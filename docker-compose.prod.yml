@@ -1,0 +1,56 @@
+# Production-style stack — `main.py` API + Service Bus worker.
+# Usage:
+#   cp .env.example .env   # all Azure + DATABASE_URL vars required
+#   docker compose -f docker-compose.prod.yml up --build -d
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lectora-backend:prod
+    ports:
+      - "${API_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      RUN_MIGRATIONS: "1"
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/lectora.db}
+    volumes:
+      - lectora-data:/app/data
+    command:
+      [
+        "uvicorn",
+        "lectora_backend.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lectora-backend:prod
+    env_file:
+      - .env
+    environment:
+      RUN_MIGRATIONS: "0"
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/lectora.db}
+    volumes:
+      - lectora-data:/app/data
+    command: ["python", "-m", "lectora_backend.worker"]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  lectora-data:

@@ -45,13 +45,17 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = "https://cloud.langfuse.com"
 
-    # Comma-separated browser origins (FE dev server, Docker FE on :8080, etc.)
+    # Comma-separated browser origins (FE dev server, Docker FE on :8080, Netlify, etc.)
     cors_origins: str = (
         "http://localhost:5173,"
         "http://127.0.0.1:5173,"
         "http://localhost:3000,"
-        "http://localhost:8080"
+        "http://localhost:8080,"
+        "https://nimble-cendol-69a81c.netlify.app"
     )
+
+    # Extra origins matched by regex (Netlify branch/preview deploys).
+    cors_origin_regex: str = r"https://.*\.netlify\.app"
 
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

@@ -176,3 +176,12 @@ class JobRepository:
 
         self.session.commit()
         return self.get_job(job_id)
+
+    def delete_job(self, job_id: str) -> bool:
+        """Remove job and cascaded stage/retry/log rows."""
+        job = self.get_job(job_id)
+        if job is None:
+            return False
+        self.session.delete(job)
+        self.session.commit()
+        return True

@@ -8,6 +8,7 @@ from sqlalchemy import text
 from lectora_backend.api.middleware.cors import add_cors_middleware
 from lectora_backend.api.middleware.logging_middleware import LoggingMiddleware
 from lectora_backend.api.routes import events, generate_to, health, jobs, storage
+from lectora_backend.api.routes import settings as settings_routes
 from lectora_backend.config import settings
 from lectora_backend.dependencies import engine
 from lectora_backend.repositories.blob_repository import BlobRepository
@@ -58,3 +59,4 @@ app.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 app.include_router(events.router, prefix="/jobs", tags=["events"])
 app.include_router(storage.router, prefix="/storage", tags=["storage"])
 app.include_router(generate_to.router, prefix="/documents", tags=["documents"])
+app.include_router(settings_routes.router, prefix="/settings", tags=["settings"])

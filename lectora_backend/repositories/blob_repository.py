@@ -95,6 +95,19 @@ class BlobRepository:
     def list_blobs(self, prefix: str) -> list[str]:
         return [blob.name for blob in self._container_client.list_blobs(name_starts_with=prefix)]
 
+    def delete_blobs_by_prefix(self, prefix: str) -> int:
+        """Delete all blobs whose names start with *prefix*. Returns count deleted."""
+        normalized = prefix.strip().lstrip("/")
+        if not normalized:
+            return 0
+        if not normalized.endswith("/"):
+            normalized = f"{normalized}/"
+        removed = 0
+        for name in self.list_blobs(normalized):
+            self.delete_blob(name)
+            removed += 1
+        return removed
+
     def prefix_exists(self, prefix: str) -> bool:
         normalized = prefix.rstrip("/") + "/"
         iterator = self._container_client.list_blobs(name_starts_with=normalized)

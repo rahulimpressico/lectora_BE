@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 _MIME_DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-from lectora_backend.core.blob_layout import build_blob_layout_from_input_blob
+from lectora_backend.core.blob_layout import build_blob_layout_for_course
 from lectora_backend.core.state_manager import StateManager
 from lectora_backend.pipeline.agent.a0_request_synthesizer.main import A0RequestSynthesizer
 from lectora_backend.pipeline.agent.a1_outline_interpreter.main import run as a1_run
@@ -67,10 +67,8 @@ class PipelineAdapter:
     ) -> tuple[str, str]:
         blob_layout = state.get("blobLayout")
         if blob_layout is None:
-            layout = build_blob_layout_from_input_blob(
-                study_guide_blob,
-                state["run"]["jobId"],
-            )
+            course_title = (state.get("request") or {}).get("courseTitle") or ""
+            layout = build_blob_layout_for_course(course_title)
             blob_layout = layout.to_dict()
             state["blobLayout"] = blob_layout
 
@@ -145,9 +143,8 @@ class PipelineAdapter:
             # No timedOutline blob — normalize study guide alone (updates blobLayout)
             blob_layout = state.get("blobLayout")
             if blob_layout is None:
-                from lectora_backend.core.blob_layout import build_blob_layout_from_input_blob
-                layout = build_blob_layout_from_input_blob(
-                    study_guide_blob, state["run"]["jobId"])
+                course_title = (state.get("request") or {}).get("courseTitle") or ""
+                layout = build_blob_layout_for_course(course_title)
                 state["blobLayout"] = layout.to_dict()
                 self._state_manager.save(
                     state["run"]["jobId"], state, blob_path=state_blob_path)
@@ -588,7 +585,33 @@ class PipelineAdapter:
         pipeline_shared_state_path: str,
         study_guide_path: str,
         course_difficulty: str = "intermediate",
+        extra_source_blob_paths: list[str] | None = None,
     ) -> dict[str, Any]:
+        # ── Download extra source files for multi-file chunk retrieval ─────
+        source_file_paths: list[str] | None = None
+        if extra_source_blob_paths:
+            temp_dir = Path(pipeline_shared_state_path).parent / "_source_chunks"
+            temp_dir.mkdir(exist_ok=True)
+            downloaded: list[str] = [study_guide_path]  # primary DOCX always first
+            for blob_path in extra_source_blob_paths:
+                try:
+                    local_path = temp_dir / Path(blob_path).name
+                    if not local_path.exists():
+                        content = self._blob_repository.download_bytes(blob_path)
+                        local_path.write_bytes(content)
+                    downloaded.append(str(local_path))
+                except Exception as exc:
+                    logger.warning(
+                        "Could not download extra source file %s for A2 retrieval: %s",
+                        blob_path, exc,
+                    )
+            if len(downloaded) > 1:
+                source_file_paths = downloaded
+                logger.info(
+                    "[run_a2] %d source files available for chunk-based retrieval.",
+                    len(source_file_paths),
+                )
+
         # ── Section Mapper ────────────────────────────────────────────────
         section_map_result = section_mapper_run(
             shared_state_path=pipeline_shared_state_path)
@@ -618,6 +641,7 @@ class PipelineAdapter:
                 render_docx=False,
                 course_difficulty=course_difficulty,
                 feedback=a2_feedback,
+                source_file_paths=source_file_paths,
             ).run()
             logger.info(
                 "A2 status=%s generated=%s skipped=%s failed=%s words=%s",

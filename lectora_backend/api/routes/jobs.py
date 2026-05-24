@@ -32,7 +32,9 @@ from lectora_backend.api.schemas.job_schemas import (
 from lectora_backend.dependencies import get_db_session
 from lectora_backend.models.job_enums import JobStatus, PipelineStep, StageStatus, ValidationOutcome
 from lectora_backend.repositories.job_repository import JobRepository
-from lectora_backend.core.blob_layout import build_blob_layout_from_input_blob
+from lectora_backend.core.blob_layout import build_blob_layout_for_course
+from lectora_backend.core.course_storage import sanitize_course_slug
+from lectora_backend.core.storage_cleanup import delete_course_output_tree
 from lectora_backend.core.state_manager import StateManager
 from lectora_backend.core.queue_publisher import QueuePublisher
 from lectora_backend.models.constants import PIPELINE_ORDER
@@ -210,10 +212,8 @@ async def create_job(
     if not study_guide_blob_path or not study_guide_blob_path.strip():
         return _missing_input_response("studyGuide.blobPath is required.")
 
-    blob_layout = build_blob_layout_from_input_blob(
-        study_guide_blob_path,
-        job_id,
-    )
+    blob_layout = build_blob_layout_for_course(payload.course_title)
+    course_slug = sanitize_course_slug(payload.course_title)
 
     repository = JobRepository(session)
     repository.create_job(
@@ -237,6 +237,7 @@ async def create_job(
         },
         "request": {
             "courseTitle": payload.course_title,
+            "courseStorageSlug": course_slug,
             "courseType": payload.course_type,
             "requestedBy": actor,
             "normalizedAt": None,
@@ -350,6 +351,41 @@ async def get_job(
             status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
 
     return _map_job_detail(job)
+
+
+@router.delete("/{job_id}", status_code=status.HTTP_200_OK)
+async def delete_job(
+    job_id: str,
+    session: Session = Depends(get_db_session),
+) -> dict[str, str]:
+    """Remove job metadata and delete course output artifacts from blob storage."""
+    repository = JobRepository(session)
+    job = repository.get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Job not found."
+        )
+
+    if job.status in (JobStatus.PENDING, JobStatus.PROCESSING):
+        repository.update_job_status(job_id, JobStatus.CANCELLED)
+
+    delete_course_output_tree(job.course_title)
+
+    state_manager = StateManager()
+    try:
+        state_manager.delete_blobs_under_prefix(
+            f"{sanitize_course_slug(job.course_title)}"
+        )
+    except Exception as exc:
+        logger.warning("[delete_job] Blob cleanup partial failure for %s: %s", job_id, exc)
+
+    if not repository.delete_job(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Job not found."
+        )
+
+    logger.info("[delete_job] Deleted job %s (course=%r)", job_id, job.course_title)
+    return {"jobId": job_id, "status": "deleted", "message": "Job and artifacts removed"}
 
 
 @router.post("/{job_id}/retry", response_model=RetryResponse)

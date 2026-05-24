@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class UploadDocumentResponse(BaseModel):
@@ -18,11 +18,58 @@ class UploadDocumentResponse(BaseModel):
 
 
 class GenerateTORequest(BaseModel):
-    """Body accepted by POST /documents/generate-to."""
-    blob_path: str = Field(alias="blobPath")
+    """Body accepted by POST /documents/generate-to.
+
+    Supports both the legacy single-file shape and the new multi-file shape:
+
+    Legacy:   { "blobPath": "folder/file.docx", "difficulty": "intermediate" }
+    Multi:    { "blobPaths": ["folder/a.docx", "folder/b.pdf"], "difficulty": "...",
+                "customToPrompt": "..." }
+
+    At least one of ``blobPath`` or ``blobPaths`` must be provided.
+    ``blobPath`` is kept for backward compatibility; ``blobPaths`` takes precedence.
+    """
+    blob_path: str | None = Field(default=None, alias="blobPath")
+    blob_paths: list[str] = Field(default_factory=list, alias="blobPaths")
     difficulty: str = "intermediate"
+    custom_to_prompt: str | None = Field(
+        default=None,
+        alias="customToPrompt",
+        description=(
+            "Optional custom system prompt for TO generation. "
+            "When provided, replaces the default internal GENERATE_TO_PROMPT. "
+            "The response JSON schema remains unchanged."
+        ),
+    )
+    course_type_hint: str | None = Field(
+        default=None,
+        alias="courseTypeHint",
+        description=(
+            "Optional domain/course-type context (e.g. 'Washington LTC Compliance Course'). "
+            "Used to prioritize relevant topics and filter unrelated content during TO generation."
+        ),
+    )
+    to_doc_blob_path: str | None = Field(
+        default=None,
+        alias="toDocBlobPath",
+        description="Optional user-uploaded TO document blob path (DOCX). When provided, A0 parses this as the Timed Outline instead of generating one from scratch.",
+    )
 
     model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def _normalise_paths(self) -> "GenerateTORequest":
+        # Merge legacy blobPath into blobPaths for uniform downstream handling.
+        if self.blob_path and self.blob_path not in self.blob_paths:
+            self.blob_paths = [self.blob_path] + list(self.blob_paths)
+        if not self.blob_paths:
+            raise ValueError("At least one of 'blobPath' or 'blobPaths' must be provided.")
+        return self
+
+    @property
+    def effective_blob_paths(self) -> list[str]:
+        """Normalised list of all blob paths (always non-empty after validation)."""
+        return self.blob_paths
 
 
 class GenerateTOResponse(BaseModel):
@@ -54,7 +101,7 @@ class GenerateTOJobAccepted(BaseModel):
 class GenerateTOJobPollResponse(BaseModel):
     """Returned by GET /documents/generate-to/jobs/{jobId}."""
     job_id: str = Field(alias="jobId")
-    status: str  # processing | completed | failed
+    status: str  # processing | completed | failed | cancelled
     message: str | None = None
     error: str | None = None
     to: dict[str, Any] | None = None

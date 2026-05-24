@@ -33,16 +33,53 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-# Persistent output directory — mirrors pipeline.py SHARED_STATE_DIR so that
-# locally-triggered jobs write artifacts to the same location as direct runs.
-_PIPELINE_SHARED_STATE_DIR = str(
-    Path(__file__).resolve().parents[2] / "pipeline" / "shared_state"
-)
+def _resolve_and_validate(blob_path: str, label: str) -> str:
+    """Resolve *blob_path* to an absolute local path, raising HTTP 422 if missing.
+
+    Uses the shared blob_resolver which:
+      1. Checks local _UPLOAD_ROOT cache (fast path).
+      2. Downloads from Azure Blob Storage and persists to _UPLOAD_ROOT if
+         Azure is configured and the file is not cached locally.
+      3. Handles the ``uploaded-documents/`` prefix that Azure browser paths carry.
+
+    Raises
+    ------
+    HTTPException 422
+        When the file cannot be found locally or in Azure, with an actionable
+        message telling the user to re-upload the document.
+    """
+    from lectora_backend.core.blob_resolver import resolve_blob_to_local
+
+    resolved = resolve_blob_to_local(blob_path)
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "file_not_found",
+                "label": label,
+                "blobPath": blob_path,
+                "message": (
+                    f"{label} could not be located: '{blob_path}'. "
+                    "The file may have been uploaded in a previous session that "
+                    "has since expired, or it only exists in Azure and could not "
+                    "be downloaded. Please re-upload the document and try again."
+                ),
+            },
+        )
+    logger.info("[blob] %s resolved: %r → %s", label, blob_path, resolved)
+    return str(resolved)
+
+# Course-title output roots (``{slug}/``) — same layout as Azure artifacts.
+_PIPELINE_COURSES_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "courses"
+_PIPELINE_COURSES_DIR.mkdir(parents=True, exist_ok=True)
 
 from lectora_backend.api.local_course_job_store import (
     LocalJobStatus,
     get_local_course_job_store,
 )
+from lectora_backend.core.course_storage import sanitize_course_slug
+from lectora_backend.core.job_registry import register_local_pipeline, unregister_local_pipeline
+from lectora_backend.core.storage_cleanup import delete_course_output_tree
 from lectora_backend.models.constants import MAX_A0_A1_S1_CYCLES, MAX_A2_S2_CYCLES
 from lectora_backend.pipeline.agent.a0_request_synthesizer.main import (
     A0RequestSynthesizer,
@@ -351,6 +388,9 @@ class CreateJobPayload(BaseModel):
     difficulty: str = Field(default="intermediate")
     inputs: JobInputs
     to_override: dict[str, Any] | None = Field(default=None, alias="toOverride")
+    # All source file blob paths (local file paths in dev) used to generate the TO.
+    # When provided, A2 builds a chunk index from these files for topic-wise retrieval.
+    source_file_paths: list[str] | None = Field(default=None, alias="sourceFilePaths")
 
     model_config = {"populate_by_name": True}
 
@@ -408,6 +448,16 @@ def _persist_difficulty(shared_state_path: str, difficulty: str) -> None:
         json.dump(state, fh, indent=2, default=str)
 
 
+def _persist_source_file_paths(shared_state_path: str, paths: list[str]) -> None:
+    """Store source file local paths in shared_state for A2 chunk-based retrieval."""
+    p = Path(shared_state_path)
+    with open(p, encoding="utf-8") as fh:
+        state = json.load(fh)
+    state["source_file_paths"] = paths
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, default=str)
+
+
 def _format_s1_feedback(report: Any) -> str:
     lines: list[str] = []
     for issue in getattr(report, "issues", []) or []:
@@ -446,6 +496,7 @@ def _run_pipeline_sync(
     timed_outline_path: str | None,
     to_override: dict[str, Any] | None,
     difficulty: str,
+    source_file_paths: list[str] | None = None,
 ) -> tuple[str | None, str | None]:
     """Execute the full pipeline synchronously.  Returns (shared_state_path, study_guide_docx_path)."""
     store = get_local_course_job_store()
@@ -457,7 +508,7 @@ def _run_pipeline_sync(
     try:
         return _run_pipeline_inner(
             job_id, study_guide_path, timed_outline_path, to_override, difficulty,
-            temp_input_dir,
+            temp_input_dir, source_file_paths,
         )
     finally:
         # Ephemeral input dir is tiny (user_edited_to.json only); clean up always.
@@ -471,6 +522,7 @@ def _run_pipeline_inner(
     to_override: dict[str, Any] | None,
     difficulty: str,
     temp_input_dir: Path,
+    source_file_paths: list[str] | None = None,
 ) -> tuple[str | None, str | None]:
     """Inner pipeline body, called from _run_pipeline_sync after temp dir setup."""
     store = get_local_course_job_store()
@@ -493,6 +545,8 @@ def _run_pipeline_inner(
     s1_feedback: str | None = None
 
     for gate_cycle in range(1, MAX_A0_A1_S1_CYCLES + 1):
+        if store.is_cancelled(job_id):
+            raise RuntimeError("Cancelled")
         if gate_cycle == 1:
             log("info", "Analyzing your study guide document…", "A0")
         else:
@@ -502,17 +556,27 @@ def _run_pipeline_inner(
         # On retry cycles let A0 re-run fully (don't reuse pre-generated TO)
         to_path_for_cycle = effective_to_path if gate_cycle == 1 else timed_outline_path
 
+        job_rec = store.get(job_id)
+        course_slug = sanitize_course_slug(
+            job_rec.course_title if job_rec else "course"
+        )
         a0_result = A0RequestSynthesizer(
-            docx_path=study_guide_path,
+            docx_paths=[study_guide_path],
             to_outline_doc_path=to_path_for_cycle,
-            output_dir=_PIPELINE_SHARED_STATE_DIR,  # persistent shared_state/, same as pipeline.py
+            output_dir=str(_PIPELINE_COURSES_DIR),
             course_difficulty=difficulty,
+            course_output_slug=course_slug,
         ).run()
         shared_state_path = a0_result.shared_state_path
         # Point the job's artifact dir to the actual pipeline output directory
         # (parent of shared_state.json = pipeline/shared_state/{doc_stem}/).
         store.set_temp_dir(job_id, str(Path(shared_state_path).parent))
         _persist_difficulty(shared_state_path, difficulty)
+
+        # Inject source_file_paths into shared_state so A2 can build a chunk
+        # index for topic-wise retrieval across all uploaded source files.
+        if source_file_paths:
+            _persist_source_file_paths(shared_state_path, source_file_paths)
         log("success", "Document analyzed — course structure and rule family identified", "A0")
         store.complete_stage(job_id, "A0", "PASS")
 
@@ -556,6 +620,9 @@ def _run_pipeline_inner(
             log("error", "Structure review could not be resolved — pipeline stopped", "S1")
             raise RuntimeError("S1 validation blocked after max retries")
 
+    if store.is_cancelled(job_id):
+        raise RuntimeError("Cancelled")
+
     # ── Section Mapper ────────────────────────────────────────────────────
     assert shared_state_path is not None
     log("info", "Organizing course sections and mapping lessons to the training outline…", "SECTION_MAPPER")
@@ -581,6 +648,8 @@ def _run_pipeline_inner(
     final_docx_path: str | None = None
 
     for a2_cycle in range(1, MAX_A2_S2_CYCLES + 1):
+        if store.is_cancelled(job_id):
+            raise RuntimeError("Cancelled")
         if a2_cycle > 1:
             log("info", "Refining course content based on quality feedback…", "A2")
 
@@ -590,6 +659,7 @@ def _run_pipeline_inner(
             render_docx=False,
             course_difficulty=difficulty,
             feedback=a2_feedback,
+            source_file_paths=source_file_paths,
         ).run()
         log(
             "success",
@@ -643,6 +713,7 @@ async def _run_pipeline_background(
     timed_outline_path: str | None,
     to_override: dict[str, Any] | None,
     difficulty: str,
+    source_file_paths: list[str] | None = None,
 ) -> None:
     store = get_local_course_job_store()
     store.update_status(job_id, LocalJobStatus.PROCESSING)
@@ -651,7 +722,8 @@ async def _run_pipeline_background(
 
     def _sync() -> tuple[str | None, str | None]:
         return _run_pipeline_sync(
-            job_id, study_guide_path, timed_outline_path, to_override, difficulty)
+            job_id, study_guide_path, timed_outline_path, to_override, difficulty,
+            source_file_paths)
 
     try:
         shared_state_path, study_guide_docx = await asyncio.to_thread(_sync)
@@ -662,13 +734,19 @@ async def _run_pipeline_background(
         )
         store.append_log(job_id, "success", "Your course has been generated successfully", None)
     except Exception as exc:
-        logger.exception("[%s] Pipeline failed: %s", job_id[:8], exc)
-        store.fail_job(
-            job_id,
-            error={"message": str(exc), "type": type(exc).__name__},
-        )
-        store.append_log(job_id, "error", f"Generation failed: {exc}", None)
+        if str(exc) == "Cancelled" or store.is_cancelled(job_id):
+            store.cancel_job(job_id, reason="Cancelled")
+            store.append_log(job_id, "warn", "Course generation cancelled", None)
+            logger.info("[%s] Pipeline cancelled", job_id[:8])
+        else:
+            logger.exception("[%s] Pipeline failed: %s", job_id[:8], exc)
+            store.fail_job(
+                job_id,
+                error={"message": str(exc), "type": type(exc).__name__},
+            )
+            store.append_log(job_id, "error", f"Generation failed: {exc}", None)
     finally:
+        unregister_local_pipeline(job_id)
         store.release_slot()
 
 
@@ -693,30 +771,69 @@ async def create_job(payload: CreateJobPayload) -> JSONResponse:
             ),
         )
 
-    study_guide_blob = payload.inputs.study_guide.blob_path
-    if not Path(study_guide_blob).exists():
-        store.release_slot()
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Study guide not found at blobPath: {study_guide_blob}",
+    # ── Resolve study guide (required) ───────────────────────────────────────
+    try:
+        study_guide_blob = _resolve_and_validate(
+            payload.inputs.study_guide.blob_path, "Study guide"
         )
+    except HTTPException:
+        store.release_slot()
+        raise
 
+    # ── Resolve timed outline (optional) ─────────────────────────────────────
+    # When to_override is provided the pipeline injects the TO JSON directly and
+    # never reads the timed outline file — so a missing file is not an error.
     timed_outline_path: str | None = None
     if payload.inputs.timed_outline:
-        to_blob = payload.inputs.timed_outline.blob_path
-        if not Path(to_blob).exists():
-            store.release_slot()
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Timed outline not found at blobPath: {to_blob}",
-            )
-        timed_outline_path = to_blob
+        to_raw = payload.inputs.timed_outline.blob_path
+        if payload.to_override:
+            # to_override takes precedence; try to resolve the file but don't fail
+            try:
+                timed_outline_path = _resolve_and_validate(to_raw, "Timed outline")
+            except HTTPException:
+                logger.info(
+                    "[create_job] Timed outline %r not found — to_override present, skipping file",
+                    to_raw,
+                )
+                timed_outline_path = None
+        else:
+            # No to_override — the pipeline MUST read the timed outline file
+            try:
+                timed_outline_path = _resolve_and_validate(to_raw, "Timed outline")
+            except HTTPException:
+                store.release_slot()
+                raise
 
     difficulty = (payload.difficulty or "intermediate").strip().lower()
     job = store.create(
         course_title=payload.course_title,
         course_type=payload.course_type,
         difficulty=difficulty,
+    )
+
+    # ── Resolve source file paths (best-effort, non-fatal) ───────────────────
+    # Missing source files only affect multi-file chunk retrieval in A2.
+    # Silently drop paths that cannot be resolved so a single stale path does
+    # not block the whole job.
+    source_file_paths: list[str] | None = None
+    if payload.source_file_paths:
+        from lectora_backend.core.blob_resolver import resolve_blob_to_local
+        resolved_sources: list[str] = []
+        for p in payload.source_file_paths:
+            r = resolve_blob_to_local(p)
+            if r is not None:
+                resolved_sources.append(str(r))
+            else:
+                logger.warning("[create_job] Source file not found (skipped): %r", p)
+        if resolved_sources:
+            source_file_paths = resolved_sources
+
+    course_slug = sanitize_course_slug(payload.course_title)
+    register_local_pipeline(
+        job.job_id,
+        course_title=payload.course_title,
+        course_slug=course_slug,
+        blob_paths=payload.source_file_paths or [payload.inputs.study_guide.blob_path],
     )
 
     asyncio.create_task(
@@ -726,6 +843,7 @@ async def create_job(payload: CreateJobPayload) -> JSONResponse:
             timed_outline_path=timed_outline_path,
             to_override=payload.to_override,
             difficulty=difficulty,
+            source_file_paths=source_file_paths,
         )
     )
 
@@ -738,6 +856,39 @@ async def create_job(payload: CreateJobPayload) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
         content={"jobId": job.job_id, "status": "PENDING"},
+    )
+
+
+@router.delete(
+    "/{job_id}",
+    summary="Cancel and remove a local pipeline job",
+)
+async def delete_job(job_id: str) -> JSONResponse:
+    """Cancel if running, clean course output folder, and drop in-memory job record."""
+    store = get_local_course_job_store()
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown or expired jobId: {job_id}",
+        )
+
+    if job.status in (LocalJobStatus.PENDING, LocalJobStatus.PROCESSING):
+        store.cancel_job(job_id, reason="Deleted by user")
+        from lectora_backend.core.job_registry import get_local_pipeline
+
+        handle = get_local_pipeline(job_id)
+        if handle:
+            handle.cancel_event.set()
+
+    delete_course_output_tree(job.course_title)
+    unregister_local_pipeline(job_id)
+
+    store.remove(job_id)
+
+    logger.info("[delete_job] Removed local job %s (title=%r)", job_id, job.course_title)
+    return JSONResponse(
+        content={"jobId": job_id, "status": "deleted", "message": "Job removed"},
     )
 
 
@@ -755,7 +906,7 @@ async def get_job(job_id: str) -> JSONResponse:
         )
 
     error_detail: dict[str, Any] | None = None
-    if job.status == LocalJobStatus.FAILED and job.error:
+    if job.status in (LocalJobStatus.FAILED, LocalJobStatus.CANCELLED) and job.error:
         error_detail = job.error
 
     return JSONResponse(content={

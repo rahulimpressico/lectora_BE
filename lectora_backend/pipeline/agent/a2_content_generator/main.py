@@ -188,6 +188,7 @@ class A2ContentGenerator:
         render_docx: bool = True,
         feedback: str | None = None,
         course_difficulty: str | None = None,
+        source_file_paths: list[str] | None = None,
     ):
         """
         Args:
@@ -201,6 +202,10 @@ class A2ContentGenerator:
                                lesson user prompt so the LLM can address known issues.
             course_difficulty: ``basic``, ``intermediate``, or ``advanced`` — merged
                                into the rule pack via ``resolve_rule_pack``.
+            source_file_paths: Optional list of local file paths (DOCX + PDF) used as
+                               source material. When provided (or found in shared_state),
+                               A2 builds a chunk index and enriches each subtopic prompt
+                               with topic-relevant passages retrieved from all source files.
         """
         self.shared_state_path = shared_state_path
         self.docx_path = docx_path
@@ -208,6 +213,7 @@ class A2ContentGenerator:
         self.render_docx = render_docx
         self.feedback = feedback
         self.course_difficulty = course_difficulty
+        self.source_file_paths = source_file_paths
 
     def run(self) -> A2Output:
         """Execute the full A2 pipeline and return a typed A2Output."""
@@ -274,7 +280,38 @@ class A2ContentGenerator:
         )
         logger.info("[A2] Learning objectives: %s", len(learning_objectives))
 
-        # -- Step 2: Generate content section-by-section ----------------------
+        # -- Step 2: Build multi-file chunk index (when source files available) --
+        source_chunks: list[dict] | None = None
+        effective_paths = self.source_file_paths
+        if effective_paths is None:
+            # Fallback: read from shared_state if caller didn't pass them directly
+            raw_paths = shared_state.get("source_file_paths")
+            if isinstance(raw_paths, list) and raw_paths:
+                effective_paths = [p for p in raw_paths if isinstance(p, str)]
+
+        if effective_paths and len(effective_paths) > 1:
+            try:
+                from lectora_backend.pipeline.agent.a0_request_synthesizer.utils.chunker import (
+                    chunk_files,
+                )
+                existing_paths = [p for p in effective_paths if Path(p).exists()]
+                if len(existing_paths) > 1:
+                    source_chunks = chunk_files(existing_paths)
+                    logger.info(
+                        "[A2] Built %d chunks from %d source files for topic-wise retrieval.",
+                        len(source_chunks),
+                        len(existing_paths),
+                    )
+                else:
+                    logger.debug(
+                        "[A2] Only %d/%d source file(s) found on disk — skipping multi-file chunking.",
+                        len(existing_paths),
+                        len(effective_paths),
+                    )
+            except Exception as exc:
+                logger.warning("[A2] Could not build chunk index: %s — proceeding without retrieval.", exc)
+
+        # -- Step 3: Generate content section-by-section ----------------------
         if self.feedback:
             logger.info(
                 "[A2] Generating content with prior S2 feedback applied (%s chars).",
@@ -288,6 +325,7 @@ class A2ContentGenerator:
             learning_objectives=learning_objectives,
             rule_pack=rule_pack,
             feedback=self.feedback,
+            source_chunks=source_chunks,
         )
 
         # -- Collect stats -----------------------------------------------------
@@ -312,7 +350,7 @@ class A2ContentGenerator:
             total_words=total_generated_words,
         )
 
-        # -- Step 3: Build course description ---------------------------------
+        # -- Step 4: Build course description ---------------------------------
         course_description = _build_course_description(
             course_title,
             content_sample=content_sample,
@@ -325,7 +363,7 @@ class A2ContentGenerator:
             generated_sections=generated_sections,
         )
 
-        # -- Step 4: Render styled .docx output (gated by self.render_docx) ---
+        # -- Step 5: Render styled .docx output (gated by self.render_docx) ---
         final_path: str | None = None
         if self.render_docx:
             logger.info("[A2] Rendering study guide .docx...")
@@ -344,7 +382,7 @@ class A2ContentGenerator:
                 "[A2] DOCX rendering deferred — will be built after S2 validation passes."
             )
 
-        # -- Step 5: Build typed A2Output and persist -------------------------
+        # -- Step 6: Build typed A2Output and persist -------------------------
         now = datetime.now(timezone.utc)
         content_json_path = self.output_dir / "generated_content.json"
 
@@ -364,7 +402,7 @@ class A2ContentGenerator:
         with open(content_json_path, "w") as f:
             json.dump(a2_result.model_dump(mode="json"), f, indent=2, default=str)
 
-        # -- Step 6: Update shared state --------------------------------------
+        # -- Step 7: Update shared state --------------------------------------
         logger.info("[A2] Updating shared state...")
         shared_state["agent_outputs"]["A2"] = a2_result.model_dump(mode="json")
         shared_state["status"] = "A2_complete"

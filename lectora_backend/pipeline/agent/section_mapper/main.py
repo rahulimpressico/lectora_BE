@@ -59,6 +59,18 @@ from lectora_backend.pipeline.shared_utils.kc_patterns import KC_RE as _KC_RE, i
 
 logger = logging.getLogger(__name__)
 
+# Structural sections that must never act as content-topic containers.
+_RESERVED_HEADING_RE = re.compile(
+    r"^\s*(\d+(\.\d+)*\s+)?"
+    r"(overview|learning\s+objectives?|learning\s+outcomes?|course\s+objectives?|"
+    r"summary|assessment|introduction)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_reserved_heading(heading: str) -> bool:
+    return bool(_RESERVED_HEADING_RE.match((heading or "").strip()))
+
 
 # ---------------------------------------------------------------------------
 # Format detection
@@ -242,16 +254,43 @@ def _distribute_to_subtopics(
 
 
 def _group_by_l1(sections: list[dict]) -> list[list[dict]]:
-    """Group course_spec sections by their L1 chapter heading."""
+    """Group course_spec sections by their L1 chapter heading.
+
+    Reserved sections (Overview, Learning Objectives, Summary, Assessment, etc.)
+    are excluded entirely — they are rendered by A2 from metadata and must not
+    act as containers for actual course topics.  Any sub-level sections that
+    immediately follow a reserved L1 heading are also skipped (they are LO item
+    lines or overview paragraphs, not course content).
+    """
     groups: list[list[dict]] = []
     current: list[dict] = []
+    in_reserved_block = False
+
     for sec in sections:
+        heading = sec.get("heading", "")
+        is_res = sec.get("is_reserved") or _is_reserved_heading(heading)
+
         if sec.get("level") == 1:
+            in_reserved_block = is_res
+            if is_res:
+                # Flush any open group but do NOT start a new group for this heading.
+                if current:
+                    groups.append(current)
+                    current = []
+                continue
+
+            # Normal L1 content heading — start a new group.
             if current:
                 groups.append(current)
             current = [sec]
+
         else:
+            if in_reserved_block:
+                # Sub-sections under a reserved L1 (e.g., LO bullet items parsed
+                # as H2) are metadata, not content — skip them.
+                continue
             current.append(sec)
+
     if current:
         groups.append(current)
     return groups

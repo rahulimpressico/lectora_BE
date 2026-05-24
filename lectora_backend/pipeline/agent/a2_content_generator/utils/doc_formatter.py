@@ -108,12 +108,25 @@ def _add_toc_hyperlink_para(
 
 # ---------------------------------------------------------------------------
 
+_RESERVED_HEADING_RE = re.compile(
+    r"^\s*(\d+(\.\d+)*\s+)?"
+    r"(overview|learning\s+objectives?|learning\s+outcomes?|course\s+objectives?|"
+    r"summary|assessment|introduction)\s*$",
+    re.IGNORECASE,
+)
+
+
 def _renumber_sections(sections: list[dict]) -> list[dict]:
     """Re-number generated sections sequentially starting at 3.0.
 
-    Fixed sections 1.0 OVERVIEW and 2.0 Learning Objectives are not touched.
+    Fixed sections 1.0 OVERVIEW and 2.0 Learning Objectives are rendered by
+    doc_formatter from metadata and must NEVER appear in this list.  If a
+    reserved heading does slip through (e.g. from a malformed TO), it is
+    removed here so it never occupies a content-section slot or consumes a
+    major-number counter tick.
+
     Level-1 sections (parent overviews) get N.0 numbers (3.0, 4.0, …).
-    Level-2 sections (subtopics) get N.M numbers (3.1, 3.2, …).
+    Level-2 sections (subtopics)        get N.M numbers (3.1, 3.2, …).
     Guarantees proper ordering: a level-2 section always follows its level-1 parent.
     """
     _NUM_PREFIX = re.compile(r"^\d+(\.\d+)*[\s.:\-]*")
@@ -127,6 +140,11 @@ def _renumber_sections(sections: list[dict]) -> list[dict]:
         level = sec.get("level", 2)
         heading = (sec.get("heading") or "").strip()
         clean = _NUM_PREFIX.sub("", heading).strip() or heading
+
+        # Reserved headings belong in front-matter (rendered from metadata),
+        # not in the generated content body.  Drop them silently.
+        if _RESERVED_HEADING_RE.match(clean):
+            continue
 
         if level == 1:
             major += 1

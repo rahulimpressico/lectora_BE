@@ -47,6 +47,21 @@ from lectora_backend.pipeline.rule_pack_config.rule_packs import resolve_rule_pa
 
 logger = logging.getLogger(__name__)
 
+# Headings that represent structural/metadata sections — never content topics.
+# They are rendered by A2 from metadata (description + learning_objectives), so
+# they must not receive LLM-generated subtopics or be grouped as content parents.
+_RESERVED_SECTION_RE = re.compile(
+    r"^\s*(\d+(\.\d+)*\s+)?"  # optional leading "N.0 " prefix
+    r"(overview|learning\s+objectives?|learning\s+outcomes?|course\s+objectives?|"
+    r"summary|assessment|introduction)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_reserved_section(heading: str) -> bool:
+    """Return True if *heading* names a structural section that must not hold subtopics."""
+    return bool(_RESERVED_SECTION_RE.match(heading.strip()))
+
 
 # -- State -------------------------------------------------------------------
 
@@ -276,6 +291,10 @@ def enrich_with_llm(state: A1State) -> A1State:
 
     section_input = {}
     for s in state["raw_sections"]:
+        if _is_reserved_section(s["heading"]):
+            # Reserved structural sections (Overview, LO, Summary, Assessment) are
+            # rendered by A2 from metadata — they must not receive content subtopics.
+            continue
         preview = " ".join(s["paragraphs"][:2])[:250] if s["paragraphs"] else ""
         section_input[s["heading"]] = {"preview": preview}
 
@@ -370,6 +389,7 @@ def build_course_spec(state: A1State) -> A1State:
                 "id": s["id"],
                 "heading": heading,
                 "level": s["level"],
+                "is_reserved": _is_reserved_section(heading),
                 "is_knowledge_check": s["is_knowledge_check"],
                 "has_knowledge_check": has_kc_final,
                 "para_start": para_start,

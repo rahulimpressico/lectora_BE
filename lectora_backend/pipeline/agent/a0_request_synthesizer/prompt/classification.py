@@ -49,72 +49,121 @@ _GENERATE_TO_format = {
 }
 
 GENERATE_TO_PROMPT = f"""\
-You are an expert instructional designer. Given one or more source training documents
-(with paragraph indices in [P<N>] format), generate a complete, professional Timed
-Outline (TO) for an eLearning course.
+You are an expert instructional designer creating a professional Timed Outline (TO)
+for an eLearning course from one or more source training documents.
 
-SOURCE CONTENT FORMAT:
-Each line of the source content is prefixed with [P<N>] where N is the paragraph index
-in the original document. Use these indices to set para_idx_start and para_idx_end for
-each generated section so that downstream agents can retrieve the exact source paragraphs
-for that section from the raw document.
+═══════════════════════════════════════════════════════════
+SOURCE CONTENT FORMAT
+═══════════════════════════════════════════════════════════
+The user message may contain:
 
-CONTENT RULES:
-- Extract ONLY real information present in the provided documents — do NOT hallucinate topics
-- Merge overlapping content from multiple documents intelligently
-- When the same concept appears in multiple documents, use the most detailed explanation
-- Preserve domain-specific terminology exactly as it appears in the source material
-- Extract and include all learning objectives found in the source material
+1. SOURCE DOCUMENT CONTENT (with paragraph indices)
+   Multiple files are separated by ``--- Document: <filename> ---`` headers.
+   Within each block, lines are prefixed with [P<N>] where N is the paragraph
+   index in that file. Use indices from the matching document block for
+   para_idx_start and para_idx_end on each section.
 
-STRUCTURE RULES:
-- Group related content into logical lessons (sections)
-- Each lesson should cover a coherent topic (typically 10–25 minutes of instruction)
-- Subtopics within a lesson follow a logical flow from foundational to advanced
-- Include "knowledge_check" in a lesson's interactive_elements when the lesson contains
-  conceptually dense material that benefits from comprehension verification
-- minutes = round(word_count / 180 * 60, 1)   (reading pace ~180 words per minute, expressed as decimal)
-- credit_hour = round(minutes / 50, 3)          (50 minutes = 1.0 credit hour)
-- Totals = sum of all section word_count / minutes / credit_hours
+2. DOCUMENT HEADING STRUCTURE (optional)
+   A structured outline of headings detected across all uploaded files.
+   Format: [L<level>] <heading_text>  (L1 = top-level, L2 = sub-topic, etc.)
+   When present, USE this as the primary structural skeleton for the TO.
+   Translate headings → lessons intelligently — do NOT copy headings blindly:
+     • Merge closely related headings into one lesson
+     • Elevate sub-headings to top-level lessons if they represent major topics
+     • Remove duplicate or trivially similar headings
+     • Re-order for logical curriculum flow (foundations first)
 
-WORD COUNT TARGETS BY DIFFICULTY (use the "Course Difficulty" provided in the user message):
-- basic:        400–800 words per section   (foundational, clear language, limited depth)
-- intermediate: 800–1500 words per section  (balanced coverage, some examples and detail)
-- advanced:     1500–2500 words per section (comprehensive, regulatory depth, nuanced examples,
-                                             case applications, and cross-topic analysis)
-Match word_count estimates to the stated difficulty level. For advanced courses, prefer
-the upper range and include more subtopics per section to reflect thorough coverage.
+3. COURSE TYPE CONTEXT (optional)
+   A hint about the regulatory domain (e.g. "Washington LTC Compliance").
+   When present:
+     • Prioritize topics directly relevant to that domain
+     • De-prioritize off-topic sections
+     • Use domain-appropriate terminology
+     • Filter unrelated extracted topics from the outline
 
-PROGRESSION:
-- Order lessons from foundational concepts → advanced applications
-- Begin with definitions and context, end with compliance/application/summary if applicable
+═══════════════════════════════════════════════════════════
+CONTENT EXTRACTION RULES
+═══════════════════════════════════════════════════════════
+- Extract ONLY real information present in the source documents — do NOT hallucinate topics
+- When heading structure is provided: derive the TO structure from headings first,
+  then fill content objectives and subtopics from the indexed paragraph content
+- When NO heading structure is provided: use AI to identify important topics and
+  concepts from the paragraph content, group by theme, and generate logical lessons
+- Merge overlapping content from multiple documents:
+    • When the same concept appears across files, use the most detailed version
+    • Do NOT create duplicate lessons for the same regulatory concept
+    • Combine complementary material (e.g. law text + examples) into one lesson
+- Preserve domain-specific terminology exactly as it appears in the source
 
-Return ONLY a single JSON object matching this exact schema — no markdown, no explanation:
+═══════════════════════════════════════════════════════════
+TOPIC QUALITY RULES (curriculum-style, not raw extraction)
+═══════════════════════════════════════════════════════════
+1. MERGE: Combine related headings under one lesson
+   e.g. "Types of Policies" + "Policy Types Overview" → "1.0 Policy Types"
+2. DEDUPLICATE: Never create two sections covering the same concept
+3. ORGANIZE LOGICALLY: foundational → applied → compliance/assessment
+4. RENAME for curriculum clarity: prefer professional lesson titles over
+   verbatim heading text when the original is informal or incomplete
+5. FILTER by course type when a context hint is provided
+
+═══════════════════════════════════════════════════════════
+STRUCTURE & PACING RULES
+═══════════════════════════════════════════════════════════
+- Each lesson covers a coherent topic (typically 10–25 minutes of instruction)
+- Subtopics follow a logical flow from foundational to advanced within the lesson
+- Leave "interactive_elements" as [] — Knowledge Check placement is handled by the KC Planner using rule packs
+- minutes = round(word_count / 180 * 60, 1)   (~180 wpm reading pace)
+- credit_hour = round(minutes / 50, 3)          (50 min = 1.0 credit hour)
+- Totals = sum of all section values
+
+WORD COUNT TARGETS BY DIFFICULTY:
+- basic:        400–800 words per section
+- intermediate: 800–1500 words per section
+- advanced:     1500–2500 words per section (include more subtopics, regulatory depth)
+
+PROGRESSION ORDER:
+  Definitions/context → Core concepts → Applied rules → Compliance/exceptions → Summary
+
+RESERVED SECTIONS — NEVER CREATE AS LESSONS:
+- "Overview", "Introduction", "Learning Objectives", "Learning Outcomes", and
+  "Summary" / "Assessment" are NOT content lessons — do NOT add them to "sections".
+  • The "description" field already captures the course overview.
+  • The "learning_objectives" field already captures the objectives.
+  • If the source document has these as headings, treat their body text as metadata,
+    not as lesson content to replicate.
+- NEVER nest course topics or modules as subtopics under "Learning Objectives"
+  or "Overview". Course topics must ALWAYS appear as independent top-level lessons.
+
+═══════════════════════════════════════════════════════════
+OUTPUT SCHEMA
+═══════════════════════════════════════════════════════════
+Return ONLY a single JSON object — no markdown, no explanation:
 
 {json.dumps(_GENERATE_TO_format, indent=2)}
 
 FIELD RULES:
-- "course_title": derive from document title or the primary topic of the content
-- "course_id": use the course ID found in the document if present, else ""
-- "description": 2–4 sentence professional summary describing what this course covers and who it is for
-- "learning_objectives": list of measurable outcome statements derived from source material
-- "sections": ordered list of lessons
-  - "title": lesson title in format "N.0 Topic Name" (e.g., "1.0 Introduction to Flood Insurance")
+- "course_title": derive from document title or primary topic
+- "course_id": course ID from document if present, else ""
+- "description": 2–4 sentence professional summary (who it is for + what it covers)
+- "learning_objectives": measurable outcome statements from source material
+- "sections": ordered lesson list
+  - "title": "N.0 Topic Name" (e.g. "1.0 Introduction to Flood Insurance")
   - "content": 1–2 sentence content objective for this lesson
-  - "subtopics": list of subtopic title strings within this lesson
-  - "word_count": estimated word count as a string (e.g., "1250")
-  - "minutes": derived from word_count, as a string (e.g., "6.9")
-  - "credit_hour": derived from minutes, as a string (e.g., ".14")
-  - "interactive_elements": list — include "knowledge_check" where appropriate, else []
-  - "para_idx_start": integer — the [P<N>] index of the FIRST paragraph in this section
-    (use the index N from the [P<N>] prefix in the source content)
-  - "para_idx_end": integer — the [P<N>] index of the LAST paragraph in this section (inclusive)
-    → Set null only if no [P<N>] indices are present in the source content
+  - "subtopics": list of subtopic title strings (curriculum-style, not raw heading text)
+  - "word_count": string (e.g. "1250")
+  - "minutes": string derived from word_count (e.g. "6.9")
+  - "credit_hour": string derived from minutes (e.g. ".14")
+  - "interactive_elements": [] always — Knowledge Check placement is determined by the KC Planner, not TO generation
+  - "para_idx_start": integer from [P<N>] prefix for FIRST paragraph of this section
+  - "para_idx_end":   integer from [P<N>] prefix for LAST paragraph (inclusive)
+    → Set null when no [P<N>] indices are present (PDF-only sources)
 - "totals": {{"word_count": "<sum>", "minutes": "<sum>", "credit_hours": "<sum>"}}
 
 PARA INDEX RULES:
-- Sections must be contiguous and non-overlapping: para_idx_end of section N < para_idx_start of section N+1
-- The first section's para_idx_start should be the first meaningful content paragraph (skip title/header paragraphs if they belong to no section)
-- The last section's para_idx_end should be the last content paragraph in the primary document
+- Sections must be contiguous and non-overlapping within each source document
+- First section's para_idx_start = first meaningful content paragraph (skip title/headers)
+- Last section's para_idx_end = last content paragraph in that document's block
+- When multiple files are present, indices are scoped per ``--- Document: ---`` block
 
 Output ONLY valid JSON. No explanation. No markdown fences.
 """
@@ -160,6 +209,16 @@ TITLE NORMALISATION — CRITICAL:
 - "word_count", "minutes", "credit_hour": copy the raw string as written (e.g. "4115", "23", ".46")
 - "totals": read from the last row of the outline table (the row whose Lesson Topic cell is blank or says "Totals")
 - Output ONLY valid JSON
+
+RESERVED SECTION RULE — CRITICAL:
+If a section's Col 0 title (ignoring a leading "N.0 " number prefix) is one of:
+  "Overview", "Introduction", "Learning Objectives", "Learning Outcomes",
+  "Course Objectives", "Summary", "Assessment"
+  → Add the section to "sections" as-is (it may legitimately appear in the TO).
+  → Its "subtopics" list MUST be [] (empty) — NEVER put course topic/module names
+    inside a Learning Objectives or Overview section's subtopics.
+  → Objective text lines listed under a Learning Objectives row are metadata,
+    not subtopics; discard them from the subtopics list.
 
 KNOWLEDGE CHECK RULE — CRITICAL:
 If a row or a subtopic item has "Knowledge Check" anywhere in its title:

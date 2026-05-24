@@ -24,6 +24,19 @@ from ..prompt.section_prompt import (
     build_lesson_system_prompt,
     build_lesson_user_message,
 )
+
+# Reserved section headings rendered by A2 from metadata (not from LLM generation).
+# Any enriched_section whose title matches these is skipped in content generation.
+_RESERVED_LESSON_RE = re.compile(
+    r"^\s*(\d+(\.\d+)*\s+)?"
+    r"(overview|learning\s+objectives?|learning\s+outcomes?|course\s+objectives?|"
+    r"summary|assessment|introduction)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_reserved_lesson(title: str) -> bool:
+    return bool(_RESERVED_LESSON_RE.match((title or "").strip()))
 from .source_chunker import (
     extract_full_section_text,
     build_prior_summary,
@@ -293,6 +306,7 @@ def generate_all_sections(
     learning_objectives: list[str],
     rule_pack: dict,
     feedback: str | None = None,
+    source_chunks: list[dict] | None = None,
 ) -> list[dict]:
     """
     Generate content for every lesson in enriched_sections.
@@ -307,6 +321,10 @@ def generate_all_sections(
         docx_path         : Path to the source .docx file.
         learning_objectives: Full list of course learning objectives.
         rule_pack         : Active rule pack constraints.
+        feedback          : Optional S2 feedback to inject into generation.
+        source_chunks     : Optional pre-built chunk list from chunk_files().
+                            When provided, topic-wise retrieval supplements
+                            paragraph-range extraction for each subtopic.
 
     Returns:
         Flat list of generated section dicts in document order.
@@ -319,6 +337,19 @@ def generate_all_sections(
     except (OSError, ValueError) as exc:
         logger.warning("  [A2] Could not load doc paragraphs: %s", exc)
         doc_paragraphs = []
+
+    # Import chunk retrieval only when chunks are available (avoids hard dep)
+    _build_context = None
+    if source_chunks:
+        try:
+            from lectora_backend.pipeline.agent.a0_request_synthesizer.utils.chunker import (
+                build_context_for_topic,
+            )
+            _build_context = build_context_for_topic
+            logger.info("[A2] Multi-file chunk index loaded: %d chunks available.", len(source_chunks))
+        except ImportError:
+            logger.warning("[A2] chunker not available — falling back to paragraph-range source.")
+            source_chunks = None
 
     for lesson_idx, lesson in enumerate(enriched_sections, start=1):
         to_title = lesson.get("title", "")
@@ -347,6 +378,16 @@ def generate_all_sections(
 
         if not subtopics:
             logger.info("  -> No subtopics, skipping lesson")
+            continue
+
+        # Reserved sections (Overview, Learning Objectives, Summary, etc.) are
+        # rendered by doc_formatter from extracted metadata — never generated here.
+        if _is_reserved_lesson(to_title):
+            logger.info(
+                "  -> Reserved section %r — skipping content generation "
+                "(rendered from metadata by doc_formatter).",
+                to_title,
+            )
             continue
 
         # ── Word-count budget per subtopic ────────────────────────────────────
@@ -449,6 +490,17 @@ def generate_all_sections(
                 para_start=sub.get("para_start", 0),
                 para_end=sub.get("para_end", 0),
             )
+            # When a multi-file chunk index is available, retrieve topic-relevant
+            # passages from all source files and append them to the primary DOCX
+            # paragraph-range text. This ensures A2 uses content from PDFs and
+            # additional DOCXs without sending every file to every LLM call.
+            if _build_context and source_chunks:
+                sub_heading = sub.get("title", "")
+                query = f"{to_title} {sub_heading}".strip()
+                chunk_ctx = _build_context(query, source_chunks, top_k=6, max_words=1500)
+                if chunk_ctx:
+                    separator = "\n\n--- Additional source material ---\n"
+                    source_text = f"{source_text}{separator}{chunk_ctx}" if source_text else chunk_ctx
             source_text = _trim_source_to_budget(source_text, wc_per_sub[sub_i])
             subtopic_specs.append({
                 "heading":             sub.get("title", f"Section {sub_i + 1}"),

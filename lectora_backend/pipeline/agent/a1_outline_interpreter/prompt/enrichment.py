@@ -23,6 +23,16 @@ STRICT RULES:
 - Do NOT skip any section
 - Output ONLY valid JSON (no markdown, no explanation)
 
+RESERVED SECTION RULE:
+- Sections whose heading (ignoring any leading "N.0 " number) matches one of:
+    Overview, Introduction, Learning Objectives, Learning Outcomes,
+    Course Objectives, Summary, Assessment
+  are structural/metadata sections — NOT content topics.
+  For these sections:
+  - subtopics MUST be [] (empty list)
+  - maps_to_objectives MUST be [] (empty list)
+  - NEVER generate content subtopics or nest course topics/modules inside them.
+
 KNOWLEDGE CHECK RULE:
 - If heading contains "Knowledge Check":
   - subtopics MUST be ["assessment"]

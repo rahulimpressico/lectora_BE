@@ -17,21 +17,34 @@ from docx import Document
 
 
 class CourseDocParser:
-    """Extracts only the raw inputs A0 needs from a .docx study guide."""
+    """Extracts raw inputs A0 needs from one or more equal-priority .docx sources."""
 
     def __init__(
         self,
-        docx_path: str,
+        docx_paths: Optional[list[str]] = None,
         to_outline_doc_path: Optional[str] = None,
+        *,
+        docx_path: Optional[str] = None,
         extra_docx_paths: Optional[list[str]] = None,
     ):
-        self._docx_path = Path(docx_path)
-        self.doc = Document(docx_path)
+        paths: list[str] = [str(p) for p in (docx_paths or []) if p]
+        if not paths and docx_path:
+            paths = [str(docx_path)]
+            paths.extend(str(p) for p in (extra_docx_paths or []) if p)
+        if not paths:
+            raise ValueError("At least one docx path is required")
+
+        self._docx_paths = [Path(p) for p in paths]
+        self._sources: list[tuple[Path, Document]] = [
+            (path, Document(str(path))) for path in self._docx_paths
+        ]
         self._to_outline_document = (
             Document(to_outline_doc_path) if to_outline_doc_path else None
         )
+        # First document — convenience for single-doc helpers and TO fetch
+        self._docx_path = self._docx_paths[0]
+        self.doc = self._sources[0][1]
         self.paragraphs = self.doc.paragraphs
-        self._extra_docs = [Document(p) for p in (extra_docx_paths or [])]
 
     @staticmethod
     def _normalize_whitespace(s: str) -> str:
@@ -46,8 +59,8 @@ class CourseDocParser:
         re.IGNORECASE,
     )
 
-    def _title_from_filename(self) -> str:
-        stem = self._docx_path.stem
+    def _title_from_filename(self, path: Optional[Path] = None) -> str:
+        stem = (path or self._docx_path).stem
         s = stem
         s = re.sub(r"(?i)_ACCEPTED|_FINAL|_DRAFT|_REV[A-Z0-9]*", "", s)
         s = re.sub(r"(?i)_SG_", " ", s)
@@ -66,22 +79,20 @@ class CourseDocParser:
             return False
         return True
 
-    def extract_title(self) -> str:
-        """
-        Best-effort title: OOXML title / Title style / first suitable heading,
-        then first substantial opening paragraph, then filename stem.
-        """
-        cp = (self.doc.core_properties.title or "").strip()
+    def _extract_title_from_doc(self, doc: Document, path: Path) -> str:
+        """Best-effort title from one document."""
+        cp = (doc.core_properties.title or "").strip()
         if cp and len(cp) > 2:
             return self._normalize_whitespace(cp)
 
-        for p in self.paragraphs[:80]:
+        paragraphs = doc.paragraphs
+        for p in paragraphs[:80]:
             if p.style.name == "Title" and p.text.strip():
                 t = self._normalize_whitespace(p.text)
                 if len(t) > 2:
                     return t
 
-        for p in self.paragraphs[:40]:
+        for p in paragraphs[:40]:
             name = p.style.name
             if "Heading" not in name:
                 continue
@@ -90,11 +101,10 @@ class CourseDocParser:
             t = self._normalize_whitespace(p.text)
             if not self._heading_might_be_course_title(t):
                 continue
-            # Prefer Heading 1–2; still allow H3+ if long enough (some templates).
             if name == "Heading 1" or name == "Heading 2" or len(t) >= 40:
                 return t
 
-        for p in self.paragraphs[:25]:
+        for p in paragraphs[:25]:
             t = self._normalize_whitespace(p.text)
             if len(t) < 25:
                 continue
@@ -104,17 +114,28 @@ class CourseDocParser:
                 continue
             return t
 
-        derived = self._title_from_filename()
+        derived = self._title_from_filename(path)
         if derived:
             return derived
+        return ""
 
+    def extract_title(self) -> str:
+        """
+        Best-effort title across all source documents (first non-empty wins),
+        then filename stem of the first file.
+        """
+        for path, doc in self._sources:
+            title = self._extract_title_from_doc(doc, path)
+            if title:
+                return title
         return "Course"
 
     def extract_course_id(self) -> Optional[str]:
-        for p in self.paragraphs[:10]:
-            m = re.search(r"Course\s*ID[:\s]*(\d+)", p.text, re.IGNORECASE)
-            if m:
-                return m.group(1)
+        for _path, doc in self._sources:
+            for p in doc.paragraphs[:10]:
+                m = re.search(r"Course\s*ID[:\s]*(\d+)", p.text, re.IGNORECASE)
+                if m:
+                    return m.group(1)
         return None
 
     # Phrases that signal the start of a learning-objectives block.
@@ -270,29 +291,28 @@ class CourseDocParser:
         return objectives
 
     def extract_merged_learning_objectives(self) -> list[str]:
-        """Extract and deduplicate learning objectives across all loaded documents."""
-        all_objectives = list(self.extract_learning_objectives())
-        seen = {obj.lower() for obj in all_objectives}
+        """Extract and deduplicate learning objectives across all source documents."""
+        all_objectives: list[str] = []
+        seen: set[str] = set()
 
-        for extra_doc in self._extra_docs:
-            for obj in self.extract_learning_objectives(paragraphs=extra_doc.paragraphs):
-                if obj.lower() not in seen:
+        for _path, doc in self._sources:
+            for obj in self.extract_learning_objectives(paragraphs=doc.paragraphs):
+                key = obj.lower()
+                if key not in seen:
                     all_objectives.append(obj)
-                    seen.add(obj.lower())
+                    seen.add(key)
 
         return all_objectives
 
     def extract_merged_full_content(self, max_words: int = 8000) -> str:
-        """Extract and merge body text from all documents (primary + extras) up to max_words."""
-        all_docs = [self.doc] + self._extra_docs
+        """Extract and merge body text from all source documents up to max_words."""
         parts: list[str] = []
         total_words = 0
 
-        for i, doc in enumerate(all_docs):
+        for path, doc in self._sources:
             if total_words >= max_words:
                 break
-            if i > 0:
-                parts.append(f"\n--- Source Document {i + 1} ---\n")
+            parts.append(f"\n--- Document: {path.name} ---\n")
             for p in doc.paragraphs:
                 if total_words >= max_words:
                     parts.append("[…content truncated at word limit…]")
@@ -312,19 +332,9 @@ class CourseDocParser:
 
         return "\n".join(parts)
 
-    def count_extra_doc_words(self) -> int:
-        """Return combined word count across all extra documents."""
-        total = 0
-        for doc in self._extra_docs:
-            for p in doc.paragraphs:
-                text = p.text.strip()
-                if text:
-                    total += len(text.split())
-        return total
-
     def count_paragraphs(self) -> int:
-        """Return total paragraph count in the primary document."""
-        return len(self.doc.paragraphs)
+        """Return total paragraph count across all source documents."""
+        return sum(len(doc.paragraphs) for _path, doc in self._sources)
 
     def fetch_paragraphs_by_range(
         self,
@@ -401,57 +411,103 @@ class CourseDocParser:
 
         return "\n".join(collected)
 
-    def get_section_heading_map(self) -> list[tuple[int, str, int]]:
-        """Return (para_idx, heading_text, heading_level) for every heading in primary doc.
+    def get_section_heading_map(self) -> list[tuple[int, str, int] | tuple[int, str, int, str]]:
+        """Return headings from all source documents for TO section mapping.
 
-        Used to map TO section titles to source paragraph ranges (Scenario 1).
+        Each entry is (para_idx, heading_text, heading_level) or, when multiple
+        files are loaded, (para_idx, heading_text, heading_level, source_filename).
         """
-        result: list[tuple[int, str, int]] = []
-        for idx, p in enumerate(self.doc.paragraphs):
-            if "Heading" in p.style.name and p.text.strip():
+        multi = len(self._sources) > 1
+        result: list[tuple[int, str, int] | tuple[int, str, int, str]] = []
+        for path, doc in self._sources:
+            for idx, p in enumerate(doc.paragraphs):
+                if "Heading" not in p.style.name or not p.text.strip():
+                    continue
                 try:
                     level = int(p.style.name[-1]) if p.style.name[-1].isdigit() else 0
                 except (IndexError, ValueError):
                     level = 0
-                result.append((idx, p.text.strip(), level))
+                text = p.text.strip()
+                if multi:
+                    result.append((idx, text, level, path.name))
+                else:
+                    result.append((idx, text, level))
         return result
 
+    def extract_heading_tree(
+        self, paragraphs=None, source_label: str = "primary"
+    ) -> list[dict]:
+        """Return a structured heading tree for one document.
+
+        Each entry: {level, text, para_idx, source}.
+
+        Level 1 headings are top-level topics; level 2+ are sub-topics.
+        Also detects numbered headings like "7.0 Topic" even when paragraph
+        style is "Normal", since some DOCXs don't use Heading styles.
+        """
+        if paragraphs is None:
+            paragraphs = self.doc.paragraphs
+
+        _NUMBERED_HEADING = re.compile(
+            r"^(\d+(?:\.\d+)*)[\s.\-:]\s*(.+)$"
+        )
+        result: list[dict] = []
+
+        for idx, p in enumerate(paragraphs):
+            text = p.text.strip()
+            if not text:
+                continue
+            style = p.style.name
+
+            # Named heading style
+            if "Heading" in style:
+                try:
+                    level = int(style[-1]) if style[-1].isdigit() else 1
+                except (IndexError, ValueError):
+                    level = 1
+                result.append({"level": level, "text": text, "para_idx": idx, "source": source_label})
+                continue
+
+            # Numbered section heading (e.g. "3.0 Overview", "3.1.2 Sub-topic")
+            m = _NUMBERED_HEADING.match(text)
+            if m:
+                dots = m.group(1).count(".")
+                level = dots + 1  # "3" → level 1, "3.1" → level 2, etc.
+                result.append({"level": level, "text": text, "para_idx": idx, "source": source_label})
+
+        return result
+
+    def extract_merged_heading_tree(self) -> list[dict]:
+        """Extract and merge heading trees from all source documents (deduplicated by text)."""
+        tree: list[dict] = []
+        seen: set[str] = set()
+
+        for path, doc in self._sources:
+            label = path.name
+            for h in self.extract_heading_tree(paragraphs=doc.paragraphs, source_label=label):
+                key = h["text"].lower()
+                if key not in seen:
+                    tree.append(h)
+                    seen.add(key)
+
+        return tree
+
     def extract_indexed_content(self, max_words: int = 8000) -> str:
-        """Return primary doc content with [P<N>] paragraph index markers.
+        """Return all source documents with [P<N>] paragraph index markers per file.
 
-        Each [P<N>] number is the actual index into doc.paragraphs, so downstream
-        agents can retrieve exact paragraph ranges via doc.paragraphs[start:end+1].
-
-        Extra documents (if any) are appended without index markers as supplemental
-        context — they do not contribute to index mapping.
+        Each document block starts with ``--- Document: <filename> ---``.
+        [P<N>] is the paragraph index within that document's doc.paragraphs list.
         """
         lines: list[str] = []
         total_words = 0
 
-        for idx, p in enumerate(self.doc.paragraphs):
-            if total_words >= max_words:
-                lines.append("[…primary doc truncated at word limit…]")
-                break
-            text = p.text.strip()
-            if not text:
-                continue
-            words = text.split()
-            if total_words + len(words) > max_words:
-                remaining = max_words - total_words
-                lines.append(f"[P{idx}] " + " ".join(words[:remaining]))
-                lines.append("[…primary doc truncated at word limit…]")
-                total_words = max_words
-                break
-            lines.append(f"[P{idx}] {text}")
-            total_words += len(words)
-
-        for i, doc in enumerate(self._extra_docs):
+        for path, doc in self._sources:
             if total_words >= max_words:
                 break
-            lines.append(f"\n--- Supplemental Document {i + 1} (no index mapping) ---")
-            for p in doc.paragraphs:
+            lines.append(f"\n--- Document: {path.name} ---")
+            for idx, p in enumerate(doc.paragraphs):
                 if total_words >= max_words:
-                    lines.append("[…supplemental doc truncated…]")
+                    lines.append("[…content truncated at word limit…]")
                     break
                 text = p.text.strip()
                 if not text:
@@ -459,32 +515,37 @@ class CourseDocParser:
                 words = text.split()
                 if total_words + len(words) > max_words:
                     remaining = max_words - total_words
-                    lines.append(" ".join(words[:remaining]))
-                    lines.append("[…supplemental doc truncated…]")
+                    lines.append(f"[P{idx}] " + " ".join(words[:remaining]))
+                    lines.append("[…content truncated at word limit…]")
                     total_words = max_words
                     break
-                lines.append(text)
+                lines.append(f"[P{idx}] {text}")
                 total_words += len(words)
 
         return "\n".join(lines)
 
     def extract_content_sample(self, max_chars: int = 3000) -> str:
-        """High-level content sample: headings + first paragraph of each section."""
-        parts = []
+        """High-level sample from all sources: headings + first paragraph per section."""
+        parts: list[str] = []
         total = 0
-        prev_was_heading = False
-        for p in self.paragraphs:
-            if "Heading" in p.style.name and p.text.strip():
-                parts.append(f"\n[{p.style.name}] {p.text.strip()}")
-                total += len(parts[-1])
-                prev_was_heading = True
-            elif prev_was_heading and p.text.strip():
-                snippet = p.text.strip()
-                parts.append(snippet)
-                total += len(snippet)
-                prev_was_heading = False
+        for path, doc in self._sources:
             if total >= max_chars:
                 break
+            parts.append(f"\n--- Document: {path.name} ---")
+            total += len(parts[-1])
+            prev_was_heading = False
+            for p in doc.paragraphs:
+                if "Heading" in p.style.name and p.text.strip():
+                    parts.append(f"\n[{p.style.name}] {p.text.strip()}")
+                    total += len(parts[-1])
+                    prev_was_heading = True
+                elif prev_was_heading and p.text.strip():
+                    snippet = p.text.strip()
+                    parts.append(snippet)
+                    total += len(snippet)
+                    prev_was_heading = False
+                if total >= max_chars:
+                    break
         return "\n".join(parts)
 
     def extract_full_content(self, max_words: int = 8000) -> str:
@@ -509,9 +570,32 @@ class CourseDocParser:
             word_count += len(words)
         return "\n".join(collected)
 
+    def extract_all_images(self, images_dir: Path) -> list[dict]:
+        """Extract embedded images from every source document."""
+        images_dir.mkdir(parents=True, exist_ok=True)
+        all_images: list[dict] = []
+        seq_offset = 0
+        for path, doc in self._sources:
+            self.doc = doc
+            self.paragraphs = doc.paragraphs
+            batch = self._extract_images_from_doc(
+                str(path), images_dir, start_seq=seq_offset
+            )
+            for img in batch:
+                img["source_document"] = path.name
+                all_images.append(img)
+            seq_offset += len(batch)
+        return all_images
+
     def extract_images(self, docx_path: str, images_dir: Path) -> list[dict]:
+        """Extract images from a single docx (backward-compatible alias)."""
+        return self._extract_images_from_doc(docx_path, images_dir)
+
+    def _extract_images_from_doc(
+        self, docx_path: str, images_dir: Path, *, start_seq: int = 0
+    ) -> list[dict]:
         """
-        Extract all embedded images from the docx.
+        Extract all embedded images from one docx.
 
         Stores:
           - binary file to images_dir
@@ -543,7 +627,7 @@ class CourseDocParser:
         R   = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
         images: list[dict] = []
-        img_seq = 0
+        img_seq = start_seq
         heading_ctx = ("", 0)
 
         for para_idx, p in enumerate(self.paragraphs):
@@ -637,12 +721,13 @@ class CourseDocParser:
         return images
 
     def count_total_doc_words(self) -> int:
-        """Return the total word count across all paragraphs in the study-guide DOCX."""
+        """Return the total word count across all source documents."""
         total = 0
-        for p in self.paragraphs:
-            text = p.text.strip()
-            if text:
-                total += len(text.split())
+        for _path, doc in self._sources:
+            for p in doc.paragraphs:
+                text = p.text.strip()
+                if text:
+                    total += len(text.split())
         return total
 
     def extract_to_outline_text(self) -> str:

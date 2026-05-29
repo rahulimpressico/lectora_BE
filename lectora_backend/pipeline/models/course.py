@@ -218,8 +218,17 @@ class ContentGenerationBounds(BaseModel):
 
 
 class ExtractedInputs(BaseModel):
-    """Raw inputs A0 pulls directly from the DOCX, enriched with word-count bounds."""
+    """
+    Raw inputs A0 pulls from all source documents (DOCX and/or PDF), enriched
+    with structural extraction results.
 
+    Shallow metadata (title, objectives, word counts) and deep structural data
+    (heading tree, indexed content, TOC mapping) are both persisted here so that
+    downstream agents and observability tooling see a consistent shared-state
+    schema regardless of whether the sources are DOCX or PDF files.
+    """
+
+    # ── Shallow metadata ────────────────────────────────────────────────────
     title: str = Field(min_length=1)
     course_id: Optional[str] = None
     learning_objectives: list[str] = Field(description="Ordered list of learning objective strings.")
@@ -230,7 +239,7 @@ class ExtractedInputs(BaseModel):
     total_doc_word_count: int = Field(
         default=0,
         ge=0,
-        description="Total word count of the source study-guide DOCX (all paragraphs, no exclusions).",
+        description="Total word count across all source documents (all paragraphs/blocks, no exclusions).",
     )
     content_generation_bounds: Optional[ContentGenerationBounds] = Field(
         None,
@@ -240,6 +249,52 @@ class ExtractedInputs(BaseModel):
         default=0,
         ge=0,
         description="Total word count from the Timed Outline's 'totals' row — this is the authoritative generation target.",
+    )
+
+    # ── Structural extraction (consistent for DOCX and PDF sources) ─────────
+    heading_tree: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Merged heading tree from all source documents. "
+            "Each entry: {level: int, text: str, para_idx: int, source: str}."
+        ),
+    )
+    heading_map: list[list[Any]] = Field(
+        default_factory=list,
+        description=(
+            "Heading anchors for TO-to-source section mapping. "
+            "Each entry: [para_idx, text, level] or [para_idx, text, level, source]."
+        ),
+    )
+    indexed_content: str = Field(
+        default="",
+        description=(
+            "[P<N>]-annotated paragraph/block content from all source documents "
+            "(up to 8 000 words). Used by A0 for TO generation; persisted for audit."
+        ),
+    )
+    toc_entries: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Table of Contents entries extracted from source documents. "
+            "Each entry: {level: int, text: str, page: int|null, source: str}."
+        ),
+    )
+    toc_section_contents: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "TOC entries mapped to body-content ranges with [P<N>] indexed excerpts. "
+            "Each entry: {level, title, para_idx_start, para_idx_end, source, indexed_content}."
+        ),
+    )
+    total_paragraphs: int = Field(
+        default=0,
+        ge=0,
+        description="Total paragraph / block count across all source documents.",
+    )
+    paragraphs_by_source: dict[str, int] = Field(
+        default_factory=dict,
+        description="Paragraph / block count per source file, keyed by filename.",
     )
 
     model_config = {
@@ -253,6 +308,17 @@ class ExtractedInputs(BaseModel):
                         "Explain how Risk Rating 2.0 changes premium calculations.",
                     ],
                     "content_sample": "The National Flood Insurance Program (NFIP) was established...",
+                    "total_doc_word_count": 12450,
+                    "to_outline_total_word_count": 9800,
+                    "heading_tree": [
+                        {"level": 1, "text": "Introduction to NFIP", "para_idx": 5, "source": "study_guide.docx"}
+                    ],
+                    "heading_map": [[5, "Introduction to NFIP", 1]],
+                    "indexed_content": "[P5] Introduction to NFIP\n[P6] The NFIP was established...",
+                    "toc_entries": [],
+                    "toc_section_contents": [],
+                    "total_paragraphs": 280,
+                    "paragraphs_by_source": {"study_guide.docx": 280},
                 }
             ]
         }

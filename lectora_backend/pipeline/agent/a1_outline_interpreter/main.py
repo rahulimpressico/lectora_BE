@@ -44,8 +44,39 @@ from .utils.image_mapper import map_images_to_sections
 
 from lectora_backend.pipeline.models import A1Output, A1Status, CourseSpec, Inconsistency
 from lectora_backend.pipeline.rule_pack_config.rule_packs import resolve_rule_pack
+from lectora_backend.pipeline.shared_utils.interactive_elements import (
+    collect_interactive_elements,
+    resolve_section_assets,
+)
+from lectora_backend.pipeline.shared_utils.learning_objectives import (
+    resolve_learning_objectives,
+)
 
 logger = logging.getLogger(__name__)
+
+# Headings that represent structural/metadata sections — never content topics.
+# They are rendered by A2 from metadata (description + learning_objectives), so
+# they must not receive LLM-generated subtopics or be grouped as content parents.
+_RESERVED_SECTION_RE = re.compile(
+    r"^\s*(\d+(\.\d+)*\s+)?"  # optional leading "N.0 " prefix
+    r"(overview|learning\s+objectives?|learning\s+outcomes?|course\s+objectives?|"
+    r"summary|assessment|introduction)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_reserved_section(heading: str) -> bool:
+    """Return True if *heading* names a structural section that must not hold subtopics."""
+    return bool(_RESERVED_SECTION_RE.match(heading.strip()))
+
+
+def _normalize_section_level(level: Any) -> int:
+    """Clamp section levels into the schema-supported range (1..4)."""
+    try:
+        value = int(level)
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, min(value, 4))
 
 
 # -- State -------------------------------------------------------------------
@@ -89,6 +120,15 @@ def load_shared_state(state: A1State) -> A1State:
     try:
         with open(state["shared_state_path"]) as f:
             data = json.load(f)
+        resolved_los = resolve_learning_objectives(data)
+        if resolved_los and not (data.get("extracted_inputs", {}) or {}).get("learning_objectives"):
+            extracted_inputs = dict(data.get("extracted_inputs", {}) or {})
+            extracted_inputs["learning_objectives"] = resolved_los
+            data = {**data, "extracted_inputs": extracted_inputs}
+            logger.info(
+                "[A1] Backfilled %s learning objective(s) from llm_to_outline for PDF-only source.",
+                len(resolved_los),
+            )
         return {
             **state,
             "run_id": data["run_id"],
@@ -103,26 +143,114 @@ def load_shared_state(state: A1State) -> A1State:
 # -- Node: parse_document ----------------------------------------------------
 
 
-_INTERACTIVE_TAGS = (
-    "table",
-    "figure",
-    "image",
-    "chart",
-    "case study",
-    "scenario",
-    "video",
-    "animation",
-)
-
-
 def _append_section_body(current: dict, text: str) -> None:
     """Add a non-heading paragraph to the open section (KC lines included)."""
     current["paragraphs"].append(text)
     current["word_count"] += count_words(text)
-    lower = text.lower()
-    for ie in _INTERACTIVE_TAGS:
-        if ie in lower and ie not in current["interactive_elements"]:
-            current["interactive_elements"].append(ie)
+    current["interactive_elements"] = collect_interactive_elements(
+        [text],
+        initial=current.get("interactive_elements", []),
+    )
+
+
+def _parse_pdf_sections_from_shared_state(
+    a0_data: dict,
+) -> tuple[list[dict], int, int]:
+    """
+    Reconstruct raw_sections for PDF source files using the structural data
+    that A0 already persisted into shared_state.
+
+    Uses:
+      - ``extracted_inputs.heading_tree`` — section boundaries (level, text, para_idx)
+      - ``extracted_inputs.indexed_content`` — ``[P<N>] …`` paragraph blocks
+
+    Returns ``(sections, total_word_count, kc_count)``.
+    """
+    import re as _re
+
+    extracted: dict = a0_data.get("extracted_inputs", {})
+    heading_tree: list[dict] = extracted.get("heading_tree", [])
+    indexed_content: str = extracted.get("indexed_content", "") or ""
+
+    # Parse indexed_content into {para_idx: text} mapping
+    para_map: dict[int, str] = {}
+    for m in _re.finditer(r"\[P(\d+)\]\s*(.*?)(?=\[P\d+\]|\Z)", indexed_content, _re.DOTALL):
+        idx = int(m.group(1))
+        text = m.group(2).strip()
+        if text:
+            para_map[idx] = text
+
+    max_para = max(para_map.keys(), default=0)
+
+    if not heading_tree:
+        # No heading structure — wrap all content in a single synthetic section
+        all_paras = [para_map[k] for k in sorted(para_map.keys())]
+        all_text = " ".join(all_paras)
+        wc = count_words(all_text)
+        interactive_elements = collect_interactive_elements(all_paras)
+        return (
+            [
+                {
+                    "id": "s1_content",
+                    "heading": "Content",
+                    "level": 1,
+                    "is_knowledge_check": False,
+                    "has_knowledge_check": False,
+                    "para_start": 0,
+                    "para_end": max_para,
+                    "paragraphs": all_paras,
+                    "word_count": wc,
+                    "interactive_elements": interactive_elements,
+                }
+            ],
+            wc,
+            0,
+        )
+
+    sections: list[dict] = []
+    kc_count = 0
+
+    for i, h in enumerate(heading_tree):
+        para_start: int = h.get("para_idx", 0)
+        para_end: int = (
+            heading_tree[i + 1].get("para_idx", para_start) - 1
+            if i + 1 < len(heading_tree)
+            else max_para
+        )
+        level: int = _normalize_section_level(h.get("level", 1))
+        heading_text: str = h.get("text", "")
+        is_kc = "Knowledge Check" in heading_text and level == 3
+
+        # Body paragraphs (everything after the heading line itself)
+        body_paras = [
+            para_map[j]
+            for j in range(para_start + 1, para_end + 1)
+            if j in para_map
+        ]
+        wc = count_words(" ".join(body_paras))
+        interactive_elements = collect_interactive_elements(body_paras)
+
+        section: dict = {
+            "id": f"s{len(sections)+1}_{to_snake(heading_text)}",
+            "heading": heading_text,
+            "level": level,
+            "is_knowledge_check": is_kc,
+            "has_knowledge_check": False,
+            "para_start": para_start,
+            "para_end": para_end,
+            "paragraphs": body_paras,
+            "word_count": wc,
+            "interactive_elements": interactive_elements,
+        }
+
+        if is_kc and sections:
+            sections[-1]["has_knowledge_check"] = True
+            kc_count += 1
+
+        sections.append(section)
+
+    total_words = sum(s["word_count"] for s in sections)
+    return sections, total_words, kc_count
 
 
 def parse_document(state: A1State) -> A1State:
@@ -135,6 +263,30 @@ def parse_document(state: A1State) -> A1State:
     try:
         import os as _os
         docx_path = state["docx_path"]
+
+        # ── PDF source: reconstruct sections from A0's shared-state structural data ──
+        if docx_path.lower().endswith(".pdf"):
+            logger.info(
+                "[A1] PDF source detected — rebuilding sections from "
+                "shared-state heading_tree + indexed_content."
+            )
+            a0_data = state.get("a0_data", {})
+            sections, total_words, kc_count = _parse_pdf_sections_from_shared_state(a0_data)
+            logger.info(
+                "[A1] Reconstructed %s sections, %s words, %s KC(s) from PDF shared state.",
+                len(sections),
+                total_words,
+                kc_count,
+            )
+            return {
+                **state,
+                "raw_sections": sections,
+                "total_word_count": total_words,
+                "kc_count": kc_count,
+                "error": None,
+            }
+
+        # ── DOCX source: original python-docx parsing path ──────────────────────────
         if not _os.path.exists(docx_path):
             raise FileNotFoundError(f"Source document not found: {docx_path!r}")
         doc = Document(docx_path)
@@ -276,6 +428,10 @@ def enrich_with_llm(state: A1State) -> A1State:
 
     section_input = {}
     for s in state["raw_sections"]:
+        if _is_reserved_section(s["heading"]):
+            # Reserved structural sections (Overview, LO, Summary, Assessment) are
+            # rendered by A2 from metadata — they must not receive content subtopics.
+            continue
         preview = " ".join(s["paragraphs"][:2])[:250] if s["paragraphs"] else ""
         section_input[s["heading"]] = {"preview": preview}
 
@@ -342,23 +498,17 @@ def build_course_spec(state: A1State) -> A1State:
 
         para_start = s["para_start"]
         para_end = max(s["para_end"], para_start)
+        level = _normalize_section_level(s["level"])
 
-        raw_ies = list(s["interactive_elements"])
-        if s.get("has_knowledge_check") and "knowledge_check" not in raw_ies:
-            raw_ies = [*raw_ies, "knowledge_check"]
-
-        # ── IE-gated binding ────────────────────────────────────────────────
-        # Images: only keep if section IE declares a visual element.
-        _visual_tags = {"chart", "figure", "image"}
-        has_visual_ie = any(t in raw_ies for t in _visual_tags)
-        section_images = (
-            [
-                im
-                for im in state.get("image_map", {}).get(s["id"], [])
-                if para_start <= im.get("para_idx", -1) <= para_end
-            ]
-            if has_visual_ie
-            else []
+        mapped_images = [
+            im
+            for im in state.get("image_map", {}).get(s["id"], [])
+            if para_start <= im.get("para_idx", -1) <= para_end
+        ]
+        raw_ies, section_images = resolve_section_assets(
+            s.get("interactive_elements", []),
+            mapped_images,
+            has_knowledge_check=bool(s.get("has_knowledge_check")),
         )
 
         # KC: only set has_knowledge_check True if IE confirms it.
@@ -369,7 +519,8 @@ def build_course_spec(state: A1State) -> A1State:
             {
                 "id": s["id"],
                 "heading": heading,
-                "level": s["level"],
+                "level": level,
+                "is_reserved": _is_reserved_section(heading),
                 "is_knowledge_check": s["is_knowledge_check"],
                 "has_knowledge_check": has_kc_final,
                 "para_start": para_start,

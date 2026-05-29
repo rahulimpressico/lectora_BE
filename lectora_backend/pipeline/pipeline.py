@@ -129,38 +129,41 @@ def _format_s2_feedback(report: S2ValidationReport) -> str:
 
 
 def run_pipeline(
-    docx_path: str,
+    docx_paths: list[str] | None = None,
     to_outline_doc_path: str | None = None,
     course_difficulty: str = "intermediate",
+    *,
+    docx_path: str | None = None,
     extra_docx_paths: list[str] | None = None,
 ) -> None:
     """
     Run the full multi-agent pipeline for one or more source documents.
 
     Args:
-        docx_path:           Path to the primary source .docx course document.
+        docx_paths:          All source .docx paths (equal priority). Legacy: pass
+            ``docx_path`` + optional ``extra_docx_paths`` instead.
         to_outline_doc_path: Path to the Timed Outline .docx.
-            - Scenario 1 (provided): TO is used as the primary course structure.
+            - Scenario 1 (provided): TO is used as the course structure.
             - Scenario 2 (omitted): A0 generates a complete TO from the source
               content via LLM. Rule packs with ``require_timed_outline`` will fail
               S1 in this scenario.
         course_difficulty:   ``basic``, ``intermediate``, or ``advanced`` — merged into
             the Insurance CE rule pack (default ``intermediate``).
-        extra_docx_paths:    Optional list of additional source .docx files. Their
-            content is merged with the primary document for classification and,
-            when no TO is provided, for TO generation.
     """
     course_difficulty = (course_difficulty or "intermediate").strip().lower()
-    extra_docx_paths = extra_docx_paths or []
+    paths: list[str] = [str(p) for p in (docx_paths or []) if p]
+    if not paths and docx_path:
+        paths = [str(docx_path)]
+        paths.extend(str(p) for p in (extra_docx_paths or []) if p)
+    if not paths:
+        raise ValueError("At least one docx path is required")
 
     start = datetime.now(timezone.utc)
-    set_doc_name(Path(docx_path).stem)
+    set_doc_name(Path(paths[0]).stem)
 
     _separator("PIPELINE START")
-    logger.info("Document   : %s", docx_path)
-    if extra_docx_paths:
-        for i, p in enumerate(extra_docx_paths, 1):
-            logger.info("Extra doc %s: %s", i, p)
+    for i, p in enumerate(paths, 1):
+        logger.info("Source doc %s: %s", i, p)
     logger.info("Difficulty : %s", course_difficulty)
     logger.info(
         "TO doc   : %s",
@@ -183,10 +186,9 @@ def run_pipeline(
 
         _separator(f"A0 — Request Synthesizer (cycle {cycle})")
         a0 = A0RequestSynthesizer(
-            docx_path=docx_path,
+            docx_paths=paths,
             output_dir=SHARED_STATE_DIR,
             to_outline_doc_path=to_outline_doc_path,
-            extra_docx_paths=extra_docx_paths or None,
             course_difficulty=course_difficulty,
         ).run()
         shared_state_path = a0.output_files.shared_state
@@ -199,7 +201,7 @@ def run_pipeline(
         _separator(f"A1 — Timed Outline Interpreter (cycle {cycle})")
         a1_final = a1_run(
             shared_state_path=shared_state_path,
-            docx_path=docx_path,
+            docx_path=paths[0],
             feedback=feedback,
         )
 
@@ -257,7 +259,7 @@ def run_pipeline(
         _separator(f"A2 — Content Generator (cycle {cycle})")
         a2 = A2ContentGenerator(
             shared_state_path=shared_state_path,
-            docx_path=docx_path,
+            docx_path=paths[0],
             render_docx=False,
             feedback=a2_feedback,
             course_difficulty=course_difficulty,

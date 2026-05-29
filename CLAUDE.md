@@ -19,10 +19,26 @@ alembic upgrade head   # required before starting API or worker
 |----------|---------|
 | Production API | `uvicorn lectora_backend.main:app --reload` |
 | Worker (separate terminal) | `PYTHONUNBUFFERED=1 python -m lectora_backend.worker` |
-| Local dev (A0 only, no DB/Bus/Blob needed) | `uvicorn lectora_backend.dev_app:app --reload` |
+| Local dev (full pipeline, no DB/Bus/Blob) | `uvicorn lectora_backend.dev_app:app --reload` |
 | Direct pipeline (no API/worker) | `python3 lectora_backend/pipeline/pipeline.py` |
 
-`dev_app.py` supports the full frontend workflow (upload → generate-TO → three-panel → pipeline → course editor) with no Azure Service Bus or Blob Storage. It uses an in-memory job store and local filesystem. Requires only `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_ENDPOINT`. Exposed endpoints: `POST /documents/upload`, `POST /documents/generate-to`, `GET /documents/generate-to/jobs/{jobId}`, `POST /jobs`, `GET /jobs/{jobId}`, `GET /jobs/{jobId}/events` (SSE), `GET /jobs/{jobId}/course`, `GET /jobs/{jobId}/artifacts`, `GET /jobs/{jobId}/artifacts/download`.
+`dev_app.py` supports the full frontend workflow (upload → generate-TO → three-panel → pipeline → course editor) using an in-memory job store and local filesystem. Requires only `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_ENDPOINT`. Artifacts are written to `pipeline/courses/{courseSlug}/`.
+
+### Docker
+
+**Dev** (`dev_app` — full frontend workflow, no Service Bus or Blob Storage):
+```bash
+cp .env.example .env   # AZURE_OPENAI_* required at minimum
+docker compose up --build -d
+# API: http://localhost:8000/docs
+```
+
+**Production** (`main.py` + worker — all Azure services required):
+```bash
+docker compose -f docker-compose.prod.yml up --build -d
+```
+
+Both compose files default to `DATABASE_URL=sqlite:////app/data/lectora.db` (persisted volume). The prod compose sets `RUN_MIGRATIONS=1` on the API container so Alembic runs on startup; the dev compose sets it to `0`.
 
 ### Database migrations
 ```bash
@@ -48,13 +64,18 @@ This system has two execution modes that share the same pipeline agents:
 - **`lectora_backend/core/orchestrator.py`** — Worker message loop + gate retry logic (`MAX_S1_GATE_CYCLES = 3`); renews Service Bus lock (30 min max)
 - **`lectora_backend/core/pipeline_adapter.py`** — Bridge that translates backend shared state into pipeline agent calls and merges outputs back
 - **`lectora_backend/core/state_manager.py`** — Reads/writes `shared_state.json` to Azure Blob
-- **`lectora_backend/core/blob_layout.py`** — Builds deterministic blob prefix `{jobId}/{fileName}/`
 - **`lectora_backend/repositories/`** — SQL CRUD (`job_repository.py`) and Blob Storage wrapper (`blob_repository.py`)
 
-### Mode 2: Direct pipeline execution (local/dev path)
-`python pipeline.py` calls `run_pipeline(docx_path, to_outline_doc_path)` directly, writing artifacts to `pipeline/shared_state/`.
+### Mode 2: Local dev (`dev_app` + in-memory store)
+`POST /jobs` → `local_course_job_store` (in-memory, 2 hr TTL, max 3 concurrent) → runs same pipeline agents → writes artifacts to `pipeline/courses/{courseSlug}/`.
 
-- **`lectora_backend/pipeline/pipeline.py`** — Orchestrator; runs `(A0 → A1 → S1) x3` then `Section Mapper → KC Planner → (A2 → S2) x3`
+- **`lectora_backend/api/routes/local_jobs.py`** — Job lifecycle routes for dev mode
+- **`lectora_backend/api/local_course_job_store.py`** — TTL-based in-memory store; replaces SQL for local execution
+- **`lectora_backend/core/blob_resolver.py`** — Resolves blob paths to local files; downloads from Azure and caches to disk on first access to avoid re-downloads
+- **`lectora_backend/core/job_registry.py`** — Thread-safe registry of in-flight jobs; enables `/storage/delete` to cancel running jobs that touch deleted paths
+
+### Mode 3: Direct pipeline execution
+`python pipeline.py` calls `run_pipeline(docx_path, to_outline_doc_path)` directly, writing artifacts to `pipeline/shared_state/`.
 
 ### Pipeline Agent Flow
 
@@ -74,19 +95,23 @@ agent/<name>/
 
 | Agent | Role |
 |-------|------|
-| **A0** (`a0_request_synthesizer`) | Extracts metadata from study guide `.docx`, sends timed-outline `.docx` to LLM for outline extraction, classifies rule family, extracts images |
+| **A0** (`a0_request_synthesizer`) | Extracts metadata from primary document (DOCX or PDF), sends timed-outline to LLM for outline extraction, classifies rule family, extracts images; also chunks all source files for downstream retrieval |
 | **A1** (`a1_outline_interpreter`) | LangGraph `StateGraph`; parses document structure, maps images, enriches via LLM, builds `course_spec.json` |
 | **S1** (`s1_validator`) | Quality gate on A0+A1 outputs; blockers trigger full A0→A1→S1 retry |
 | **Section Mapper** (`section_mapper`) | Groups `course_spec` sections under L1 chapters, maps to TO lessons; produces `enriched_sections.json` |
 | **KC Planner** (`kc_planner`) | Determines Knowledge Check placement via 3 auto-selected scenarios; mutates `has_knowledge_check` flags on subtopics in `enriched_sections`; outputs `kc_plan.json` |
-| **A2** (`a2_content_generator`) | One LLM call per lesson (all subtopics batched); renders final styled `.docx` |
+| **A2** (`a2_content_generator`) | One LLM call per lesson (all subtopics batched); retrieves relevant chunks from source files via BM25-style keyword scoring; renders final styled `.docx` |
 | **S2** (`s2_validator`) | Quality gate on generated content; blockers trigger A2 regeneration with feedback |
 
 Shared KC regex patterns (`is_kc_title()`, etc.) live in `pipeline/shared_utils/kc_patterns.py`.
 
+#### Multi-file source support
+
+A0 accepts multiple source files (DOCX + PDF) via the `source_file_paths` field on `POST /jobs`. `a0/utils/chunker.py` splits each file at heading boundaries (~400 words/chunk, 50-word overlap) and stores chunks in shared state. A2 calls `retrieve_chunks_for_topic()` (BM25-style keyword overlap, no vector DB) to pull relevant context per lesson. PDF parsing uses `a0/utils/pdf_extractor.py`; DOCX parsing uses `python-docx`.
+
 #### KC Planner Scenarios (auto-selected)
 
-The KC Planner runs after Section Mapper and selects one of three scenarios based on source document content and TO availability:
+The KC Planner selects one of three scenarios based on source document content and TO availability:
 
 - **Scenario A** — Raw doc has KCs flagged by A1; if TO present, cross-reference and keep only TO-confirmed KCs. Decisions: `confirmed_by_to` or `removed_not_in_to`.
 - **Scenario B** — Raw doc has no KCs but TO is available; derive placements from TO `interactive_elements` or KC-titled subtopics. Decision: `kc_from_to`.
@@ -100,33 +125,63 @@ Rule pack fields: `assessment_rules`, `style_constraints`, `compliance_elements`
 
 ### API Contract
 
-**Authentication:** All routes use Microsoft Entra ID OAuth2 Bearer tokens. The `EntraTokenValidator` middleware (`api/middleware/auth.py`) validates tokens; `get_current_user()` in `dependencies.py` injects the identity.
+**Authentication:** Production routes (`main.py`) use Microsoft Entra ID OAuth2 Bearer tokens via `EntraTokenValidator` middleware. `dev_app.py` has no auth.
 
-**`POST /jobs`** — create a job. Input blobs must already exist in Azure Blob Storage.
+**`POST /jobs`** — create a job.
 ```json
 {
   "studyGuide": "blob/path/to/study_guide.docx",
   "timedOutline": "blob/path/to/timed_outline.docx",
   "courseTitle": "...",
   "courseType": "insurance_ce",
-  "requestedBy": "user@example.com"
+  "requestedBy": "user@example.com",
+  "to_override": { ... },          // optional: user-edited TO JSON from three-panel editor
+  "source_file_paths": ["..."]     // optional: additional DOCX/PDF files for multi-file chunking
 }
 ```
-Returns `202 Accepted` with `{ "jobId": "..." }`.
+Returns `202 Accepted` with `{ "jobId": "..." }`. In production, blobs must already exist in Azure Blob Storage; in dev mode, `blob_resolver.py` downloads and caches them locally.
 
-**`GET /jobs/{jobId}`** — returns job status, stage progress array, and artifact list.
+**`GET /jobs/{jobId}`** — job status, stage progress array, artifact list.
 
-**`POST /jobs/{jobId}/retry`** — triggers retry from a specific stage.
+**`GET /jobs/{jobId}/events`** — SSE stream of real-time stage updates and logs.
 
-**`GET /jobs/{jobId}/artifacts`** — lists output blob paths.
+**`GET /jobs/{jobId}/course`** — course content after completion.
+
+**`GET /jobs/{jobId}/artifacts/download`** — download final `.docx`.
+
+**`POST /jobs/{jobId}/retry`** — retry from a specific stage (production only).
+
+**Storage endpoints** (both `main.py` and `dev_app.py`):
+
+- `GET /storage/browse?prefix=` — browse artifacts container (Azure or local `pipeline/courses/`)
+- `GET /storage/uploaded-documents/browse?prefix=` — browse source documents container
+- `GET /storage/file?path=&source=` — download/preview a file
+- `POST /storage/delete` — delete files/folders; cancels any in-flight jobs that touch those paths via `job_registry`
 
 Schemas live in `lectora_backend/api/schemas/`.
+
+### Storage Layout
+
+Artifacts are organized by **course slug** (sanitized title), not job ID:
+
+```
+{courseSlug}/         ← e.g. Long_Term_Care/
+  doc/                ← original input .docx/.pdf files
+  output/             ← pipeline artifacts (JSON + final .docx)
+  images/             ← extracted image binaries
+  logs/               ← stage completion logs
+  state/              ← shared_state.json
+```
+
+`core/course_storage.py` manages slug generation (`sanitize_course_slug()`), path construction, and backward compatibility with legacy `outputs/` segments. In dev mode this maps to `pipeline/courses/{courseSlug}/`; in production it maps to the Azure Blob container prefix.
+
+Source documents uploaded by the frontend are stored in a separate `uploaded-documents` container/prefix. `core/blob_resolver.py` resolves paths from either container to local disk, caching Azure downloads to avoid re-fetches.
 
 ### Database Schema
 
 Three tables managed by Alembic (`alembic/versions/`):
 
-- **`jobs`** — `job_id`, `status` (`PENDING|PROCESSING|COMPLETED|FAILED`), `course_title`, `course_type`, `requested_by`, `shared_state_blob_path`, `created_at`, `updated_at`
+- **`jobs`** — `job_id`, `status` (`PENDING|PROCESSING|COMPLETED|FAILED|CANCELLED`), `course_title`, `course_type`, `requested_by`, `shared_state_blob_path`, `created_at`, `updated_at`
 - **`stage_progress`** — `id`, `job_id`, `stage_id` (A0/A1/S1/A2/S2), `status`, `validation_outcome` (`PASS|WARNING|RECOVERABLE_FAIL|CRITICAL_FAIL`), `started_at`, `completed_at`, `error_detail` (JSON)
 - **`retry_history`** — `id`, `job_id`, `attempt`, `from_stage`, `triggered_by`, `outcome`
 
@@ -139,22 +194,13 @@ Agents do not import each other. The orchestrator wires them via a shared state 
 - `run_id`, `status` — pipeline run identity and stage
 - `extracted_inputs` — A0 metadata (title, course_id, learning_objectives, content_sample)
 - `images` — extracted image list with paragraph indices
+- `source_chunks` — chunked content from all source files (populated by A0, consumed by A2)
 - `llm_classification` — A0 rule family classification result
 - `llm_to_outline_classification` — A0 timed-outline LLM extraction
 - `agent_outputs.A1.course_spec` — full section hierarchy from A1
 - `agent_outputs.section_map.enriched_sections` — Section Mapper output; KC Planner mutates `has_knowledge_check` flags on subtopics in-place
 - `agent_outputs.kc_planner` — KC Planner report: `{scenario, decisions[]}` with per-subtopic placement decisions
 - `s1_validation`, `s2_validation` — validator reports (`ValidationIssue[]` with `field`, `severity`, `message`, `remediation`)
-
-### Blob Storage Layout (per job)
-```
-{jobId}/{fileName}/
-  doc/          ← original input .docx files
-  output/       ← all pipeline artifacts (JSON + final .docx)
-  images/       ← extracted image binaries
-  logs/         ← stage completion logs
-  state/        ← shared_state.json + pipeline_shared_state.json
-```
 
 ### S2 Word Count Validation Logic
 
@@ -172,9 +218,10 @@ After the main check passes, a deviation check compares section-level word count
 - **`study_guide.docx` is rendered only after S2 passes** (pass or pass_with_warnings).
 - **`DATABASE_URL` must be an absolute path** when using SQLite — relative paths resolve differently from API vs worker processes.
 - **Azure OpenAI o-series models require `max_completion_tokens`**, not `max_tokens` — using the wrong parameter silently breaks generation.
-- Input blobs (`studyGuide`, `timedOutline`) must already exist in Azure Blob Storage before `POST /jobs` — the API records paths only, does not upload files.
+- Production: input blobs must already exist in Azure Blob Storage before `POST /jobs` — the API records paths only. Dev mode: `blob_resolver.py` downloads and caches blobs on demand.
 - Schema is managed via Alembic; the app does not auto-create tables at runtime.
 - Orphaned Service Bus messages (job not found in DB) are dead-lettered immediately, not retried.
+- Storage deletes cancel in-flight jobs via `job_registry` before removing files.
 
 ### Observability
 
@@ -202,6 +249,15 @@ LANGFUSE_HOST=https://cloud.langfuse.com
 ```
 
 All required vars are validated at API startup — missing values cause an immediate `RuntimeError`. `dev_app.py` only requires the `AZURE_OPENAI_*` vars.
+
+### CORS
+
+Both `main.py` and `dev_app.py` call `add_cors_middleware(app)` from `api/middleware/cors.py`, which reads `settings.cors_origins_list()`. Override via env vars (defaults shown):
+
+```env
+CORS_ORIGINS=http://localhost:5173,http://localhost:3000,http://localhost:8080,https://nimble-cendol-69a81c.netlify.app
+CORS_ORIGIN_REGEX=https://.*\.netlify\.app   # covers Netlify branch/preview deploys
+```
 
 ### Validation Severity Levels
 - **Blocker** — pipeline must not proceed; triggers retry then stops

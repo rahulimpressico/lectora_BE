@@ -3,7 +3,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# pyodbc + python-docx/lxml build deps
+# pyodbc + python-docx/lxml build deps + LibreOffice for DOCX→PDF conversion
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         unixodbc \
@@ -11,6 +11,7 @@ RUN apt-get update \
         gcc \
         libxml2-dev \
         libxslt1-dev \
+        libreoffice-writer \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -30,4 +31,4 @@ EXPOSE 8000
 ENTRYPOINT ["/entrypoint.sh"]
 
 # Dev API: full pipeline via in-memory jobs (matches local `dev_app`)
-CMD ["uvicorn", "lectora_backend.dev_app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "lectora_backend.dev_app:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]

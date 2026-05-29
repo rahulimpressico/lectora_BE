@@ -23,6 +23,7 @@ class LocalJobStatus(str, Enum):
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 @dataclass
@@ -34,6 +35,7 @@ class LocalStageProgress:
     outcome: str | None = None
     blockers: list[dict[str, Any]] = field(default_factory=list)
     retry_attempt: int = 0
+    error_message: str | None = None  # persisted by fail_stage()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -44,6 +46,7 @@ class LocalStageProgress:
             "outcome": self.outcome,
             "blockers": self.blockers,
             "retryAttempt": self.retry_attempt,
+            "errorMessage": self.error_message,
         }
 
 
@@ -214,6 +217,7 @@ class LocalCourseJobStore:
             if stage:
                 stage.status = "FAILED"
                 stage.completed_at = datetime.now(timezone.utc).isoformat()
+                stage.error_message = error_message  # surfaced in to_dict()
             job.updated_at = datetime.now(timezone.utc).isoformat()
 
     def append_log(
@@ -247,6 +251,37 @@ class LocalCourseJobStore:
             job.study_guide_path = study_guide_path
             job.finished_at = time.monotonic()
 
+    def cancel_job(self, job_id: str, *, reason: str = "Cancelled") -> bool:
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return False
+            if job.status in (
+                LocalJobStatus.COMPLETED,
+                LocalJobStatus.FAILED,
+                LocalJobStatus.CANCELLED,
+            ):
+                return False
+            job.status = LocalJobStatus.CANCELLED
+            job.updated_at = now
+            job.error = {"message": reason, "code": "CANCELLED"}
+            job.finished_at = time.monotonic()
+            if job.temp_dir:
+                import shutil
+                from pathlib import Path
+
+                shutil.rmtree(Path(job.temp_dir), ignore_errors=True)
+                job.temp_dir = None
+            return True
+
+    def is_cancelled(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return job is not None and job.status == LocalJobStatus.CANCELLED
+
     def fail_job(
         self,
         job_id: str,
@@ -259,6 +294,8 @@ class LocalCourseJobStore:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
+                return
+            if job.status == LocalJobStatus.CANCELLED:
                 return
             job.status = LocalJobStatus.FAILED
             job.updated_at = now
@@ -287,6 +324,10 @@ class LocalCourseJobStore:
             job = self._jobs.get(job_id)
             if job:
                 job.study_guide_path = path
+
+    def remove(self, job_id: str) -> bool:
+        with self._lock:
+            return self._jobs.pop(job_id, None) is not None
 
     def _evict_expired(self) -> None:
         cutoff = time.monotonic() - _TTL_SECONDS

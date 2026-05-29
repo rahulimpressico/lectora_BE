@@ -1,9 +1,24 @@
 """
-POST /documents/upload       — save uploaded DOCX, return a local blob path.
+POST /documents/upload       — save uploaded DOCX, PDF, or JSON (TO) as-is.
 POST /documents/generate-to  — run A0 (async by default; optional sync wait).
 GET  /documents/generate-to/jobs/{jobId} — poll async A0 result.
 
 Designed for local / dev usage.  Production paths go through the worker queue.
+
+PDF ingestion
+─────────────
+PDF files are stored as-is alongside DOCX uploads.  A0 accepts both formats
+natively via its ``pdf_paths`` parameter (handled by ``PDFSourceParser``).
+No conversion step is required; the caller receives the original file's blob
+path and extension.
+
+JSON Timed Outline upload
+─────────────────────────
+A pre-built or previously-generated Timed Outline can be uploaded as a
+``.json`` file.  A0 detects the ``.json`` extension and uses the fast-path
+(``json.load``) instead of invoking the LLM, so the pipeline skips outline
+re-generation entirely.  Only DOCX/PDF are accepted as *source* documents
+for the generate-to endpoint itself; JSON is accepted only as an upload.
 """
 from __future__ import annotations
 
@@ -25,6 +40,7 @@ from lectora_backend.api.generate_to_job_store import (
     get_generate_to_job_store,
     run_a0_job_background,
 )
+from lectora_backend.core.job_registry import register_generate_to
 from lectora_backend.api.schemas.generate_to_schemas import (
     GenerateTOJobAccepted,
     GenerateTOJobPollResponse,
@@ -37,19 +53,27 @@ from lectora_backend.pipeline.agent.a0_request_synthesizer.main import (
 )
 from lectora_backend.pipeline.models import A0Result
 from lectora_backend.core.blob_layout import _sanitize_segment
+from lectora_backend.core.course_storage import (
+    course_folder_from_blob_path,
+)
 from lectora_backend.core.blob_paths import UPLOADED_DOCUMENTS_PREFIX
 from lectora_backend.repositories.blob_repository import BlobRepository
 from lectora_backend.pipeline.rule_pack_config.rule_packs import (
     RULE_PACKS,
     resolve_rule_pack,
 )
-
+from lectora_backend.pipeline.agent.a0_request_synthesizer.utils.outline_metrics import (
+    compute_course_totals,
+    get_difficulty_factor,
+)
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ── Local upload storage (dev only) ──────────────────────────────────────────
 _UPLOAD_ROOT = Path(tempfile.gettempdir()) / "lectora_uploads"
 _UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+_LOCAL_SHARED_STATE_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "shared_state"
+_LOCAL_SHARED_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Sync wait cap (seconds) — FE can use async mode instead of raising this.
 _A0_SYNC_TIMEOUT_SEC = max(
@@ -119,6 +143,24 @@ def _clean_sections(sections: list[dict]) -> list[dict]:
     return cleaned
 
 
+def _scale_section_word_counts(sections: list[dict], source_word_count: int) -> list[dict]:
+    """Proportionally scale section word_count fields so they sum to source_word_count.
+
+    This keeps the per-section distribution from the LLM while anchoring the
+    total to the actual source document size (which drives CE credit hours).
+    """
+    if not sections or source_word_count <= 0:
+        return sections
+    current_total = sum(_safe_int(s.get("word_count")) for s in sections)
+    if current_total <= 0:
+        return sections
+    ratio = source_word_count / current_total
+    scaled = []
+    for s in sections:
+        scaled.append({**s, "word_count": max(1, round(_safe_int(s.get("word_count")) * ratio))})
+    return scaled
+
+
 def _clean_rule_pack(pack: dict | None) -> dict:
     """Strip internal-only keys from the resolved rule pack."""
     if not pack:
@@ -159,26 +201,38 @@ def _build_generate_to_response(
     totals: dict = llm_outline.get("totals") or {}
     sections: list[dict] = llm_outline.get("sections") or []
 
+    total_doc_word_count = _safe_int(
+        getattr(spec, "total_doc_word_count", None) or totals.get("source_word_count")
+    )
+    if total_doc_word_count > 0 and sections:
+        sections = _scale_section_word_counts(sections, total_doc_word_count)
+
+    # Compute accurate totals using the difficulty-adjusted NAIC formula.
+    # 180 words = 1 min | 50 min = 1 CE hour | × difficulty factor
+    cleaned_sections = _clean_sections(sections)
+    course_totals    = compute_course_totals(cleaned_sections, difficulty=difficulty)
+
     to: dict[str, Any] = {
         "course_name": (
             spec.course_metadata.title
             or llm_outline.get("course_title")
             or "Untitled Course"
         ),
-        "rule_family": rule_family_key,
-        "difficulty": difficulty,
-        "audience": spec.course_metadata.audience or "",
-        "course_type": spec.course_metadata.course_type or "",
-        "topic": spec.course_metadata.topic or "",
-        "category": spec.course_metadata.category or "",
-        "description": llm_outline.get("description") or "",
-        "total_word_count": _safe_int(totals.get("word_count")),
-        "total_minutes": _safe_int(totals.get("minutes")),
-        "total_credit_hours": _safe_float(totals.get("credit_hours")),
+        "rule_family":        rule_family_key,
+        "difficulty":         difficulty,
+        "difficulty_factor":  get_difficulty_factor(difficulty),
+        "audience":           spec.course_metadata.audience or "",
+        "course_type":        spec.course_metadata.course_type or "",
+        "topic":              spec.course_metadata.topic or "",
+        "category":           spec.course_metadata.category or "",
+        "description":        llm_outline.get("description") or "",
+        "total_word_count":   course_totals["total_word_count"],
+        "total_minutes":      course_totals["total_minutes"],
+        "total_credit_hours": course_totals["total_credit_hours"],
         "learning_objectives": llm_outline.get("learning_objectives") or [],
-        "sections": _clean_sections(sections),
-        "llm_confidence": spec.rule_classification.llm_confidence,
-        "llm_reasoning": spec.rule_classification.llm_reasoning,
+        "sections":            cleaned_sections,
+        "llm_confidence":      spec.rule_classification.llm_confidence,
+        "llm_reasoning":       spec.rule_classification.llm_reasoning,
     }
 
     # ── Save generated TO as a reusable blob ─────────────────────────────────
@@ -275,55 +329,94 @@ def _upload_folder_from_blob_path(blob_path: str) -> str | None:
 
 
 def _azure_storage_ready() -> bool:
-    try:
-        from lectora_backend.config import settings  # type: ignore[attr-defined]
-        return bool(getattr(settings, "azure_storage_connection_string", "").strip())
-    except Exception:
-        return False
+    from lectora_backend.config import settings
+    return settings.is_azure_storage_configured()
 
 
-def _validate_docx_path(blob_path: str) -> Path:
+def _validate_document_path(blob_path: str) -> Path:
+    """Resolve a blob path (DOCX, PDF, or JSON TO) to a local filesystem Path.
+
+    Accepts DOCX and PDF source documents, plus JSON Timed Outline files.
+    Returns a local file path, downloading from Azure Blob Storage when
+    available.
+
+    Azure downloads are persisted to ``_UPLOAD_ROOT/{normalized}`` (not a
+    disposable temp dir) so that POST /jobs can find the same file by its
+    relative blob path after this call completes.
+
+    JSON files are only meaningful as ``to_doc_blob_path`` (pre-built Timed
+    Outline).  When a ``.json`` appears in ``blob_paths`` (source docs) it is
+    resolved successfully but silently ignored by the ``all_docx``/``all_pdf``
+    split downstream — A0 never receives it as a source document.
+    """
+    from lectora_backend.core.blob_resolver import resolve_blob_to_local
+
     clean = blob_path.strip().lstrip("/")
-    if clean.lower().endswith(".docx"):
-        normalized = _strip_upload_blob_roots(clean)
-        if _azure_storage_ready():
-            try:
-                data = _uploads_blob_repo().download_bytes(normalized)
-                tmp_dir = Path(tempfile.mkdtemp(prefix="lectora_doc_"))
-                dest = tmp_dir / Path(normalized).name
-                dest.write_bytes(data)
-                return dest
-            except FileNotFoundError:
-                pass
+    ext = Path(clean).suffix.lower()
 
-        local_path = (_UPLOAD_ROOT / normalized).resolve()
-        if local_path.is_file():
-            return local_path
+    # Relative blob paths: resolved via the shared blob resolver for all
+    # supported extensions (DOCX, PDF, and JSON TO files).
+    if ext in _UPLOAD_ALLOWED_EXTENSIONS:
+        resolved = resolve_blob_to_local(clean)
+        if resolved is not None:
+            return resolved
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Document not found: {clean}",
+            detail=(
+                f"Document not found: '{clean}'. "
+                "The file may have been uploaded in a previous session that has since expired. "
+                "Please re-upload the document and try again."
+            ),
         )
 
-    docx_path = Path(blob_path)
-    if not docx_path.exists():
+    # Absolute local paths (dev fallback): only DOCX/PDF are accepted here.
+    abs_path = Path(blob_path)
+    if not abs_path.exists():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Document not found at blobPath: {blob_path}",
         )
-    if docx_path.suffix.lower() != ".docx":
+    if abs_path.suffix.lower() not in _ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="blobPath must point to a .docx file.",
+            detail=f"blobPath must point to a {' or '.join(sorted(_ALLOWED_EXTENSIONS))} file.",
         )
-    return docx_path
+    return abs_path
 
 
-def _make_a0_runner(docx_path: Path, output_dir: Path, difficulty: str):
+
+def _make_a0_runner(
+    docx_paths: list[Path],
+    pdf_paths: list[Path],
+    output_dir: Path,
+    difficulty: str,
+    extra_text_contents: list[str] | None = None,
+    custom_to_prompt: str | None = None,
+    course_type_hint: str | None = None,
+    to_outline_doc_path: Path | None = None,
+    course_output_slug: str | None = None,
+    step_logger=None,
+    *,
+    duration_hours: int | None = None,
+    difficulty_level: str | None = None,
+    calculated_word_count: int | None = None,
+):
+    """Build a callable that runs A0 on all source DOCX/PDF files with equal priority."""
     def _run_a0() -> A0Result:
         a0 = A0RequestSynthesizer(
-            docx_path=str(docx_path),
+            docx_paths=[str(p) for p in docx_paths],
+            pdf_paths=[str(p) for p in pdf_paths],
             output_dir=str(output_dir),
             course_difficulty=difficulty,
+            extra_text_contents=extra_text_contents or [],
+            custom_to_prompt=custom_to_prompt,
+            course_type_hint=course_type_hint,
+            to_outline_doc_path=str(to_outline_doc_path) if to_outline_doc_path else None,
+            course_output_slug=course_output_slug,
+            step_logger=step_logger,
+            duration_hours=duration_hours,
+            difficulty_level=difficulty_level,
+            calculated_word_count=calculated_word_count,
         )
         return a0.run()
 
@@ -334,15 +427,29 @@ def _make_a0_runner(docx_path: Path, output_dir: Path, difficulty: str):
 # Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
+_ALLOWED_EXTENSIONS = {".docx", ".pdf"}
+# JSON is accepted for the upload endpoint only (pre-built Timed Outline files).
+# Source-document validation (_validate_document_path) stays strict to DOCX/PDF.
+_UPLOAD_ALLOWED_EXTENSIONS = {".docx", ".pdf", ".json"}
+_CONTENT_TYPES: dict[str, str] = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pdf": "application/pdf",
+    ".json": "application/json",
+}
+
+
 @router.post(
     "/upload",
     response_model=UploadDocumentResponse,
     response_model_by_alias=True,
     status_code=status.HTTP_200_OK,
-    summary="Upload a DOCX file (uploaded-documents container or local temp)",
+    summary="Upload a DOCX, PDF, or JSON (Timed Outline) file (uploaded-documents container or local temp)",
 )
 async def upload_document(
-    file: UploadFile = File(..., description="A .docx source document"),
+    file: UploadFile = File(
+        ...,
+        description="A .docx or .pdf source document, or a .json Timed Outline file.",
+    ),
     course_topic: str = Form(
         ...,
         alias="courseTopic",
@@ -350,16 +457,24 @@ async def upload_document(
     ),
 ) -> UploadDocumentResponse:
     """
-    Save an uploaded DOCX under ``{course_topic}/{filename}`` in the uploaded-documents
-    Azure container (or local dev temp).
+    Save an uploaded DOCX, PDF, or JSON file under ``{course_topic}/{filename}``
+    in the uploaded-documents Azure container (or local dev temp).
+
+    DOCX and PDF files are stored as-is — no conversion is performed.
+    A0 handles PDFs natively via ``PDFSourceParser``.
+
+    JSON files must be valid Timed Outline objects (as produced by
+    ``POST /documents/generate-to``).  A0 detects the ``.json`` extension and
+    uses the fast-path loader, skipping outline re-generation entirely.
 
     The folder name is derived from the mandatory ``courseTopic`` field (sanitized).
     """
     filename = Path(file.filename or "document.docx").name
-    if not filename.lower().endswith(".docx"):
+    ext = Path(filename).suffix.lower()
+    if ext not in _UPLOAD_ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only .docx files are accepted.",
+            detail=f"Only {', '.join(sorted(_UPLOAD_ALLOWED_EXTENSIONS))} files are accepted.",
         )
 
     folder = _parse_course_topic(course_topic)
@@ -381,7 +496,7 @@ async def upload_document(
             _uploads_blob_repo().upload_bytes(
                 blob_path,
                 content,
-                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                content_type=_CONTENT_TYPES.get(ext, "application/octet-stream"),
             )
         except Exception as exc:
             raise HTTPException(
@@ -436,20 +551,80 @@ async def generate_to(
 
     **Legacy sync:** ``?wait=true`` holds the connection until A0 finishes.
     """
-    docx_path = _validate_docx_path(body.blob_path)
+    blob_paths = body.effective_blob_paths
     difficulty = (body.difficulty or "intermediate").strip().lower()
-    output_dir = Path(tempfile.mkdtemp(prefix="lectora_a0_"))
+    custom_to_prompt = (body.custom_to_prompt or "").strip() or None
+    course_type_hint = (body.course_type_hint or "").strip() or None
+
+    # ── Dynamic TO flow params (new) ──────────────────────────────────────────
+    duration_hours: int | None = body.duration_hours
+    difficulty_level: str | None = (body.difficulty_level or "").strip().lower() or None
+    calculated_word_count: int | None = body.calculated_word_count
+
+    # When the dynamic flow is active, sync the difficulty string so A0 uses it
+    # correctly for rule pack + metrics even if the old `difficulty` field
+    # wasn't set by the FE.
+    if difficulty_level and not body.difficulty:
+        difficulty = difficulty_level
+
+    # A0 accepts DOCX and PDF sources natively — separate and pass both.
+    resolved_paths = [_validate_document_path(bp) for bp in blob_paths]
+    all_docx = [p for p in resolved_paths if p.suffix.lower() == ".docx"]
+    all_pdf = [p for p in resolved_paths if p.suffix.lower() == ".pdf"]
+
+    if not all_docx and not all_pdf:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid DOCX or PDF files found in blobPaths.",
+        )
+
+    # Resolve optional user-uploaded TO document (DOCX, PDF, or pre-built JSON)
+    to_outline_path: Path | None = None
+    if body.to_doc_blob_path:
+        to_outline_path = _validate_document_path(body.to_doc_blob_path)
+        if to_outline_path.suffix.lower() == ".json":
+            logger.info(
+                "[generate-to] Pre-built JSON TO detected: %s — A0 will use fast-path loader "
+                "(no LLM outline generation); rule classification still runs.",
+                to_outline_path.name,
+            )
+        else:
+            logger.info("[generate-to] User-provided TO document: %s", to_outline_path.name)
+
+    output_dir = _LOCAL_SHARED_STATE_DIR
+    source_blob = blob_paths[0]
+    course_folder = course_folder_from_blob_path(source_blob)
 
     logger.info(
-        "[generate-to] Starting A0 | file=%s | difficulty=%s | wait=%s",
-        docx_path.name,
+        "[generate-to] Starting A0 | docx=%d | pdf=%d | difficulty=%s | "
+        "duration_hours=%s | calculated_word_count=%s | custom_prompt=%s | course_hint=%s | wait=%s",
+        len(all_docx),
+        len(all_pdf),
         difficulty,
+        duration_hours,
+        calculated_word_count,
+        bool(custom_to_prompt),
+        bool(course_type_hint),
         wait,
     )
 
-    runner = _make_a0_runner(docx_path, output_dir, difficulty)
+    def _build_runner(step_logger=None):
+        return _make_a0_runner(
+            all_docx,
+            all_pdf,
+            output_dir,
+            difficulty,
+            custom_to_prompt=custom_to_prompt,
+            course_type_hint=course_type_hint,
+            to_outline_doc_path=to_outline_path,
+            step_logger=step_logger,
+            duration_hours=duration_hours,
+            difficulty_level=difficulty_level,
+            calculated_word_count=calculated_word_count,
+        )
 
     if wait:
+        runner = _build_runner()
         try:
             result: A0Result = await asyncio.wait_for(
                 asyncio.to_thread(runner),
@@ -460,11 +635,10 @@ async def generate_to(
                 result.request_spec.run_id,
             )
             response = _build_generate_to_response(
-                result, difficulty, source_blob_path=body.blob_path
+                result, difficulty, source_blob_path=source_blob
             )
             return response
         except asyncio.TimeoutError as exc:
-            shutil.rmtree(output_dir, ignore_errors=True)
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 detail=(
@@ -489,13 +663,10 @@ async def generate_to(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"A0 agent failed: {exc}",
             ) from exc
-        finally:
-            shutil.rmtree(output_dir, ignore_errors=True)
 
     # ── Async: return immediately, run A0 in background ─────────────────────
     store = get_generate_to_job_store()
     if not store.acquire_slot():
-        shutil.rmtree(output_dir, ignore_errors=True)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
@@ -504,14 +675,29 @@ async def generate_to(
             ),
         )
 
-    job = store.create(blob_path=body.blob_path, difficulty=difficulty)
+    job = store.create(
+        blob_path=source_blob,
+        blob_paths=blob_paths,
+        course_folder=course_folder,
+        difficulty=difficulty,
+    )
     poll_url = f"/documents/generate-to/jobs/{job.job_id}"
-    source_blob = body.blob_path
+
+    reg = register_generate_to(
+        job.job_id,
+        blob_paths=job.blob_paths,
+        course_folder=course_folder,
+    )
+
+    def _step_logger(level: str, message: str, stage: str | None = None) -> None:
+        store.append_log(job.job_id, level=level, message=message, stage=stage)
+
+    runner = _build_runner(step_logger=_step_logger)
 
     asyncio.create_task(
         run_a0_job_background(
             job.job_id,
-            blob_path=body.blob_path,
+            blob_path=source_blob,
             difficulty=difficulty,
             output_dir=output_dir,
             runner=runner,
@@ -519,6 +705,7 @@ async def generate_to(
                 r, d, source_blob_path=source_blob
             ),
             slot_acquired=True,
+            cancel_event=reg.cancel_event,
         )
     )
 
@@ -532,6 +719,31 @@ async def generate_to(
         status_code=status.HTTP_202_ACCEPTED,
         content=accepted.model_dump(by_alias=True),
     )
+
+
+@router.post(
+    "/generate-to/jobs/{job_id}/cancel",
+    summary="Cancel an in-flight A0 generate-to job",
+)
+async def cancel_generate_to_job(job_id: str) -> JSONResponse:
+    from lectora_backend.core.job_registry import get_generate_to
+
+    store = get_generate_to_job_store()
+    if not store.cancel(job_id, reason="Cancelled by user"):
+        job = store.get(job_id)
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Unknown or expired jobId: {job_id}",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job {job_id} is already {job.status.value}",
+        )
+    handle = get_generate_to(job_id)
+    if handle:
+        handle.cancel_event.set()
+    return JSONResponse(content={"jobId": job_id, "status": "cancelled"})
 
 
 @router.get(
@@ -558,6 +770,7 @@ async def get_generate_to_job(job_id: str) -> GenerateTOJobPollResponse:
             to=job.result.get("to"),
             rules=job.result.get("rules"),
             to_blob_path=job.result.get("toBlobPath"),
+            logs=[log.to_dict() for log in job.logs],
         )
 
     if job.status.value == "failed":
@@ -566,10 +779,21 @@ async def get_generate_to_job(job_id: str) -> GenerateTOJobPollResponse:
             status="failed",
             message=job.message,
             error=job.error or "A0 failed",
+            logs=[log.to_dict() for log in job.logs],
+        )
+
+    if job.status.value == "cancelled":
+        return GenerateTOJobPollResponse(
+            job_id=job.job_id,
+            status="cancelled",
+            message=job.message,
+            error=job.error or "Cancelled",
+            logs=[log.to_dict() for log in job.logs],
         )
 
     return GenerateTOJobPollResponse(
         job_id=job.job_id,
         status="processing",
         message=job.message,
+        logs=[log.to_dict() for log in job.logs],
     )

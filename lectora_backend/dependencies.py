@@ -6,16 +6,36 @@ from fastapi import Depends
 from fastapi.security import OAuth2AuthorizationCodeBearer
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from lectora_backend.api.middleware.auth import EntraTokenValidator
 from lectora_backend.config import settings
 
+# ── Database engine ────────────────────────────────────────────────────────────
 
-connect_args = {"check_same_thread": False} if settings.database_url.startswith(
-    "sqlite") else {}
+if settings.database_url.startswith("sqlite"):
+    # SQLite: use StaticPool so the same in-memory/file connection is reused
+    # across threads, required because SQLite does not support multiple concurrent
+    # writers. check_same_thread=False lets SQLAlchemy route requests from any
+    # thread through the single connection.
+    engine = create_engine(
+        settings.database_url,
+        echo=False,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+else:
+    # Production databases (Postgres / Azure SQL): configure a bounded pool so
+    # we never exhaust server-side connections under concurrent load.
+    engine = create_engine(
+        settings.database_url,
+        echo=False,
+        pool_size=10,       # resident connections kept open
+        max_overflow=20,    # burst headroom on top of pool_size
+        pool_timeout=30,    # seconds to wait for a free connection
+        pool_pre_ping=True, # discard stale connections before handing them out
+    )
 
-engine = create_engine(settings.database_url, echo=False,
-                       connect_args=connect_args)
 SessionLocal = sessionmaker(
     bind=engine,
     autoflush=False,
@@ -31,6 +51,8 @@ def get_db_session() -> Generator[Session, None, None]:
     finally:
         db.close()
 
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
 
 oauth2_scheme = OAuth2AuthorizationCodeBearer(
     authorizationUrl=(

@@ -16,6 +16,12 @@ PIPELINE_ORDER: list[PipelineStep] = [
     PipelineStep.A6,
 ]
 
+# Precomputed O(1) stage-position lookup — use instead of PIPELINE_ORDER.index()
+# which raises ValueError for unknown stages and is O(n) per call.
+STAGE_ORDER: dict[PipelineStep, int] = {
+    step: i for i, step in enumerate(PIPELINE_ORDER)
+}
+
 # Gate cycle limits — how many times each gate loop can retry before hard-stopping.
 MAX_S1_GATE_CYCLES: int = 3   # A0 → A1 → S1 cycles
 MAX_A2_S2_CYCLES: int = 3     # A2 → S2 cycles

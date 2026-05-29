@@ -95,7 +95,9 @@ class Orchestrator:
             "completedAt": completed_at.isoformat(),
         }
         if validation_outcome is not None:
-            state["stageExecutionState"][stage_id.value]["outcome"] = validation_outcome.value
+            state["stageExecutionState"][stage_id.value]["outcome"] = (
+                validation_outcome.value
+            )
         self._state_manager.save(job_id, state, blob_path=state_blob_path)
 
     def _fail_stage(
@@ -127,7 +129,9 @@ class Orchestrator:
             "completedAt": completed_at.isoformat(),
         }
         if validation_outcome is not None:
-            state["stageExecutionState"][stage_id.value]["outcome"] = validation_outcome.value
+            state["stageExecutionState"][stage_id.value]["outcome"] = (
+                validation_outcome.value
+            )
         if error_detail is not None:
             state["stageExecutionState"][stage_id.value]["errorDetail"] = error_detail
         self._state_manager.save(job_id, state, blob_path=state_blob_path)
@@ -150,7 +154,9 @@ class Orchestrator:
                         )
 
                         if not messages:
-                            logger.info("No messages received from queue %s", self._queue_name)
+                            logger.info(
+                                "No messages received from queue %s", self._queue_name
+                            )
                             continue
 
                         logger.info(
@@ -183,14 +189,18 @@ class Orchestrator:
                                     error_description=str(exc),
                                 )
                             except JobNotFoundError as exc:
-                                logger.warning("Dead-lettering orphan message: %s", exc)
+                                logger.warning(
+                                    "Dead-lettering orphan message: %s", exc
+                                )
                                 receiver.dead_letter_message(
                                     message,
                                     reason="JobNotFound",
                                     error_description=str(exc),
                                 )
                             except Exception as exc:
-                                delivery_count = getattr(message, "delivery_count", 1)
+                                delivery_count = getattr(
+                                    message, "delivery_count", 1
+                                )
                                 logger.exception(
                                     "Worker failed for message on attempt %s: %s",
                                     delivery_count,
@@ -235,9 +245,9 @@ class Orchestrator:
             # ── A0 → A1 → S1 gate ───────────────────────────────────────────
             # S1 validates combined A0 + A1 outputs.
             # If S1 blocks, re-run A0+A1 with prior S1 feedback — up to MAX_S1_GATE_CYCLES.
-            pipeline_result: dict[str, Any] | None = None
+            a0_ctx: dict[str, Any] | None = None
+            a1_ctx: dict[str, Any] | None = None
             s1_result: dict[str, Any] | None = None
-            s1_started_at: datetime | None = None
             prior_s1_report: Any | None = None
 
             for gate_cycle in range(1, MAX_S1_GATE_CYCLES + 1):
@@ -270,13 +280,15 @@ class Orchestrator:
                     stage_id=PipelineStep.A0,
                     started_at=a0_started_at,
                 )
-                job_log.info("Document analysis started — extracting metadata, images, and rule family", "A1")
+                job_log.info(
+                    "Document analysis started — extracting metadata, images, and rule family",
+                    "A0",
+                )
 
-                pipeline_result = self._pipeline_adapter.run_a0_a1(
+                a0_ctx = self._pipeline_adapter.run_a0(
                     job_id,
                     state_blob_path=state_blob_path,
                     prepared_inputs=prepared_inputs,
-                    s1_retry_feedback=s1_retry_bundle,
                     gate_attempt=gate_cycle,
                 )
                 state = self._state_manager.load(job_id, blob_path=state_blob_path)
@@ -291,7 +303,7 @@ class Orchestrator:
                     started_at=a0_started_at,
                     completed_at=a0_completed_at,
                 )
-                job_log.success("Document analysis complete", "A1")
+                job_log.success("Document analysis complete", "A0")
 
                 # ── A1 ──────────────────────────────────────────────────────
                 a1_started_at = datetime.now(timezone.utc)
@@ -303,7 +315,19 @@ class Orchestrator:
                     stage_id=PipelineStep.A1,
                     started_at=a1_started_at,
                 )
-                job_log.info("Outline interpretation started — building enriched course spec", "A1")
+                job_log.info(
+                    "Outline interpretation started — building enriched course spec", "A1"
+                )
+
+                a1_ctx = self._pipeline_adapter.run_a1(
+                    job_id,
+                    state_blob_path=state_blob_path,
+                    a0_result=a0_ctx["a0"],
+                    study_guide_path=a0_ctx["studyGuidePath"],
+                    s1_retry_feedback=s1_retry_bundle,
+                    gate_attempt=gate_cycle,
+                )
+                state = self._state_manager.load(job_id, blob_path=state_blob_path)
 
                 a1_completed_at = datetime.now(timezone.utc)
                 self._complete_stage(
@@ -319,22 +343,24 @@ class Orchestrator:
 
                 # ── S1 ──────────────────────────────────────────────────────
                 state = self._state_manager.load(job_id, blob_path=state_blob_path)
-                if s1_started_at is None:
-                    s1_started_at = datetime.now(timezone.utc)
-                    self._start_stage(
-                        repository=repository,
-                        job_id=job_id,
-                        state=state,
-                        state_blob_path=state_blob_path,
-                        stage_id=PipelineStep.S1,
-                        started_at=s1_started_at,
-                    )
-                    job_log.info("Content validation gate started", "S1")
+
+                # Always update S1 started_at so retries show the most recent
+                # attempt time rather than the first cycle's timestamp.
+                s1_started_at = datetime.now(timezone.utc)
+                self._start_stage(
+                    repository=repository,
+                    job_id=job_id,
+                    state=state,
+                    state_blob_path=state_blob_path,
+                    stage_id=PipelineStep.S1,
+                    started_at=s1_started_at,
+                )
+                job_log.info("Content validation gate started", "S1")
 
                 s1_result = self._pipeline_adapter.run_s1(
                     job_id,
                     state_blob_path=state_blob_path,
-                    pipeline_shared_state_path=pipeline_result["a0SharedStatePath"],
+                    pipeline_shared_state_path=a0_ctx["a0SharedStatePath"],
                 )
                 state = self._state_manager.load(job_id, blob_path=state_blob_path)
                 state["stageExecutionState"].setdefault(PipelineStep.S1.value, {})[
@@ -349,7 +375,11 @@ class Orchestrator:
 
                 # ── S1 blocked: surface blocker details + schedule retry ──
                 s1_issues = getattr(s1_result["s1"], "issues", []) or []
-                blocker_issues = [i for i in s1_issues if getattr(i, "severity", "") in ("blocker", "critical")]
+                blocker_issues = [
+                    i
+                    for i in s1_issues
+                    if getattr(i, "severity", "") in ("blocker", "critical")
+                ]
                 blocker_details = [
                     {
                         "severity": getattr(i, "severity", "blocker"),
@@ -358,14 +388,16 @@ class Orchestrator:
                     }
                     for i in blocker_issues
                 ]
-                blocker_summary = "; ".join(d["message"] for d in blocker_details[:3]) or "Validation failed"
+                blocker_summary = (
+                    "; ".join(d["message"] for d in blocker_details[:3])
+                    or "Validation failed"
+                )
 
                 job_log.warn(
                     f"Content validation blocked (attempt {gate_cycle}/{MAX_S1_GATE_CYCLES}): {blocker_summary}",
                     "S1",
                 )
 
-                # Persist blocker details into stage_progress so the SSE endpoint can surface them
                 repository.update_stage_status(
                     job_id=job_id,
                     stage_id=PipelineStep.S1,
@@ -393,9 +425,11 @@ class Orchestrator:
                         "S1",
                     )
             else:
-                # All gate cycles exhausted
+                # All gate cycles exhausted — hard-fail the job.
                 s1_completed_at = datetime.now(timezone.utc)
-                s1_error_detail = self._pipeline_adapter.build_s1_error_detail(s1_result["s1"])
+                s1_error_detail = self._pipeline_adapter.build_s1_error_detail(
+                    s1_result["s1"]
+                )
                 self._fail_stage(
                     repository=repository,
                     job_id=job_id,
@@ -412,9 +446,6 @@ class Orchestrator:
                     f"Content validation failed after {MAX_S1_GATE_CYCLES} attempts — pipeline stopped",
                     "S1",
                 )
-                logger.info("Received job %s with payload %s", job_id, payload)
-                logger.info("Pipeline result for %s: %s", job_id, pipeline_result)
-                logger.info("S1 result for %s: %s", job_id, s1_result)
                 return
 
             # S1 passed
@@ -430,10 +461,12 @@ class Orchestrator:
                 completed_at=s1_completed_at,
                 validation_outcome=s1_outcome,
             )
-            outcome_label = "with warnings" if s1_outcome == ValidationOutcome.WARNING else "clean"
+            outcome_label = (
+                "with warnings" if s1_outcome == ValidationOutcome.WARNING else "clean"
+            )
             job_log.success(f"Content validation passed ({outcome_label})", "S1")
 
-            # ── A2 (includes Section Mapper → KC Planner → content generation → S2 gate) ──
+            # ── A2 (Section Mapper → KC Planner → content generation → S2 gate) ──
             state = self._state_manager.load(job_id, blob_path=state_blob_path)
             a2_started_at = datetime.now(timezone.utc)
             self._start_stage(
@@ -445,13 +478,15 @@ class Orchestrator:
                 started_at=a2_started_at,
             )
             job_log.info("Section mapping + KC planning started", "A2")
-            job_log.info("Content generation started — writing course sections with AI", "A2")
+            job_log.info(
+                "Content generation started — writing course sections with AI", "A2"
+            )
 
             a2_result = self._pipeline_adapter.run_a2(
                 job_id,
                 state_blob_path=state_blob_path,
-                pipeline_shared_state_path=pipeline_result["a0SharedStatePath"],
-                study_guide_path=pipeline_result["studyGuidePath"],
+                pipeline_shared_state_path=a0_ctx["a0SharedStatePath"],
+                study_guide_path=a0_ctx["studyGuidePath"],
             )
             state = self._state_manager.load(job_id, blob_path=state_blob_path)
             a2_completed_at = datetime.now(timezone.utc)
@@ -474,7 +509,6 @@ class Orchestrator:
                     validation_outcome=ValidationOutcome.CRITICAL_FAIL,
                     error_detail=s2_error,
                 )
-                # Explicitly mark S2 as failed so the frontend stage row reflects reality
                 repository.update_stage_status(
                     job_id=job_id,
                     stage_id=PipelineStep.S2,
@@ -488,7 +522,9 @@ class Orchestrator:
                     "Quality assurance gate blocked generation after max retries — pipeline stopped",
                     "S2",
                 )
-                logger.error("Job %s failed: S2 hard-blocked after max retries.", job_id)
+                logger.error(
+                    "Job %s failed: S2 hard-blocked after max retries.", job_id
+                )
                 return
 
             self._complete_stage(
@@ -503,7 +539,6 @@ class Orchestrator:
             )
             job_log.success("Content generation complete — all sections written", "A2")
 
-            # Explicitly mark S2 as completed so the frontend stage row reflects reality
             repository.update_stage_status(
                 job_id=job_id,
                 stage_id=PipelineStep.S2,
@@ -516,10 +551,6 @@ class Orchestrator:
             repository.update_job_status(job_id, JobStatus.COMPLETED)
             job_log.success("Course generation complete — pipeline finished successfully")
 
-            logger.info("Received job %s with payload %s", job_id, payload)
-            logger.info("Pipeline result for %s: %s", job_id, pipeline_result)
-            logger.info("S1 result for %s: %s", job_id, s1_result)
-            logger.info("A2 result for %s: %s", job_id, a2_result)
         finally:
             if prepared_inputs is not None:
                 shutil.rmtree(Path(prepared_inputs["tempDir"]), ignore_errors=True)

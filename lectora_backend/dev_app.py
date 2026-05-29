@@ -22,6 +22,10 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv()
 
+from lectora_backend.core.logging_config import configure_logging
+
+configure_logging()
+
 from fastapi import FastAPI
 
 from lectora_backend.api.middleware.cors import add_cors_middleware
@@ -29,6 +33,7 @@ from lectora_backend.api.routes import health
 from lectora_backend.api.routes import generate_to
 from lectora_backend.api.routes import local_jobs
 from lectora_backend.api.routes import storage
+from lectora_backend.api.routes import settings as settings_routes
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +53,11 @@ def _validate_openai_settings() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _validate_openai_settings()
-    logger.info("[dev_app] Azure OpenAI credentials OK — dev server ready (full pipeline enabled).")
+    logger.info(
+        "[dev_app] Azure OpenAI credentials OK — dev server ready "
+        "(LOG_LEVEL=%s; [EXTRACT]/[TO-LLM]/[A0] logs go to this terminal).",
+        os.getenv("LOG_LEVEL", "INFO"),
+    )
     yield
 
 
@@ -66,10 +75,11 @@ app = FastAPI(
 
 add_cors_middleware(app)
 
-app.include_router(health.router,      prefix="/health",    tags=["health"])
-app.include_router(generate_to.router, prefix="/documents",  tags=["documents"])
-app.include_router(local_jobs.router,  prefix="/jobs",       tags=["jobs"])
-app.include_router(storage.router,     prefix="/storage",    tags=["storage"])
+app.include_router(health.router,          prefix="/health",    tags=["health"])
+app.include_router(generate_to.router,     prefix="/documents",  tags=["documents"])
+app.include_router(local_jobs.router,      prefix="/jobs",       tags=["jobs"])
+app.include_router(storage.router,         prefix="/storage",    tags=["storage"])
+app.include_router(settings_routes.router, prefix="/settings",   tags=["settings"])
 
 
 @app.get("/", include_in_schema=False)

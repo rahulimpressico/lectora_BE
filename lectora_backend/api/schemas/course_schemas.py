@@ -19,6 +19,14 @@ class CamelModel(BaseModel):
 
 # ── Course content (GET /jobs/{jobId}/course) ─────────────────────────────────
 
+class SectionImageSchema(CamelModel):
+    id: str
+    file_name: str
+    blob_path: str
+    caption: str | None = None
+    alt_text: str | None = None
+
+
 class CourseSectionSchema(CamelModel):
     id: str
     title: str
@@ -31,6 +39,7 @@ class CourseSectionSchema(CamelModel):
     order: int
     parent_id: str | None = None
     children: list["CourseSectionSchema"] = []
+    images: list[SectionImageSchema] = []
 
 
 class CourseContentMeta(CamelModel):
@@ -56,6 +65,7 @@ class AIOperationRequest(CamelModel):
     operation: str      # regenerate | rewrite | improve_tone | summarize | expand | simplify
     content: str
     context: str | None = None
+    user_prompt: str | None = None
 
 
 class AIOperationResponse(CamelModel):

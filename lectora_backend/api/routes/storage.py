@@ -24,7 +24,10 @@ from lectora_backend.repositories.blob_repository import BlobRepository
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_LOCAL_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "shared_state"
+_LOCAL_COURSES_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "courses"
+_LOCAL_LEGACY_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "shared_state"
+_LOCAL_DIR = _LOCAL_COURSES_DIR
+_LOCAL_COURSES_DIR.mkdir(parents=True, exist_ok=True)
 _UPLOAD_ROOT = Path(tempfile.gettempdir()) / "lectora_uploads"
 # Only these appear on the Documents page (not generated_to.json etc.)
 _UPLOAD_DOC_EXTENSIONS = frozenset({".docx", ".doc", ".pdf"})
@@ -64,6 +67,7 @@ class BrowseResponse(BaseModel):
     totalFolders: int
     totalSize: int
     source: Literal["azure", "local"]
+    container_name: str | None = Field(default=None, alias="containerName")
 
 
 class DeleteStorageFilesRequest(BaseModel):
@@ -96,6 +100,16 @@ class DeleteStorageFilesResponse(BaseModel):
 
 def _iso(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+
+
+def _main_container_name() -> str:
+    from lectora_backend.config import settings  # type: ignore[attr-defined]
+
+    return getattr(settings, "blob_container_name", None) or "regedlectoraaistorage"
+
+
+def _uploads_container_display_name() -> str:
+    return _uploads_container_name()
 
 
 def _azure_configured() -> bool:
@@ -151,16 +165,15 @@ def _browse_uploaded_documents_azure(relative_prefix: str) -> BrowseResponse:
     primary = _filter_upload_entries(
         _azure_browse_container(uploads_repo, azure_prefix, uploads_only=True),
     )
-    primary = BrowseResponse(
+    return BrowseResponse(
         prefix=azure_prefix,
         entries=primary.entries,
         totalFiles=primary.totalFiles,
         totalFolders=primary.totalFolders,
         totalSize=primary.totalSize,
         source="azure",
+        container_name=_uploads_container_display_name(),
     )
-
-    return primary
 
 
 def _filter_upload_entries(response: BrowseResponse) -> BrowseResponse:
@@ -179,6 +192,7 @@ def _filter_upload_entries(response: BrowseResponse) -> BrowseResponse:
         totalFolders=len(folders),
         totalSize=total_size,
         source=response.source,
+        container_name=response.container_name,
     )
 
 
@@ -189,10 +203,6 @@ def _normalize_blob_path(path: str, source: Literal["artifacts", "uploads"]) -> 
     if source == "uploads":
         return _strip_upload_blob_roots(clean)
     return clean
-
-
-def _local_browse(relative_prefix: str) -> BrowseResponse:
-    return _local_browse_at(_LOCAL_DIR, relative_prefix)
 
 
 def _azure_browse(prefix: str, *, uploads_only: bool = False) -> BrowseResponse:
@@ -265,6 +275,7 @@ def _azure_browse_container(
         totalFolders=len(folders),
         totalSize=total_size,
         source="azure",
+        container_name=_main_container_name(),
     )
 
 
@@ -274,8 +285,15 @@ def _resolve_local_file(source: Literal["artifacts", "uploads"], relative_path: 
         base = _UPLOAD_ROOT.resolve()
         rel = _local_uploaded_documents_relative(clean)
     else:
-        base = _LOCAL_DIR.resolve()
-        rel = clean
+        from lectora_backend.core.course_storage import strip_legacy_outputs_prefix
+
+        rel = strip_legacy_outputs_prefix(clean)
+        if rel and (_LOCAL_COURSES_DIR / rel).exists():
+            base = _LOCAL_COURSES_DIR.resolve()
+        elif (_LOCAL_COURSES_DIR / rel).exists() or not (_LOCAL_LEGACY_DIR / rel).exists():
+            base = _LOCAL_COURSES_DIR.resolve()
+        else:
+            base = _LOCAL_LEGACY_DIR.resolve()
 
     target = (base / rel).resolve() if rel else base.resolve()
     if not str(target).startswith(str(base)):
@@ -341,6 +359,70 @@ def _local_browse_at(base: Path, relative_prefix: str) -> BrowseResponse:
         totalFolders=len(folders),
         totalSize=total_size,
         source="local",
+        container_name=_main_container_name() if base == _LOCAL_COURSES_DIR.resolve() else None,
+    )
+
+
+def _local_browse_artifacts(relative_prefix: str) -> BrowseResponse:
+    """Browse local pipeline courses + legacy shared_state (mirrors Azure container layout)."""
+    from lectora_backend.core.course_storage import strip_legacy_outputs_prefix
+
+    clean = strip_legacy_outputs_prefix(relative_prefix.strip().lstrip("/"))
+
+    if clean:
+        legacy_resp = _local_browse_at(_LOCAL_LEGACY_DIR, clean)
+        if legacy_resp.entries:
+            legacy_resp.container_name = _main_container_name()
+            return legacy_resp
+        out_resp = _local_browse_at(_LOCAL_COURSES_DIR, clean)
+        out_resp.container_name = _main_container_name()
+        return out_resp
+
+    entries: list[StorageEntry] = []
+    seen: set[str] = set()
+    if _LOCAL_COURSES_DIR.exists():
+        for item in sorted(
+            _LOCAL_COURSES_DIR.iterdir(),
+            key=lambda p: (not p.is_dir(), p.name.lower()),
+        ):
+            if not item.is_dir():
+                continue
+            seen.add(item.name)
+            fc = sum(1 for f in item.rglob("*") if f.is_file())
+            entries.append(
+                StorageEntry(
+                    name=item.name,
+                    path=f"{item.name}/",
+                    entryType="folder",
+                    fileCount=fc,
+                )
+            )
+    if _LOCAL_LEGACY_DIR.exists():
+        for item in sorted(
+            _LOCAL_LEGACY_DIR.iterdir(),
+            key=lambda p: (not p.is_dir(), p.name.lower()),
+        ):
+            if not item.is_dir() or item.name in seen:
+                continue
+            fc = sum(1 for f in item.rglob("*") if f.is_file())
+            entries.append(
+                StorageEntry(
+                    name=item.name,
+                    path=f"{item.name}/",
+                    entryType="folder",
+                    fileCount=fc,
+                )
+            )
+
+    folders = [e for e in entries if e.entryType == "folder"]
+    return BrowseResponse(
+        prefix="",
+        entries=entries,
+        totalFiles=0,
+        totalFolders=len(folders),
+        totalSize=0,
+        source="local",
+        container_name=_main_container_name(),
     )
 
 
@@ -408,17 +490,34 @@ def _file_response_bytes(data: bytes, blob_path: str) -> Response:
     )
 
 
+def _artifacts_browse_prefix(prefix: str) -> str:
+    """Map UI prefix to a blob prefix inside the main container (``regedlectoraaistorage``)."""
+    from lectora_backend.core.course_storage import strip_legacy_outputs_prefix
+
+    clean = strip_legacy_outputs_prefix(prefix.strip().lstrip("/"))
+    if not clean:
+        return ""
+    return clean if clean.endswith("/") else f"{clean}/"
+
+
 @router.get("/browse", response_model=BrowseResponse)
 async def browse_storage(
     prefix: str = Query(default="", description="Path prefix to browse. Empty for root."),
 ) -> BrowseResponse:
-    """Browse pipeline artifacts (not uploaded-documents/)."""
+    """Browse the main Azure container (``regedlectoraaistorage``) — full tree at root."""
+    azure_prefix = _artifacts_browse_prefix(prefix)
     if _azure_configured():
         try:
-            return _azure_browse(prefix)
+            result = _azure_browse(azure_prefix)
+            if result.entries or prefix:
+                return result
+            logger.info(
+                "[storage] Azure browse empty at prefix=%r — falling back to local.",
+                azure_prefix,
+            )
         except Exception as exc:
             logger.warning("[storage] Azure browse failed (%s), falling back to local.", exc)
-    return _local_browse(prefix)
+    return _local_browse_artifacts(prefix)
 
 
 @router.get("/uploaded-documents/browse", response_model=BrowseResponse)
@@ -437,16 +536,30 @@ async def browse_uploaded_documents(
     """
     if _azure_configured():
         try:
-            return _browse_uploaded_documents_azure(prefix)
+            primary = _browse_uploaded_documents_azure(prefix)
+            filtered = _filter_upload_entries(primary)
+            if prefix or filtered.totalFiles or filtered.totalFolders:
+                return filtered
+            logger.info(
+                "[storage] uploaded-documents empty at root — listing main container %s",
+                _main_container_name(),
+            )
+            main_docs = _filter_upload_entries(_azure_browse("", uploads_only=True))
+            main_docs.container_name = _main_container_name()
+            return main_docs
         except Exception as exc:
             logger.warning(
                 "[storage] Azure uploaded-documents browse failed (%s), falling back to local.",
                 exc,
             )
     _UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-    return _filter_upload_entries(
+    local = _filter_upload_entries(
         _local_browse_at(_UPLOAD_ROOT, _local_uploaded_documents_relative(prefix)),
     )
+    if prefix or local.totalFiles or local.totalFolders:
+        local.container_name = _uploads_container_display_name()
+        return local
+    return _filter_upload_entries(_local_browse_artifacts(prefix))
 
 
 @router.get("/file", summary="Download or preview a file")
@@ -482,122 +595,30 @@ async def get_storage_file(
     return FileResponse(path=str(target), media_type=media, filename=target.name)
 
 
-def _delete_storage_file(path: str, source: Literal["artifacts", "uploads"]) -> None:
-    """Delete one file from Azure Blob and/or local storage."""
-    clean = path.strip().lstrip("/")
-    if not clean or ".." in clean:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid file path",
-        )
-
-    if source == "uploads":
-        blob_path = _normalize_blob_path(path, source)
-        removed = False
-        if _azure_configured():
-            repo = _uploads_blob_repo()
-            if repo.exists(blob_path):
-                repo.delete_blob(blob_path)
-                removed = True
-        try:
-            target = _resolve_local_file(source, path)
-            if target.is_file():
-                target.unlink(missing_ok=True)
-                removed = True
-        except HTTPException as exc:
-            if exc.status_code != status.HTTP_404_NOT_FOUND:
-                raise
-        if not removed:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"File not found: {path}",
-            )
-        return
-
-    blob_path = clean
-    removed = False
-    if _azure_configured():
-        repo = BlobRepository()
-        if repo.exists(blob_path):
-            repo.delete_blob(blob_path)
-            removed = True
-    try:
-        target = _resolve_local_file(source, path)
-        if target.is_file():
-            target.unlink(missing_ok=True)
-            removed = True
-    except HTTPException as exc:
-        if exc.status_code != status.HTTP_404_NOT_FOUND:
-            raise
-    if not removed:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"File not found: {path}",
-        )
-
-
-def _delete_storage_folder(folder_path: str, source: Literal["artifacts", "uploads"]) -> int:
-    """Delete all blobs under a folder prefix. Returns number of blobs removed."""
-    clean = folder_path.strip().lstrip("/").rstrip("/")
-    if not clean or ".." in clean:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid folder path",
-        )
-
-    if source == "uploads":
-        prefix = _relative_upload_prefix(clean)
-        removed = 0
-        if _azure_configured():
-            repo = _uploads_blob_repo()
-            for name in repo.list_blobs(prefix):
-                repo.delete_blob(name)
-                removed += 1
-        local_dir = (_UPLOAD_ROOT / _strip_upload_blob_roots(clean)).resolve()
-        if local_dir.is_dir():
-            for f in local_dir.rglob("*"):
-                if f.is_file():
-                    f.unlink(missing_ok=True)
-                    removed += 1
-        if removed == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Folder not found or empty: {folder_path}",
-            )
-        return removed
-
-    prefix = clean if clean.endswith("/") else f"{clean}/"
-    removed = 0
-    if _azure_configured():
-        repo = BlobRepository()
-        for name in repo.list_blobs(prefix):
-            repo.delete_blob(name)
-            removed += 1
-    local_dir = (_LOCAL_DIR / clean).resolve()
-    if local_dir.is_dir():
-        for f in local_dir.rglob("*"):
-            if f.is_file():
-                f.unlink(missing_ok=True)
-                removed += 1
-    if removed == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Folder not found or empty: {folder_path}",
-        )
-    return removed
-
-
 @router.post("/delete", response_model=DeleteStorageFilesResponse)
 async def delete_storage_files(
     body: DeleteStorageFilesRequest,
 ) -> DeleteStorageFilesResponse:
     """Delete files and/or folders from blob storage."""
+    from lectora_backend.core.storage_cleanup import (
+        cancel_background_jobs_for_delete,
+        delete_storage_file,
+        delete_storage_folder,
+    )
+
+    cancelled = cancel_background_jobs_for_delete(body.paths, body.folder_paths)
+    if cancelled:
+        logger.info(
+            "[storage] Cancelled %s in-flight job(s) before delete",
+            len(cancelled),
+        )
+
     results: list[DeleteStorageFileResult] = []
     deleted_count = 0
 
     for path in body.paths:
         try:
-            _delete_storage_file(path, body.source)
+            delete_storage_file(path, body.source)
             results.append(DeleteStorageFileResult(path=path, ok=True))
             deleted_count += 1
         except HTTPException as exc:
@@ -609,7 +630,7 @@ async def delete_storage_files(
 
     for folder_path in body.folder_paths:
         try:
-            count = _delete_storage_folder(folder_path, body.source)
+            count = delete_storage_folder(folder_path, body.source)
             results.append(
                 DeleteStorageFileResult(
                     path=folder_path,

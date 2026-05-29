@@ -10,25 +10,34 @@ from azure.storage.blob import BlobServiceClient, ContentSettings
 
 from lectora_backend.config import settings
 
+# Per-process cache of container names that have already been verified to exist.
+# Eliminates the Azure API round-trip on every BlobRepository instantiation.
+_verified_containers: set[str] = set()
+
 
 class BlobRepository:
     _DOWNLOAD_RETRIES = 3
     _UPLOAD_BLOCK_SIZE = 64 * 1024
+    _DELETE_BATCH_SIZE = 256  # Azure batch-delete limit per request
 
     def __init__(self, container_name: str | None = None) -> None:
         self._service_client = BlobServiceClient.from_connection_string(
             settings.azure_storage_connection_string,
-            connection_timeout=5,
-            read_timeout=5,
+            connection_timeout=10,
+            read_timeout=30,
             max_single_put_size=self._UPLOAD_BLOCK_SIZE,
             max_block_size=self._UPLOAD_BLOCK_SIZE,
         )
-        resolved = container_name or settings.blob_container_name
-        self._container_name = resolved
-        self._container_client = self._service_client.get_container_client(resolved)
+        self._container_name = container_name or settings.blob_container_name
+        self._container_client = self._service_client.get_container_client(
+            self._container_name
+        )
 
-        if not self._container_client.exists():
-            self._container_client.create_container()
+        # Only check/create once per container name per process lifetime.
+        if self._container_name not in _verified_containers:
+            if not self._container_client.exists():
+                self._container_client.create_container()
+            _verified_containers.add(self._container_name)
 
     def upload_text(self, blob_path: str, content: str) -> None:
         blob_client = self._container_client.get_blob_client(blob_path)
@@ -38,9 +47,8 @@ class BlobRepository:
         blob_client = self._container_client.get_blob_client(blob_path)
         for attempt in range(1, self._DOWNLOAD_RETRIES + 1):
             try:
-                return blob_client.download_blob(max_concurrency=1).readall()
+                return blob_client.download_blob().readall()
             except ResourceNotFoundError:
-                # Blob does not exist — no point retrying.
                 raise FileNotFoundError(
                     f"Blob not found in storage: {blob_path!r}"
                 ) from None
@@ -72,20 +80,17 @@ class BlobRepository:
         content_type: str | None = None,
     ) -> None:
         blob_client = self._container_client.get_blob_client(blob_path)
-
         if content_type:
             blob_client.upload_blob(
                 content,
                 overwrite=True,
                 content_settings=ContentSettings(content_type=content_type),
             )
-            return
-
-        blob_client.upload_blob(content, overwrite=True)
+        else:
+            blob_client.upload_blob(content, overwrite=True)
 
     def exists(self, blob_path: str) -> bool:
-        blob_client = self._container_client.get_blob_client(blob_path)
-        return blob_client.exists()
+        return self._container_client.get_blob_client(blob_path).exists()
 
     def delete_blob(self, blob_path: str) -> None:
         blob_client = self._container_client.get_blob_client(blob_path)
@@ -93,7 +98,36 @@ class BlobRepository:
             blob_client.delete_blob()
 
     def list_blobs(self, prefix: str) -> list[str]:
-        return [blob.name for blob in self._container_client.list_blobs(name_starts_with=prefix)]
+        return [
+            blob.name
+            for blob in self._container_client.list_blobs(name_starts_with=prefix)
+        ]
+
+    def delete_blobs_by_prefix(self, prefix: str) -> int:
+        """Delete all blobs whose names start with *prefix*.
+
+        Uses Azure batch-delete (up to 256 blobs per HTTP request) instead of
+        serial single-blob deletes, reducing Azure round-trips significantly.
+        Returns the count of blobs submitted for deletion.
+        """
+        normalized = prefix.strip().lstrip("/")
+        if not normalized:
+            return 0
+        if not normalized.endswith("/"):
+            normalized = f"{normalized}/"
+
+        blob_names = self.list_blobs(normalized)
+        if not blob_names:
+            return 0
+
+        removed = 0
+        for i in range(0, len(blob_names), self._DELETE_BATCH_SIZE):
+            batch = blob_names[i : i + self._DELETE_BATCH_SIZE]
+            # raise_on_any_failure=False: continue even if a blob was already deleted
+            self._container_client.delete_blobs(*batch, raise_on_any_failure=False)
+            removed += len(batch)
+
+        return removed
 
     def prefix_exists(self, prefix: str) -> bool:
         normalized = prefix.rstrip("/") + "/"

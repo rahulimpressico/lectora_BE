@@ -1,10 +1,11 @@
-"""Adapter between Blob-backed job state and Rahul's file-based pipeline."""
+"""Adapter between blob-backed job state and the file-based pipeline agents."""
 from __future__ import annotations
 
 import json
 import logging
 import mimetypes
 import tempfile
+from collections import defaultdict
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 _MIME_DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-from lectora_backend.core.blob_layout import build_blob_layout_from_input_blob
+from lectora_backend.core.blob_layout import build_blob_layout_for_course
 from lectora_backend.core.state_manager import StateManager
 from lectora_backend.pipeline.agent.a0_request_synthesizer.main import A0RequestSynthesizer
 from lectora_backend.pipeline.agent.a1_outline_interpreter.main import run as a1_run
@@ -67,10 +68,8 @@ class PipelineAdapter:
     ) -> tuple[str, str]:
         blob_layout = state.get("blobLayout")
         if blob_layout is None:
-            layout = build_blob_layout_from_input_blob(
-                study_guide_blob,
-                state["run"]["jobId"],
-            )
+            course_title = (state.get("request") or {}).get("courseTitle") or ""
+            layout = build_blob_layout_for_course(course_title)
             blob_layout = layout.to_dict()
             state["blobLayout"] = blob_layout
 
@@ -79,11 +78,18 @@ class PipelineAdapter:
         normalized_study_guide = f"{blob_layout['doc']}/{sg_filename}"
         normalized_timed_outline = f"{blob_layout['doc']}/{to_filename}"
 
+        def _mime_for_blob(blob_path: str) -> str:
+            return (
+                "application/pdf"
+                if blob_path.lower().endswith(".pdf")
+                else _MIME_DOCX
+            )
+
         if study_guide_blob != normalized_study_guide:
             self._blob_repository.upload_bytes(
                 blob_path=normalized_study_guide,
                 content=self._blob_repository.download_bytes(study_guide_blob),
-                content_type=_MIME_DOCX,
+                content_type=_mime_for_blob(normalized_study_guide),
             )
             state["inputManifest"]["studyGuide"]["blobPath"] = normalized_study_guide
 
@@ -91,7 +97,7 @@ class PipelineAdapter:
             self._blob_repository.upload_bytes(
                 blob_path=normalized_timed_outline,
                 content=self._blob_repository.download_bytes(timed_outline_blob),
-                content_type=_MIME_DOCX,
+                content_type=_mime_for_blob(normalized_timed_outline),
             )
             state["inputManifest"]["timedOutline"]["blobPath"] = normalized_timed_outline
 
@@ -114,8 +120,6 @@ class PipelineAdapter:
         study_guide_blob = self._require_blob_path(
             manifest.get("studyGuide"), "studyGuide")
 
-        # timedOutline is optional — may not be provided when the user relies on
-        # an auto-generated or user-edited TO passed via toOverride instead.
         timed_outline_entry = manifest.get("timedOutline")
         timed_outline_blob: str | None = (
             timed_outline_entry.get("blobPath")
@@ -142,12 +146,10 @@ class PipelineAdapter:
                 temp_dir / PurePosixPath(timed_outline_blob).name,
             )
         else:
-            # No timedOutline blob — normalize study guide alone (updates blobLayout)
             blob_layout = state.get("blobLayout")
             if blob_layout is None:
-                from lectora_backend.core.blob_layout import build_blob_layout_from_input_blob
-                layout = build_blob_layout_from_input_blob(
-                    study_guide_blob, state["run"]["jobId"])
+                course_title = (state.get("request") or {}).get("courseTitle") or ""
+                layout = build_blob_layout_for_course(course_title)
                 state["blobLayout"] = layout.to_dict()
                 self._state_manager.save(
                     state["run"]["jobId"], state, blob_path=state_blob_path)
@@ -324,8 +326,6 @@ class PipelineAdapter:
 
         kc_plan_path = Path(pipeline_shared_state_path).parent / "kc_plan.json"
 
-        # Resolve which docx to upload: prefer the post-S2 rendered path, fall back to
-        # whatever A2 wrote directly (render_docx=True path, legacy callers).
         docx_local = Path(final_docx_path) if final_docx_path else (
             Path(a2_result.study_guide_docx) if a2_result.study_guide_docx else None
         )
@@ -372,13 +372,6 @@ class PipelineAdapter:
 
     @staticmethod
     def _llm_outline_from_to_data(to_data: dict[str, Any]) -> dict[str, Any]:
-        """Convert the frontend toData shape back to llm_to_outline format.
-
-        The frontend TO panel stores a cleaned/simplified structure:
-          sections[].subtopics is a list of strings
-        The pipeline expects llm_to_outline_classification.sections[].subtopics
-        as a list of dicts with at least a "title" key.  We reconstruct that here.
-        """
         sections = []
         for s in to_data.get("sections") or []:
             raw_subtopics = s.get("subtopics") or []
@@ -413,14 +406,6 @@ class PipelineAdapter:
         to_override: dict[str, Any],
         temp_dir: Path,
     ) -> Path:
-        """Write the user-edited TO as a temp JSON file A0 can load directly.
-
-        A0 detects a .json extension on to_outline_doc_path and loads it without
-        making an LLM call, so the user's reviewed outline is used as-is and the
-        TO extraction LLM call is skipped entirely.
-
-        File format: { "llm_to_outline": <converted outline> }
-        """
         to_json_path = temp_dir / "user_edited_to.json"
         payload = {"llm_to_outline": self._llm_outline_from_to_data(to_override)}
         to_json_path.write_text(
@@ -429,15 +414,21 @@ class PipelineAdapter:
         logger.info("[pipeline_adapter] Wrote user-edited TO override → %s", to_json_path)
         return to_json_path
 
-    def run_a0_a1(
+    # ── A0 ─────────────────────────────────────────────────────────────────────
+
+    def run_a0(
         self,
         job_id: str,
         *,
         state_blob_path: str,
         prepared_inputs: dict[str, object] | None = None,
-        s1_retry_feedback: dict[str, Any] | None = None,
         gate_attempt: int = 1,
     ) -> dict[str, Any]:
+        """Run A0 (document analysis) and return its result + temp-dir context.
+
+        Separated from run_a1 so the orchestrator can record accurate per-stage
+        start/end timestamps for A0 and A1 independently.
+        """
         inputs = prepared_inputs or self.prepare_inputs(
             job_id, state_blob_path=state_blob_path)
         temp_dir = Path(inputs["tempDir"])
@@ -445,33 +436,75 @@ class PipelineAdapter:
         raw_to_path = inputs.get("timedOutlinePath")
         timed_outline_path: Path | None = Path(raw_to_path) if raw_to_path else None
 
-        # On the first gate cycle, if the user reviewed/edited the TO in the
-        # three-panel step, write it as a local JSON file and pass it to A0.
-        # A0 detects the .json extension → loads directly, skipping the LLM
-        # TO extraction call.  Subsequent S1 retries (gate_attempt > 1) let A0
-        # re-run fully so S1 feedback can be incorporated.
-        effective_to_path: str | None = str(timed_outline_path) if timed_outline_path else None
+        backend_state = self._load_backend_state(
+            job_id=job_id, state_blob_path=state_blob_path
+        )
+        course_difficulty = (
+            str(
+                backend_state.get("courseDifficulty")
+                or backend_state.get("course_difficulty")
+                or "intermediate"
+            )
+            .strip()
+            .lower()
+        )
+
+        # On the first gate cycle, prefer the user-reviewed TO override (written
+        # as a local JSON file) over the raw DOCX so the LLM call is skipped.
+        # Subsequent S1 retries (gate_attempt > 1) let A0 re-run fully so S1
+        # feedback can be incorporated.
+        effective_to_path: str | None = (
+            str(timed_outline_path) if timed_outline_path else None
+        )
         if gate_attempt == 1:
-            backend_state = self._load_backend_state(
-                job_id=job_id, state_blob_path=state_blob_path)
             to_override = backend_state.get("toOverride")
             if to_override and isinstance(to_override, dict):
                 override_json = self._write_to_override_json(to_override, temp_dir)
                 effective_to_path = str(override_json)
 
+        _sg_ext = study_guide_path.suffix.lower()
+        _a0_docx_paths: list[str] = [] if _sg_ext == ".pdf" else [str(study_guide_path)]
+        _a0_pdf_paths: list[str] = [str(study_guide_path)] if _sg_ext == ".pdf" else []
+
         a0_result = A0RequestSynthesizer(
-            docx_path=str(study_guide_path),
+            docx_paths=_a0_docx_paths,
+            pdf_paths=_a0_pdf_paths,
             to_outline_doc_path=effective_to_path,
             output_dir=str(temp_dir),
+            course_difficulty=course_difficulty,
         ).run()
 
+        return {
+            "tempDir": str(temp_dir),
+            "studyGuidePath": str(study_guide_path),
+            "timedOutlinePath": str(timed_outline_path) if timed_outline_path else None,
+            "a0": a0_result,
+            "a0SharedStatePath": a0_result.shared_state_path,
+        }
+
+    # ── A1 ─────────────────────────────────────────────────────────────────────
+
+    def run_a1(
+        self,
+        job_id: str,
+        *,
+        state_blob_path: str,
+        a0_result: Any,
+        study_guide_path: str,
+        s1_retry_feedback: dict[str, Any] | None = None,
+        gate_attempt: int = 1,
+    ) -> dict[str, Any]:
+        """Run A1 (outline interpretation) and persist A0+A1 artifacts.
+
+        Must be called after run_a0() with the a0_result it returned.
+        """
         a1_feedback = dict(s1_retry_feedback) if s1_retry_feedback else None
         if a1_feedback is not None:
             a1_feedback.setdefault("gateAttempt", gate_attempt)
 
         a1_result = a1_run(
             shared_state_path=a0_result.shared_state_path,
-            docx_path=str(study_guide_path),
+            docx_path=study_guide_path,
             feedback=a1_feedback,
         )
 
@@ -483,14 +516,52 @@ class PipelineAdapter:
         )
 
         return {
-            "tempDir": str(temp_dir),
-            "studyGuidePath": str(study_guide_path),
-            "timedOutlinePath": str(timed_outline_path) if timed_outline_path else None,
-            "a0": a0_result,
             "a1": a1_result,
-            "a0SharedStatePath": a0_result.shared_state_path,
             "artifactRefs": artifact_refs,
         }
+
+    # ── run_a0_a1 (kept for pipeline.py direct-mode compatibility) ─────────────
+
+    def run_a0_a1(
+        self,
+        job_id: str,
+        *,
+        state_blob_path: str,
+        prepared_inputs: dict[str, object] | None = None,
+        s1_retry_feedback: dict[str, Any] | None = None,
+        gate_attempt: int = 1,
+    ) -> dict[str, Any]:
+        """Run A0 then A1 in sequence.
+
+        The orchestrator uses run_a0() / run_a1() directly so it can record
+        accurate per-stage timing.  This method exists for callers (e.g.
+        pipeline.py direct mode) that don't need separate timing.
+        """
+        a0_ctx = self.run_a0(
+            job_id,
+            state_blob_path=state_blob_path,
+            prepared_inputs=prepared_inputs,
+            gate_attempt=gate_attempt,
+        )
+        a1_ctx = self.run_a1(
+            job_id,
+            state_blob_path=state_blob_path,
+            a0_result=a0_ctx["a0"],
+            study_guide_path=a0_ctx["studyGuidePath"],
+            s1_retry_feedback=s1_retry_feedback,
+            gate_attempt=gate_attempt,
+        )
+        return {
+            "tempDir": a0_ctx["tempDir"],
+            "studyGuidePath": a0_ctx["studyGuidePath"],
+            "timedOutlinePath": a0_ctx["timedOutlinePath"],
+            "a0": a0_ctx["a0"],
+            "a1": a1_ctx["a1"],
+            "a0SharedStatePath": a0_ctx["a0SharedStatePath"],
+            "artifactRefs": a1_ctx["artifactRefs"],
+        }
+
+    # ── S1 ─────────────────────────────────────────────────────────────────────
 
     def run_s1(
         self,
@@ -510,6 +581,8 @@ class PipelineAdapter:
             "s1": s1_result,
             "artifactRefs": artifact_refs,
         }
+
+    # ── S2 persistence ─────────────────────────────────────────────────────────
 
     def _persist_s2_outputs(
         self,
@@ -556,29 +629,29 @@ class PipelineAdapter:
 
     @staticmethod
     def _format_s2_feedback(report: Any) -> str:
+        """Build a human-readable feedback string for A2 regeneration.
+
+        Iterates the issues list once, bucketed by severity, instead of the
+        previous 3-pass approach.
+        """
+        buckets: dict[str, list[str]] = defaultdict(list)
+        for issue in report.issues or []:
+            line = f"  - [{issue.field}] {issue.message} (rule: {issue.rule_source})"
+            buckets[issue.severity].append(line)
+
+        sections = [
+            ("Blockers (must fix):", "blocker"),
+            ("Critical issues (must address):", "critical"),
+            ("Warnings (please address):", "warning"),
+        ]
         lines: list[str] = []
-        if report.blockers:
-            lines.append("Blockers (must fix):")
-            for issue in report.issues:
-                if issue.severity == "blocker":
-                    lines.append(
-                        f"  - [{issue.field}] {issue.message} (rule: {issue.rule_source})"
-                    )
-        if report.criticals:
-            lines.append("Critical issues (must address):")
-            for issue in report.issues:
-                if issue.severity == "critical":
-                    lines.append(
-                        f"  - [{issue.field}] {issue.message} (rule: {issue.rule_source})"
-                    )
-        if report.warnings:
-            lines.append("Warnings (please address):")
-            for issue in report.issues:
-                if issue.severity == "warning":
-                    lines.append(
-                        f"  - [{issue.field}] {issue.message} (rule: {issue.rule_source})"
-                    )
+        for label, key in sections:
+            if buckets[key]:
+                lines.append(label)
+                lines.extend(buckets[key])
         return "\n".join(lines)
+
+    # ── A2 ─────────────────────────────────────────────────────────────────────
 
     def run_a2(
         self,
@@ -588,7 +661,33 @@ class PipelineAdapter:
         pipeline_shared_state_path: str,
         study_guide_path: str,
         course_difficulty: str = "intermediate",
+        extra_source_blob_paths: list[str] | None = None,
     ) -> dict[str, Any]:
+        # ── Download extra source files for multi-file chunk retrieval ─────
+        source_file_paths: list[str] | None = None
+        if extra_source_blob_paths:
+            temp_dir = Path(pipeline_shared_state_path).parent / "_source_chunks"
+            temp_dir.mkdir(exist_ok=True)
+            downloaded: list[str] = [study_guide_path]
+            for blob_path in extra_source_blob_paths:
+                try:
+                    local_path = temp_dir / Path(blob_path).name
+                    if not local_path.exists():
+                        content = self._blob_repository.download_bytes(blob_path)
+                        local_path.write_bytes(content)
+                    downloaded.append(str(local_path))
+                except Exception as exc:
+                    logger.warning(
+                        "Could not download extra source file %s for A2 retrieval: %s",
+                        blob_path, exc,
+                    )
+            if len(downloaded) > 1:
+                source_file_paths = downloaded
+                logger.info(
+                    "[run_a2] %d source files available for chunk-based retrieval.",
+                    len(source_file_paths),
+                )
+
         # ── Section Mapper ────────────────────────────────────────────────
         section_map_result = section_mapper_run(
             shared_state_path=pipeline_shared_state_path)
@@ -618,6 +717,7 @@ class PipelineAdapter:
                 render_docx=False,
                 course_difficulty=course_difficulty,
                 feedback=a2_feedback,
+                source_file_paths=source_file_paths,
             ).run()
             logger.info(
                 "A2 status=%s generated=%s skipped=%s failed=%s words=%s",
@@ -686,6 +786,8 @@ class PipelineAdapter:
             "s2_hard_blocked": s2_hard_blocked,
             "artifactRefs": artifact_refs,
         }
+
+    # ── S1 helpers ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def s1_status_blocks_pipeline(status: S1Status) -> bool:

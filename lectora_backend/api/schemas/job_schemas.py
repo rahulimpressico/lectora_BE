@@ -44,6 +44,10 @@ class JobCreateRequest(CamelModel):
     # When present the pipeline injects it into shared_state so A1 uses the
     # user's version instead of re-generating from the original DOCX.
     to_override: dict[str, Any] | None = None
+    # All source blob paths (DOCX + PDF) uploaded during the generate-TO step.
+    # When provided, A2 downloads these files and uses topic-wise chunk retrieval
+    # to enrich each section's source context across all uploaded documents.
+    source_file_paths: list[str] | None = None
 
 
 class StageProgressResponse(CamelModel):

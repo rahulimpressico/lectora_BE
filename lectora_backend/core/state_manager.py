@@ -68,3 +68,7 @@ class StateManager:
     def delete(self, job_id: str, *, blob_path: str | None = None) -> None:
         blob_path = self._resolve_blob_path(job_id, blob_path)
         self._blob_repository.delete_blob(blob_path)
+
+    def delete_blobs_under_prefix(self, prefix: str) -> int:
+        """Remove all artifacts under a course output prefix (e.g. My_Course/)."""
+        return self._blob_repository.delete_blobs_by_prefix(prefix)

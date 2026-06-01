@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -137,7 +137,13 @@ def _load_traces() -> list[TraceRecord]:
         try:
             with path.open(encoding="utf-8") as handle:
                 for line in handle:
-                    raw = json.loads(line)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        raw = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
                     run_id = str(raw.get("run_id") or "").strip()
                     timestamp = _parse_iso(raw.get("timestamp"))
                     if not timestamp:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -163,84 +163,6 @@ def _load_traces() -> list[TraceRecord]:
     return sorted(records, key=lambda item: item.timestamp)
 
 
-def _course_title_matches(metadata: RunMetadata, record: TraceRecord) -> bool:
-    title = metadata.document_name.lower().strip()
-    if not title:
-        return False
-    if title in record.search_text:
-        return True
-
-    words = [word for word in title.replace("’", "'").split() if len(word) > 4]
-    if not words:
-        return False
-    overlap = sum(1 for word in words if word in record.search_text)
-    return overlap >= min(4, max(2, len(words) // 3))
-
-
-def _infer_legacy_run_records(
-    metadata_by_run: dict[str, RunMetadata],
-    traces: list[TraceRecord],
-    existing: dict[str, list[TraceRecord]],
-) -> dict[str, list[TraceRecord]]:
-    inferred: dict[str, list[TraceRecord]] = {}
-    unassigned = [record for record in traces if not record.run_id]
-    if not unassigned:
-        return inferred
-
-    indexed = list(enumerate(unassigned))
-    for run_id, metadata in sorted(
-        metadata_by_run.items(),
-        key=lambda item: item[1].run_timestamp or datetime.min.replace(tzinfo=UTC),
-    ):
-        if existing.get(run_id):
-            continue
-
-        anchor_idx = None
-        for idx, record in indexed:
-            if record.agent != "A0":
-                continue
-            if _course_title_matches(metadata, record):
-                anchor_idx = idx
-                break
-
-        if anchor_idx is None:
-            continue
-
-        cluster: list[TraceRecord] = []
-        start_pos = next(pos for pos, (idx, _) in enumerate(indexed) if idx == anchor_idx)
-        for _, record in indexed[start_pos:]:
-            if cluster:
-                gap = record.timestamp - cluster[-1].timestamp
-                if gap > timedelta(minutes=20):
-                    break
-                if record.agent == "A0" and gap > timedelta(minutes=1):
-                    break
-            cluster.append(record)
-
-        if not cluster:
-            continue
-
-        inferred[run_id] = [
-            TraceRecord(
-                run_id=run_id,
-                doc_name=metadata.document_name,
-                agent=record.agent,
-                deployment=record.deployment,
-                timestamp=record.timestamp,
-                prompt_tokens=record.prompt_tokens,
-                completion_tokens=record.completion_tokens,
-                total_cost_usd=record.total_cost_usd,
-                search_text=record.search_text,
-            )
-            for record in cluster
-        ]
-
-        used_ids = {id(record) for record in cluster}
-        indexed = [(idx, record) for idx, record in indexed if id(record) not in used_ids]
-
-    return inferred
-
-
 def _aggregate_models(records: list[TraceRecord]) -> list[ModelUsageResponse]:
     models: dict[str, dict[str, Any]] = defaultdict(
         lambda: {
@@ -397,14 +319,14 @@ class CostingService:
         self._run_metadata = _load_run_metadata()
         self._traces = _load_traces()
 
+    def _trace_backed_records(self) -> list[TraceRecord]:
+        return [record for record in self._traces if record.run_id]
+
     def _records_by_run(self) -> dict[str, list[TraceRecord]]:
         grouped: dict[str, list[TraceRecord]] = defaultdict(list)
-        for record in self._traces:
+        for record in self._trace_backed_records():
             if record.run_id:
                 grouped[record.run_id].append(record)
-        inferred = _infer_legacy_run_records(self._run_metadata, self._traces, grouped)
-        for run_id, records in inferred.items():
-            grouped[run_id].extend(records)
         return grouped
 
     def list_documents(self) -> list[DocumentCostResponse]:
@@ -441,10 +363,10 @@ class CostingService:
         return _build_document(document_id, metadata, records)
 
     def get_model_summary(self) -> list[ModelUsageResponse]:
-        return _aggregate_models(self._traces)
+        return _aggregate_models(self._trace_backed_records())
 
     def get_cost_trends(self) -> list[CostingTrendPointResponse]:
-        return _build_cost_trend(self._traces)
+        return _build_cost_trend(self._trace_backed_records())
 
     def get_summary(self) -> CostingSummaryResponse:
         documents = self.list_documents()

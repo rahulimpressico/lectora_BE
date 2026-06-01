@@ -25,6 +25,7 @@ load_dotenv()
 from fastapi import FastAPI
 
 from lectora_backend.api.middleware.cors import add_cors_middleware
+from lectora_backend.api.routes import costing
 from lectora_backend.api.routes import health
 from lectora_backend.api.routes import generate_to
 from lectora_backend.api.routes import local_jobs
@@ -72,6 +73,7 @@ app.include_router(generate_to.router,     prefix="/documents",  tags=["document
 app.include_router(local_jobs.router,      prefix="/jobs",       tags=["jobs"])
 app.include_router(storage.router,         prefix="/storage",    tags=["storage"])
 app.include_router(settings_routes.router, prefix="/settings",   tags=["settings"])
+app.include_router(costing.router,         prefix="/costing",    tags=["costing"])
 
 
 @app.get("/", include_in_schema=False)
@@ -94,5 +96,10 @@ async def root() -> dict:
             "GET  /storage/uploaded-documents/browse → uploaded DOCX",
             "GET  /storage/file                → preview / download",
             "POST /storage/delete              → delete selected files",
+            "GET  /costing/summary",
+            "GET  /costing/models",
+            "GET  /costing/trends",
+            "GET  /costing/documents",
+            "GET  /costing/documents/{documentId}",
         ],
     }

@@ -8,6 +8,7 @@ GET /storage/file?path=&source=       — preview / download (local or Azure)
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,9 @@ _LOCAL_COURSES_DIR.mkdir(parents=True, exist_ok=True)
 _UPLOAD_ROOT = Path(tempfile.gettempdir()) / "lectora_uploads"
 # Only these appear on the Documents page (not generated_to.json etc.)
 _UPLOAD_DOC_EXTENSIONS = frozenset({".docx", ".doc", ".pdf"})
+_TEST_PREFIX_CANDIDATES = ("test-data/", "smoke-tests/")
+_LEGACY_JOB_ROOT_RE = re.compile(r"^j-[a-z0-9]+$", re.IGNORECASE)
+_TEST_ROOT_RE = re.compile(r"(test|smoke|probe)", re.IGNORECASE)
 
 _MIME: dict[str, str] = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -68,6 +72,14 @@ class BrowseResponse(BaseModel):
     totalSize: int
     source: Literal["azure", "local"]
     container_name: str | None = Field(default=None, alias="containerName")
+
+
+StorageCategory = Literal[
+    "source-documents",
+    "generated-courses",
+    "pipeline-artifacts",
+    "test-data",
+]
 
 
 class DeleteStorageFilesRequest(BaseModel):
@@ -108,6 +120,21 @@ def _main_container_name() -> str:
     return getattr(settings, "blob_container_name", None) or "regedlectoraaistorage"
 
 
+def _generated_courses_container_name() -> str:
+    from lectora_backend.config import settings  # type: ignore[attr-defined]
+
+    return getattr(settings, "generated_courses_container_name", None) or _main_container_name()
+
+
+def _pipeline_artifacts_container_name() -> str:
+    from lectora_backend.config import settings  # type: ignore[attr-defined]
+
+    return (
+        getattr(settings, "course_generation_artifacts_container_name", None)
+        or _main_container_name()
+    )
+
+
 def _uploads_container_display_name() -> str:
     return _uploads_container_name()
 
@@ -131,6 +158,14 @@ def _uploads_container_name() -> str:
 
 def _uploads_blob_repo() -> BlobRepository:
     return BlobRepository(container_name=_uploads_container_name())
+
+
+def _generated_courses_blob_repo() -> BlobRepository:
+    return BlobRepository(container_name=_generated_courses_container_name())
+
+
+def _pipeline_artifacts_blob_repo() -> BlobRepository:
+    return BlobRepository(container_name=_pipeline_artifacts_container_name())
 
 
 def _strip_upload_blob_roots(path: str) -> str:
@@ -174,6 +209,138 @@ def _browse_uploaded_documents_azure(relative_prefix: str) -> BrowseResponse:
         source="azure",
         container_name=_uploads_container_display_name(),
     )
+
+
+def _browse_category_azure(category: StorageCategory, relative_prefix: str) -> BrowseResponse:
+    if category == "source-documents":
+        return _browse_uploaded_documents_azure(relative_prefix)
+
+    clean = relative_prefix.strip().lstrip("/")
+    if clean and not clean.endswith("/"):
+        clean = f"{clean}/"
+
+    if category == "generated-courses":
+        repo = _generated_courses_blob_repo()
+        base_prefix = ""
+    elif category == "pipeline-artifacts":
+        repo = _pipeline_artifacts_blob_repo()
+        base_prefix = ""
+    else:
+        repo = _pipeline_artifacts_blob_repo()
+        base_prefix = ""
+
+    if category == "test-data":
+        if not clean:
+            root_listing = _azure_browse_container(repo, "")
+            root_entries = [
+                entry
+                for entry in root_listing.entries
+                if entry.entryType == "folder" and _TEST_ROOT_RE.search(entry.name)
+            ]
+            return BrowseResponse(
+                prefix="",
+                entries=root_entries,
+                totalFiles=0,
+                totalFolders=len(root_entries),
+                totalSize=0,
+                source="azure",
+                container_name=getattr(repo, "_container_name", None),
+            )
+        for candidate in _TEST_PREFIX_CANDIDATES:
+            try:
+                result = _azure_browse_container(repo, f"{candidate}{clean}")
+                if result.entries or clean:
+                    result.prefix = f"{candidate}{clean}"
+                    result.container_name = getattr(repo, "_container_name", None)
+                    return result
+            except Exception:
+                continue
+        result = BrowseResponse(
+            prefix=f"{_TEST_PREFIX_CANDIDATES[0]}{clean}",
+            entries=[],
+            totalFiles=0,
+            totalFolders=0,
+            totalSize=0,
+            source="azure",
+            container_name=getattr(repo, "_container_name", None),
+        )
+        return result
+
+    if category == "generated-courses" and not clean:
+        root_listing = _azure_browse_container(repo, "")
+        generated_entries: list[StorageEntry] = []
+        seen_paths: set[str] = set()
+        all_root_folders = [e for e in root_listing.entries if e.entryType == "folder"]
+
+        for entry in all_root_folders:
+            sample = repo.list_blobs(entry.path)[:100]
+            if _LEGACY_JOB_ROOT_RE.fullmatch(entry.name):
+                nested_counts: dict[str, int] = {}
+                for blob_name in sample:
+                    relative = blob_name[len(entry.path):]
+                    parts = [p for p in relative.split("/") if p]
+                    if len(parts) >= 2:
+                        nested_counts[parts[0]] = nested_counts.get(parts[0], 0) + 1
+                for nested_name, count in sorted(nested_counts.items()):
+                    nested_path = f"{entry.path}{nested_name}/"
+                    if nested_path in seen_paths:
+                        continue
+                    seen_paths.add(nested_path)
+                    display_name = f"{nested_name} ({entry.name})"
+                    generated_entries.append(
+                        StorageEntry(
+                            name=display_name,
+                            path=nested_path,
+                            entryType="folder",
+                            fileCount=count,
+                        )
+                    )
+                continue
+
+            if _TEST_ROOT_RE.search(entry.name):
+                continue
+
+            if any(
+                blob_name.endswith("/study_guide.docx")
+                or "/output/" in blob_name
+                or "/generated_content.json" in blob_name
+                for blob_name in sample
+            ):
+                generated_entries.append(entry)
+                seen_paths.add(entry.path)
+
+        return BrowseResponse(
+            prefix="",
+            entries=generated_entries,
+            totalFiles=0,
+            totalFolders=len(generated_entries),
+            totalSize=0,
+            source="azure",
+            container_name=getattr(repo, "_container_name", None),
+        )
+
+    result = _azure_browse_container(repo, f"{base_prefix}{clean}")
+    if not clean:
+        if category == "pipeline-artifacts":
+            result.entries = [
+                entry
+                for entry in result.entries
+                if entry.entryType == "folder"
+                and (
+                    _LEGACY_JOB_ROOT_RE.fullmatch(entry.name)
+                    or any("/state/" in blob for blob in repo.list_blobs(entry.path)[:50])
+                )
+            ]
+        elif category == "test-data":
+            result.entries = [
+                entry
+                for entry in result.entries
+                if entry.entryType == "folder" and _TEST_ROOT_RE.search(entry.name)
+            ]
+        result.totalFiles = len([e for e in result.entries if e.entryType == "file"])
+        result.totalFolders = len([e for e in result.entries if e.entryType == "folder"])
+    result.container_name = getattr(repo, "_container_name", None)
+    return result
 
 
 def _filter_upload_entries(response: BrowseResponse) -> BrowseResponse:
@@ -560,6 +727,80 @@ async def browse_uploaded_documents(
         local.container_name = _uploads_container_display_name()
         return local
     return _filter_upload_entries(_local_browse_artifacts(prefix))
+
+
+@router.get("/categories/{category}/browse", response_model=BrowseResponse)
+async def browse_storage_category(
+    category: StorageCategory,
+    prefix: str = Query(default="", description="Path prefix within category."),
+) -> BrowseResponse:
+    """Browse a strict storage category for Asset Library classification."""
+    if _azure_configured():
+        try:
+            result = _browse_category_azure(category, prefix)
+            if category == "source-documents":
+                return _filter_upload_entries(result)
+            return result
+        except Exception as exc:
+            logger.warning(
+                "[storage] Category browse failed for %s (%s), falling back to local.",
+                category,
+                exc,
+            )
+
+    if category == "source-documents":
+        _UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+        local = _filter_upload_entries(
+            _local_browse_at(_UPLOAD_ROOT, _local_uploaded_documents_relative(prefix)),
+        )
+        local.container_name = _uploads_container_display_name()
+        return local
+
+    if category == "generated-courses":
+        local = _local_browse_at(_LOCAL_COURSES_DIR, prefix)
+        if not prefix:
+            local.entries = [
+                entry
+                for entry in local.entries
+                if entry.entryType == "folder"
+                and not _TEST_ROOT_RE.search(entry.name)
+            ]
+            local.totalFiles = len([e for e in local.entries if e.entryType == "file"])
+            local.totalFolders = len([e for e in local.entries if e.entryType == "folder"])
+        local.container_name = _generated_courses_container_name()
+        return local
+
+    if category == "pipeline-artifacts":
+        local = _local_browse_artifacts(prefix)
+        if not prefix:
+            local.entries = [
+                entry
+                for entry in local.entries
+                if (
+                    entry.entryType == "folder"
+                    and _LEGACY_JOB_ROOT_RE.fullmatch(entry.name)
+                )
+            ]
+            local.totalFiles = len([e for e in local.entries if e.entryType == "file"])
+            local.totalFolders = len([e for e in local.entries if e.entryType == "folder"])
+        local.container_name = _pipeline_artifacts_container_name()
+        return local
+
+    # test-data
+    local = _local_browse_artifacts(prefix)
+    local.entries = [
+        e for e in local.entries
+        if e.entryType == "folder"
+        and (
+            any(e.name.lower().startswith(p.rstrip("/")) for p in _TEST_PREFIX_CANDIDATES)
+            or _TEST_ROOT_RE.search(e.name)
+        )
+    ]
+    local.totalFolders = len(local.entries)
+    local.totalFiles = 0
+    local.totalSize = 0
+    local.container_name = _pipeline_artifacts_container_name()
+    return local
 
 
 @router.get("/file", summary="Download or preview a file")

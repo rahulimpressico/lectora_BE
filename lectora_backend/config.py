@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     blob_container_name: str = "regedlectoraaistorage"
     # Container for FE-uploaded source documents (Documents library).
     uploaded_documents_container_name: str = "uploaded-documents"
+    # Container where Save to Azure writes generated course DOCX files.
+    generated_courses_container_name: str = "generated-courses"
 
     # Langfuse
     langfuse_public_key: str = ""

@@ -13,15 +13,20 @@ Style mapping:
   CE LO Head -> course title (large purple, right-aligned)
 """
 
+import logging
 import os
 import re
+import tempfile
+import hashlib
 from pathlib import Path
 
 from docx import Document
+from docx.image.exceptions import UnrecognizedImageError
 from docx.shared import Pt, Inches, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import nsdecls, qn
 from docx.oxml import parse_xml, OxmlElement
+from PIL import Image
 
 from ..config.styles import (
     setup_styles,
@@ -34,6 +39,41 @@ from ..config.styles import (
     BODY_LEFT_INDENT, H3_LEFT_INDENT, H4_LEFT_INDENT,
     DEEP_PURPLE, MEDIUM_PURPLE, DARK_NAVY, NAVY_BLUE, WHITE, BLACK,
 )
+
+logger = logging.getLogger(__name__)
+_DOCX_NATIVE_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"}
+
+
+def _coerce_docx_compatible_image_path(path_str: str, *, force_convert: bool = False) -> str:
+    """Convert non-native image formats into a PNG sidecar that python-docx can embed."""
+    path = Path(path_str)
+    if not force_convert and path.suffix.lower() in _DOCX_NATIVE_IMAGE_EXTS:
+        return str(path)
+
+    cache_dir = Path(tempfile.gettempdir()) / "lectora_docx_image_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    stat = path.stat()
+    cache_key = hashlib.sha256(
+        f"{path.resolve()}:{stat.st_mtime_ns}:{force_convert}".encode("utf-8")
+    ).hexdigest()[:16]
+    converted = cache_dir / f"{path.stem}_{cache_key}.png"
+    if converted.exists():
+        return str(converted)
+
+    with Image.open(path) as src:
+        normalized = (
+            src.convert("RGBA")
+            if src.mode in ("P", "LA", "RGBA")
+            else src.convert("RGB")
+        )
+        normalized.save(converted, format="PNG")
+
+    logger.info(
+        "[A2] Converted image for DOCX embedding: %s -> %s",
+        path.name,
+        converted.name,
+    )
+    return str(converted)
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +154,64 @@ _RESERVED_HEADING_RE = re.compile(
     r"summary|assessment|introduction)\s*$",
     re.IGNORECASE,
 )
+
+
+def _inject_missing_lesson_parent_sections(sections: list[dict]) -> list[dict]:
+    """Ensure each lesson title is rendered before its generated subtopic sections.
+
+    A2 stores the lesson title in ``outline_lesson`` for every generated subtopic,
+    but when no parent overview block is generated the final DOCX would otherwise
+    render only the subtopic headings. This helper inserts a synthetic level-1
+    heading once per lesson so the document structure matches the TO outline:
+
+        3.0 Lesson Title
+        3.1 First subtopic
+        3.2 Second subtopic
+    """
+    result: list[dict] = []
+    current_outline_lesson = ""
+    lesson_has_parent = False
+
+    for sec in sections:
+        sec = dict(sec)
+        outline_lesson = (sec.get("outline_lesson") or "").strip()
+        heading = (sec.get("heading") or "").strip()
+        level = sec.get("level", 2)
+
+        if outline_lesson != current_outline_lesson:
+            current_outline_lesson = outline_lesson
+            lesson_has_parent = False
+
+        is_existing_parent = bool(
+            level == 1
+            or sec.get("is_parent_overview")
+            or (outline_lesson and heading == outline_lesson)
+        )
+
+        if outline_lesson and not lesson_has_parent and not is_existing_parent:
+            result.append(
+                {
+                    "heading": outline_lesson,
+                    "level": 1,
+                    "status": "skipped_thin",
+                    "body_paragraphs": [],
+                    "word_count": 0,
+                    "outline_lesson": outline_lesson,
+                    "images": [],
+                    "subtopics": [],
+                    "maps_to_objectives": [],
+                    "section_id": "",
+                    "attempts": 1,
+                }
+            )
+            lesson_has_parent = True
+
+        if is_existing_parent:
+            lesson_has_parent = True
+
+        result.append(sec)
+
+    return result
 
 
 def _renumber_sections(sections: list[dict]) -> list[dict]:
@@ -419,14 +517,17 @@ def _insert_image(doc, img: dict, max_width_inches: float = 4.5):
     Respects original aspect ratio; caps width at max_width_inches.
     Adds caption below if present (from doc text only — never AI-generated).
     """
+    def _add_placeholder(reason: str) -> None:
+        p = doc.add_paragraph()
+        _apply_body_indent(p)
+        run = p.add_run(f"[Image: {img.get('media_filename', 'missing')} — {reason}]")
+        run.italic = True
+        run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+
     saved_path = img.get("saved_path", "")
     if not saved_path or not os.path.isfile(saved_path):
         # Image file missing — add placeholder
-        p = doc.add_paragraph()
-        _apply_body_indent(p)
-        run = p.add_run(f"[Image: {img.get('media_filename', 'missing')} — file not found]")
-        run.italic = True
-        run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+        _add_placeholder("file not found")
         return
 
     # Determine display width from original size or default
@@ -447,8 +548,27 @@ def _insert_image(doc, img: dict, max_width_inches: float = 4.5):
     img_para.paragraph_format.space_before = Pt(8)
     img_para.paragraph_format.space_after = Pt(4)
 
-    run = img_para.add_run()
-    run.add_picture(saved_path, width=Inches(width_in))
+    picture_path = saved_path
+    try:
+        picture_path = _coerce_docx_compatible_image_path(saved_path)
+        run = img_para.add_run()
+        run.add_picture(picture_path, width=Inches(width_in))
+    except UnrecognizedImageError:
+        try:
+            picture_path = _coerce_docx_compatible_image_path(
+                saved_path,
+                force_convert=True,
+            )
+            run = img_para.add_run()
+            run.add_picture(picture_path, width=Inches(width_in))
+        except Exception as exc:
+            logger.warning("[A2] Could not render image %s: %s", saved_path, exc)
+            _add_placeholder("unsupported image format")
+            return
+    except Exception as exc:
+        logger.warning("[A2] Could not render image %s: %s", saved_path, exc)
+        _add_placeholder("could not be rendered")
+        return
 
     # Caption (only from doc text — no AI-generated descriptions)
     caption = img.get("caption", "")
@@ -601,6 +721,9 @@ def build_study_guide_docx(
     """
     doc = Document()
     setup_styles(doc)
+
+    # Ensure each outline lesson title appears before its generated subtopic sections.
+    generated_sections = _inject_missing_lesson_parent_sections(generated_sections)
 
     # Re-number sections: 3.0 → 3.1 → 3.2 → 4.0 → 4.1 … (offsets fixed 1.0/2.0)
     generated_sections = _renumber_sections(generated_sections)

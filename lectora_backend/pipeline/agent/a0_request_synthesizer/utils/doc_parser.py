@@ -6,6 +6,7 @@ Images are stored with position, caption (from doc text only), and alt_text
 (only if not an AI-generated placeholder). NO visual descriptions are inferred.
 """
 
+import difflib
 import hashlib
 import re
 import zipfile
@@ -492,7 +493,7 @@ class CourseDocParser:
 
         return tree
 
-    def extract_indexed_content(self, max_words: int = 8000) -> str:
+    def extract_indexed_content(self, max_words: int | None = 8000) -> str:
         """Return all source documents with [P<N>] paragraph index markers per file.
 
         Each document block starts with ``--- Document: <filename> ---``.
@@ -502,18 +503,18 @@ class CourseDocParser:
         total_words = 0
 
         for path, doc in self._sources:
-            if total_words >= max_words:
+            if max_words is not None and total_words >= max_words:
                 break
             lines.append(f"\n--- Document: {path.name} ---")
             for idx, p in enumerate(doc.paragraphs):
-                if total_words >= max_words:
+                if max_words is not None and total_words >= max_words:
                     lines.append("[…content truncated at word limit…]")
                     break
                 text = p.text.strip()
                 if not text:
                     continue
                 words = text.split()
-                if total_words + len(words) > max_words:
+                if max_words is not None and total_words + len(words) > max_words:
                     remaining = max_words - total_words
                     lines.append(f"[P{idx}] " + " ".join(words[:remaining]))
                     lines.append("[…content truncated at word limit…]")
@@ -800,3 +801,185 @@ class CourseDocParser:
         text_output = re.sub(r"\n{3,}", "\n\n", text_output)
 
         return text_output.strip()
+
+    # ── TOC extraction ────────────────────────────────────────────────────────
+
+    def extract_toc_entries(self) -> list:
+        """Extract Table of Contents entries from the first source document that has one.
+
+        Scans each loaded source DOCX for paragraphs styled "TOC 1", "TOC 2", etc.
+        Returns the entry list from the first document that contains any such
+        paragraphs.  Returns an empty list when no TOC is found.
+
+        The returned objects are :class:`~toc_extractor.TOCEntry` dataclasses with
+        fields: ``level`` (int), ``text`` (str), ``page`` (int|None), ``source`` (str).
+        """
+        from .toc_extractor import extract_toc_entries_from_doc
+
+        for path, doc in self._sources:
+            entries = extract_toc_entries_from_doc(doc, source_label=path.name)
+            if entries:
+                return entries
+        return []
+
+    def extract_toc_section_contents(
+        self,
+        toc_entries: list,
+        total_word_budget: int = 8000,
+    ) -> list[dict]:
+        """Map each TOC entry to its body section and extract indexed paragraph content.
+
+        For each TOC entry:
+
+        1. Fuzzy-match the entry text against every heading-style or numbered
+           heading in the source document(s).
+        2. Determine the paragraph range for that section:
+           - ``para_idx_start``: paragraph index of the matched body heading.
+           - ``para_idx_end``  : paragraph index just before the next TOC entry
+             at the same or higher level (lower number) — within the same source file.
+        3. Extract ``[P<N>] text`` lines for paragraphs in that range, capped to a
+           per-section word budget derived from ``total_word_budget``.
+
+        Args:
+            toc_entries:       List of :class:`~toc_extractor.TOCEntry` objects
+                               (output of :meth:`extract_toc_entries`).
+            total_word_budget: Total words to spread across all sections; prevents
+                               the combined prompt from exceeding the original
+                               8 000-word flat-content budget.
+
+        Returns:
+            List of section dicts in TOC order::
+
+                {
+                    "level":            int,
+                    "title":            str,
+                    "para_idx_start":   int | None,
+                    "para_idx_end":     int | None,
+                    "source":           str,
+                    "indexed_content":  str,   # "[P5] … [P6] …"
+                }
+
+            Entries whose text cannot be matched to any heading are included with
+            ``para_idx_start = None`` and empty ``indexed_content``.
+        """
+        if not toc_entries:
+            return []
+
+        # Per-section word cap: distribute the shared budget evenly and never
+        # exceed the caller's total prompt budget across all TOC entries.
+        n = max(len(toc_entries), 1)
+        per_section_words = max(1, min(1500, total_word_budget // n))
+
+        # ── Build heading anchor table ────────────────────────────────────
+        # Each anchor: (para_idx, raw_text, level, Path, Document)
+        _NUM_PREFIX_RE = re.compile(r"^\d+(\.\d+)*[\s.\-:]*")
+        _NUMBERED_HEADING_RE = re.compile(r"^(\d+(?:\.\d+)*)[\s.\-:]\s*(.+)$")
+
+        anchors: list[tuple[int, str, int, Path, object]] = []
+        for path, doc in self._sources:
+            for idx, p in enumerate(doc.paragraphs):
+                text = p.text.strip()
+                if not text:
+                    continue
+                style = p.style.name
+
+                if "Heading" in style:
+                    try:
+                        level = int(style[-1]) if style[-1].isdigit() else 1
+                    except (IndexError, ValueError):
+                        level = 1
+                    anchors.append((idx, text, level, path, doc))
+                    continue
+
+                m = _NUMBERED_HEADING_RE.match(text)
+                if m:
+                    dots = m.group(1).count(".")
+                    anchors.append((idx, text, dots + 1, path, doc))
+
+        def _norm(t: str) -> str:
+            return _NUM_PREFIX_RE.sub("", t).lower().strip()
+
+        norm_anchors = [_norm(a[1]) for a in anchors]
+
+        def _best_anchor(title: str):
+            """Return best-matching anchor tuple or None."""
+            key = _norm(title)
+            if not key:
+                return None
+            hits = difflib.get_close_matches(key, norm_anchors, n=1, cutoff=0.35)
+            if not hits:
+                return None
+            pos = norm_anchors.index(hits[0])
+            return anchors[pos]  # (para_idx, text, level, Path, doc)
+
+        # ── Phase 1: resolve anchor for every TOC entry ───────────────────
+        resolved: list[tuple | None] = [_best_anchor(e.text) for e in toc_entries]
+
+        # ── Phase 2: assign para_idx_end via TOC hierarchy ────────────────
+        result: list[dict] = []
+
+        for i, (entry, anchor) in enumerate(zip(toc_entries, resolved)):
+            if anchor is None:
+                result.append(
+                    {
+                        "level": entry.level,
+                        "title": entry.text,
+                        "para_idx_start": None,
+                        "para_idx_end": None,
+                        "source": entry.source,
+                        "indexed_content": "",
+                    }
+                )
+                continue
+
+            start_idx, _ah_text, _ah_level, src_path, src_doc = anchor
+
+            # End = start of next matched TOC entry at same or higher level (≤ current)
+            # in the same source document, minus 1
+            end_idx: int | None = None
+            for j in range(i + 1, len(toc_entries)):
+                next_anchor = resolved[j]
+                if next_anchor is None:
+                    continue
+                next_start, _, _, next_path, _ = next_anchor
+                if next_path != src_path:
+                    # Different source file — current section ends at EOF of src_path
+                    break
+                if toc_entries[j].level <= entry.level:
+                    end_idx = next_start - 1
+                    break
+
+            if end_idx is None:
+                end_idx = len(src_doc.paragraphs) - 1  # type: ignore[attr-defined]
+
+            # ── Extract [P<N>] indexed content for this section ───────────
+            content_lines: list[str] = []
+            words_used = 0
+            for p_idx in range(start_idx, min(end_idx + 1, len(src_doc.paragraphs))):  # type: ignore[arg-type]
+                p_text = src_doc.paragraphs[p_idx].text.strip()  # type: ignore[attr-defined]
+                if not p_text:
+                    continue
+                words = p_text.split()
+                if words_used + len(words) > per_section_words:
+                    remaining = per_section_words - words_used
+                    if remaining > 0:
+                        content_lines.append(
+                            f"[P{p_idx}] " + " ".join(words[:remaining])
+                        )
+                    content_lines.append("[…section truncated…]")
+                    break
+                content_lines.append(f"[P{p_idx}] {p_text}")
+                words_used += len(words)
+
+            result.append(
+                {
+                    "level": entry.level,
+                    "title": entry.text,
+                    "para_idx_start": start_idx,
+                    "para_idx_end": end_idx,
+                    "source": entry.source or src_path.name,
+                    "indexed_content": "\n".join(content_lines),
+                }
+            )
+
+        return result

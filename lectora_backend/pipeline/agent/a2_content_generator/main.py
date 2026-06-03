@@ -247,6 +247,10 @@ class A2ContentGenerator:
         )
         content_sample = extracted.get("content_sample", "")
 
+        # Read user-provided audience and special instructions (stored by local_jobs.py)
+        course_audience: str = (shared_state.get("course_audience") or "").strip()
+        special_instructions: str | None = (shared_state.get("special_instructions") or "").strip() or None
+
         # Resolve active rule pack from A0 classification
         rule_family = (
             shared_state.get("request_spec", {})
@@ -326,6 +330,9 @@ class A2ContentGenerator:
             rule_pack=rule_pack,
             feedback=self.feedback,
             source_chunks=source_chunks,
+            shared_state_path=self.shared_state_path,
+            audience=course_audience,
+            special_instructions=special_instructions,
         )
 
         # -- Collect stats -----------------------------------------------------

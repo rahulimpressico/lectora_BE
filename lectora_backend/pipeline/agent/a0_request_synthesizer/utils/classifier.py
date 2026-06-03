@@ -7,15 +7,25 @@ This module only contains business logic.
 
 import difflib
 import json
+import logging
 import re
 from typing import Any
 
-from ..config.llm import chat
+from ..config.llm import chat, chat_for_to
+from lectora_backend.pipeline.shared_llm_config.model_registry import get_deployment
 from ..prompt.classification import (
     CLASSIFICATION_PROMPT,
     CLASSIFICATIONTO_OUTLINE_PROMPT,
     GENERATE_TO_PROMPT,
+    build_dynamic_to_prompt,
 )
+
+logger = logging.getLogger(__name__)
+
+# Max words of indexed_content sent to the LLM for TO generation.
+# At ~1.3 tokens/word, 100k words ≈ 130k tokens — leaves 70k tokens headroom for
+# system prompt, user headers, and the model's own response within a 200k context.
+_MAX_TO_INDEXED_WORDS = 100_000
 
 
 # ---------------------------------------------------------------------------
@@ -38,29 +48,99 @@ def classify_with_llm(
     objectives: list[str],
     content_sample: str,
     *,
+    all_doc_titles: list[str] | None = None,
+    heading_tree: list[dict] | None = None,
     validation_hints: str | None = None,
 ) -> dict:
-    """Classify the course into a rule family and infer metadata via AzureOpenAI."""
-    user_msg = (
-        f"## Course Title\n{title}\n\n"
-        f"## Learning Objectives\n"
-        + "\n".join(f"- {obj}" for obj in objectives)
-        + f"\n\n## Content Sample\n{content_sample}"
-    )
+    """Classify the course into a rule family and infer metadata via AzureOpenAI.
+
+    Uses multiple content signals for accurate classification:
+      - title: primary title (from first/primary source document)
+      - all_doc_titles: titles from every uploaded source document
+      - objectives: merged learning objectives from all sources
+      - content_sample: representative text from all source documents
+      - heading_tree: structured heading hierarchy from all sources
+
+    The richer the signals provided, the more accurate the classification.
+    """
+    parts: list[str] = []
+
+    # ── Multi-doc title signal ───────────────────────────────────────────────
+    if all_doc_titles and len(all_doc_titles) > 1:
+        parts.append(
+            "## Source Document Titles (" + str(len(all_doc_titles)) + " files)\n"
+            + "\n".join(f"- {t}" for t in all_doc_titles if t)
+        )
+    else:
+        parts.append(f"## Course / Document Title\n{title}")
+
+    # ── Learning objectives ──────────────────────────────────────────────────
+    if objectives:
+        parts.append(
+            "## Learning Objectives\n"
+            + "\n".join(f"- {obj}" for obj in objectives)
+        )
+
+    # ── Document heading structure (strong structural signal) ────────────────
+    if heading_tree:
+        heading_lines: list[str] = []
+        for h in heading_tree[:80]:  # first 80 headings are sufficient
+            level = int(h.get("level", 1))
+            text = str(h.get("text", "")).strip()
+            if text:
+                indent = "  " * max(0, level - 1)
+                heading_lines.append(f"[L{level}] {indent}{text}")
+        if heading_lines:
+            parts.append("## Document Heading Structure\n" + "\n".join(heading_lines))
+
+    # ── Content sample ───────────────────────────────────────────────────────
+    if content_sample:
+        parts.append(f"## Content Sample (from all source files)\n{content_sample}")
+
+    # ── Validation hints ─────────────────────────────────────────────────────
     if validation_hints:
-        user_msg += (
-            "\n\n## Prior S1 validation feedback (resolve inconsistencies with this run)\n"
+        parts.append(
+            "## Prior S1 validation feedback (resolve inconsistencies)\n"
             + validation_hints.strip()
         )
 
+    user_msg = "\n\n".join(parts)
+
+    # ── Logging ─────────────────────────────────────────────────────────────
+    logger.info("[CLASSIFY] ══════════════ RULE FAMILY CLASSIFICATION ══════════════")
+    logger.info("[CLASSIFY]  Primary title      : %s", title)
+    if all_doc_titles:
+        logger.info("[CLASSIFY]  All doc titles     : %s", all_doc_titles)
+    logger.info("[CLASSIFY]  Objectives         : %d items", len(objectives))
+    logger.info("[CLASSIFY]  Heading entries    : %d", len(heading_tree) if heading_tree else 0)
+    logger.info(
+        "[CLASSIFY]  Content sample     : %d chars",
+        len(content_sample) if content_sample else 0,
+    )
+    logger.info("[CLASSIFY]  Sending to LLM (model=A0 → %s)…", get_deployment("A0"))
+
     raw = chat(CLASSIFICATION_PROMPT, user_msg)
+
+    logger.info("[CLASSIFY]  LLM raw response   : %s", raw[:300].replace("\n", " "))
+
     try:
-        return json.loads(_strip_fences(raw))
+        result = json.loads(_strip_fences(raw))
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"LLM returned invalid JSON for course classification. "
             f"Raw output (first 500 chars): {raw[:500]!r}"
         ) from exc
+
+    logger.info(
+        "[CLASSIFY]  ── RESULT: rule_family=%s | confidence=%.2f | topic=%s",
+        result.get("rule_family"),
+        float(result.get("confidence") or 0),
+        result.get("topic"),
+    )
+    logger.info("[CLASSIFY]  ── REASONING: %s", result.get("reasoning", ""))
+    logger.info("[CLASSIFY] ══════════════════════════════════════════════════════════")
+
+    return result
 
 
 def resolve_value(
@@ -81,16 +161,121 @@ def resolve_value(
     return None, "unresolved"
 
 
+def _parse_to_outline_json(raw: str) -> dict:
+    cleaned = _strip_fences(raw)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        truncated = len(raw) < 200 or not raw.rstrip().endswith("}")
+        hint = (
+            " Response appears TRUNCATED — increase max_output_tokens."
+            if truncated else ""
+        )
+        raise ValueError(
+            f"LLM returned invalid JSON for TO generation.{hint} "
+            f"Raw output (first 500 chars): {raw[:500]!r}"
+        ) from exc
 
-def _format_heading_tree(heading_tree: list[dict]) -> str:
-    """Format a heading tree list as a readable outline string for the LLM prompt."""
-    lines: list[str] = []
-    for h in heading_tree:
-        indent = "  " * (h.get("level", 1) - 1)
-        source = h.get("source", "")
-        source_tag = f" [{source}]" if source else ""
-        lines.append(f"{indent}[L{h.get('level', 1)}] {h.get('text', '')}{source_tag}")
-    return "\n".join(lines)
+
+def _build_to_user_message(
+    title: str,
+    objectives: list[str],
+    *,
+    toc_section_contents: list[dict] | None = None,
+    heading_tree: list[dict] | None = None,
+    pdf_toc_outline: str | None = None,
+    indexed_content: str = "",
+    course_difficulty: str = "intermediate",
+    course_type_hint: str | None = None,
+    calculated_word_count: int | None = None,
+    validation_hints: str | None = None,
+    all_doc_titles: list[str] | None = None,
+) -> str:
+    """Build the user message for GENERATE_TO_PROMPT.
+
+    Selects FORMAT A (TOC-based) when ``toc_section_contents`` is provided,
+    otherwise falls back to FORMAT B (heading structure + flat indexed content).
+    """
+    parts: list[str] = []
+
+    parts.append(f"## Course Difficulty\n{course_difficulty}")
+    if calculated_word_count:
+        parts.append(f"## Target Word Count\n{calculated_word_count}")
+    parts.append(f"## Course Title\n{title}")
+    if all_doc_titles and len(all_doc_titles) > 1:
+        parts.append(
+            "## Source Document Titles (ALL uploaded files)\n"
+            "The course is assembled from " + str(len(all_doc_titles)) + " source document(s). "
+            "Generate a course title that comprehensively covers ALL the topics across these files:\n"
+            + "\n".join(f"- {t}" for t in all_doc_titles)
+        )
+    if objectives:
+        parts.append(
+            "## Learning Objectives\n"
+            + "\n".join(f"- {obj}" for obj in objectives)
+        )
+    if course_type_hint:
+        parts.append(f"## COURSE TYPE CONTEXT\n{course_type_hint}")
+
+    if toc_section_contents:
+        # FORMAT A: TOC hierarchy + per-section indexed content
+        toc_lines = ["## TOC Hierarchy"]
+        for sec in toc_section_contents:
+            level = sec.get("level", 1)
+            sec_title = sec.get("title", "")
+            start = sec.get("para_idx_start")
+            end = sec.get("para_idx_end")
+            range_str = f"(para {start}–{end})" if start is not None else ""
+            toc_lines.append(f"[L{level}] {sec_title} {range_str}".strip())
+        parts.append("\n".join(toc_lines))
+
+        content_lines = ["## Per-Section Content"]
+        for sec in toc_section_contents:
+            level = sec.get("level", 1)
+            sec_title = sec.get("title", "")
+            start = sec.get("para_idx_start")
+            end = sec.get("para_idx_end")
+            range_str = f"· para {start}–{end}" if start is not None else ""
+            content_lines.append(f"\n### [L{level}] {sec_title} {range_str}")
+            sec_content = sec.get("indexed_content", "")
+            if sec_content:
+                content_lines.append(sec_content)
+        parts.append("\n".join(content_lines))
+    else:
+        # FORMAT B: heading structure (optional) + flat indexed content
+        if heading_tree:
+            heading_lines = ["## DOCUMENT HEADING STRUCTURE"]
+            for h in heading_tree:
+                level = h.get("level", 1)
+                text = h.get("text", "")
+                heading_lines.append(f"[L{level}] {text}")
+            parts.append("\n".join(heading_lines))
+
+        if pdf_toc_outline:
+            parts.append(pdf_toc_outline.strip())
+
+        if indexed_content:
+            content_words = indexed_content.split()
+            if len(content_words) > _MAX_TO_INDEXED_WORDS:
+                truncated = " ".join(content_words[:_MAX_TO_INDEXED_WORDS])
+                logger.warning(
+                    "[TO CONTENT TRUNCATION] indexed_content truncated from %d → %d words "
+                    "to stay within context limit.",
+                    len(content_words),
+                    _MAX_TO_INDEXED_WORDS,
+                )
+                indexed_content = truncated + "\n\n[CONTENT TRUNCATED — remaining paragraphs omitted to fit context window]"
+            parts.append(
+                f"## SOURCE DOCUMENT CONTENT (with paragraph indices)\n{indexed_content}"
+            )
+
+    if validation_hints:
+        parts.append(
+            "## Prior validation feedback (resolve these issues in the generated outline)\n"
+            + validation_hints.strip()
+        )
+
+    return "\n\n".join(parts)
 
 
 def generate_to_with_llm(
@@ -98,62 +283,121 @@ def generate_to_with_llm(
     objectives: list[str],
     indexed_content: str,
     *,
-    course_difficulty: str = "intermediate",
-    validation_hints: str | None = None,
-    custom_system_prompt: str | None = None,
     heading_tree: list[dict] | None = None,
+    toc_section_contents: list[dict] | None = None,
+    pdf_toc_outline: str | None = None,
+    course_difficulty: str = "intermediate",
     course_type_hint: str | None = None,
+    duration_hours: int | float | None = None,
+    calculated_word_count: int | None = None,
+    custom_system_prompt: str | None = None,
+    validation_hints: str | None = None,
+    all_doc_titles: list[str] | None = None,
 ) -> dict:
-    """Generate a structured Timed Outline from indexed source document content.
+    """Generate a structured Timed Outline from extracted source document content.
 
-    Used when no TO document is provided (Scenario 2). The indexed_content must
-    be produced by CourseDocParser.extract_indexed_content() so that each paragraph
-    is prefixed with [P<N>], allowing the LLM to set para_idx_start / para_idx_end
-    on each generated section.
+    Used when no TO document is provided (Scenario 2). Sends structured heading
+    and content data to the LLM — not raw files.
 
-    If ``custom_system_prompt`` is provided it replaces ``GENERATE_TO_PROMPT`` as
-    the system message, allowing callers to guide TO generation without changing
-    the codebase. The expected JSON output schema must still be honoured.
+    For DOCX sources: passes heading_tree + indexed_content (FORMAT B).
+    For PDF sources with an embedded TOC: passes toc_section_contents (FORMAT A).
+    For PDF sources without a TOC: falls back to FORMAT B.
 
-    ``heading_tree`` — structured headings from all uploaded files; when present,
-    the LLM uses them as the primary structural skeleton for the TO.
+    System prompt priority:
+      1. ``custom_system_prompt`` — FE-supplied override
+      2. ``build_dynamic_to_prompt`` — when duration_hours + calculated_word_count available
+      3. ``GENERATE_TO_PROMPT`` — static fallback
 
-    ``course_type_hint`` — optional domain context (e.g. "Washington LTC Compliance
-    Course") used to filter and prioritize topics.
+    Args:
+        title:                 Course title extracted from the source document.
+        objectives:            Learning objectives extracted from the source document.
+        indexed_content:       Full [P<N>]-prefixed paragraph text from all sources.
+        heading_tree:          Heading entries with para_idx (FORMAT B).
+        toc_section_contents:  TOC-anchored section dicts with indexed_content (FORMAT A).
+        course_difficulty:     "basic" | "intermediate" | "advanced".
+        course_type_hint:      Optional domain context hint for topic selection.
+        duration_hours:        Course duration (e.g. 3); used for dynamic prompt.
+        calculated_word_count: Target total word count derived from duration + difficulty.
+        custom_system_prompt:  When set, takes highest priority as the system prompt.
+        validation_hints:      Optional S1/S2 retry feedback to embed in the request.
+        all_doc_titles:        Titles extracted from every source doc (not just the first). Enables multi-doc title synthesis.
+
+    Returns:
+        Parsed ``llm_to_outline`` dict.
     """
-    user_msg = f"## Course Difficulty\n{course_difficulty}\n\n"
+    if custom_system_prompt:
+        system_prompt = custom_system_prompt.strip()
+        prompt_source = "custom"
+    elif duration_hours is not None and calculated_word_count is not None:
+        system_prompt = build_dynamic_to_prompt(
+            duration_hours=duration_hours,
+            difficulty_level=course_difficulty,
+            calculated_word_count=calculated_word_count,
+        )
+        prompt_source = f"dynamic (duration={duration_hours}h, words={calculated_word_count:,})"
+    else:
+        system_prompt = GENERATE_TO_PROMPT
+        prompt_source = "static (GENERATE_TO_PROMPT)"
+    # ── Pre-build diagnostics ────────────────────────────────────────────────
+    raw_indexed_words = len(indexed_content.split()) if indexed_content else 0
+    toc_content_words = sum(
+        len((s.get("indexed_content") or "").split()) for s in (toc_section_contents or [])
+    )
+    fmt = "A (TOC-based)" if toc_section_contents else "B (heading + indexed)"
 
-    if course_type_hint and course_type_hint.strip():
-        user_msg += f"## Course Type Context\n{course_type_hint.strip()}\n\n"
-
-    user_msg += (
-        f"## Course Title\n{title}\n\n"
-        f"## Learning Objectives\n"
-        + "\n".join(f"- {obj}" for obj in objectives)
+    logger.info(
+        "[TO-LLM] ── INPUT SUMMARY ──────────────────────────────────────────"
+    )
+    logger.info("[TO-LLM]  Course title      : %s", title)
+    logger.info("[TO-LLM]  Difficulty         : %s", course_difficulty)
+    logger.info("[TO-LLM]  Duration           : %s h", duration_hours)
+    logger.info("[TO-LLM]  Target word count  : %s", f"{calculated_word_count:,}" if calculated_word_count else "—")
+    logger.info("[TO-LLM]  System prompt      : %s", prompt_source)
+    logger.info("[TO-LLM]  Content format     : %s", fmt)
+    logger.info("[TO-LLM]  Heading entries    : %d", len(heading_tree or []))
+    logger.info("[TO-LLM]  TOC sections       : %d  (%d words in section bodies)", len(toc_section_contents or []), toc_content_words)
+    logger.info("[TO-LLM]  indexed_content    : %d words (before truncation)", raw_indexed_words)
+    if raw_indexed_words > _MAX_TO_INDEXED_WORDS:
+        logger.warning(
+            "[TO-LLM]  ⚠ indexed_content will be TRUNCATED: %d → %d words (~%d%% kept)",
+            raw_indexed_words,
+            _MAX_TO_INDEXED_WORDS,
+            int(100 * _MAX_TO_INDEXED_WORDS / raw_indexed_words),
+        )
+    logger.info(
+        "[TO-LLM] ─────────────────────────────────────────────────────────────"
     )
 
-    if heading_tree:
-        user_msg += f"\n\n## Document Heading Structure (from all uploaded files)\n{_format_heading_tree(heading_tree)}"
+    user_msg = _build_to_user_message(
+        title=title,
+        objectives=objectives,
+        toc_section_contents=toc_section_contents,
+        heading_tree=heading_tree,
+        pdf_toc_outline=pdf_toc_outline,
+        indexed_content=indexed_content,
+        course_difficulty=course_difficulty,
+        course_type_hint=course_type_hint,
+        calculated_word_count=calculated_word_count,
+        validation_hints=validation_hints,
+        all_doc_titles=all_doc_titles,
+    )
 
-    user_msg += f"\n\n## Source Document Content (with paragraph indices)\n{indexed_content}"
+    user_msg_words = len(user_msg.split())
+    est_tokens = int(user_msg_words * 1.35)
+    logger.info(
+        "[TO-LLM]  user_msg size      : %d words (~%d tokens estimated)",
+        user_msg_words,
+        est_tokens,
+    )
+    logger.info("[TO-LLM]  Sending request to LLM (model=A0_TO → %s)…", get_deployment("A0_TO"))
 
-    if validation_hints:
-        user_msg += (
-            "\n\n## Prior validation feedback (resolve these issues in the generated outline)\n"
-            + validation_hints.strip()
-        )
-
-    system_prompt = custom_system_prompt.strip() if custom_system_prompt else GENERATE_TO_PROMPT
-    raw = chat(system_prompt, user_msg)
-    cleaned = _strip_fences(raw)
-
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"LLM returned invalid JSON for TO generation. "
-            f"Raw output (first 500 chars): {raw[:500]!r}"
-        ) from exc
+    raw = chat_for_to(system_prompt, user_msg)
+    resp_words = len(raw.split()) if raw else 0
+    logger.info(
+        "[TO-LLM]  LLM response received — %d words. Parsing TO JSON…",
+        resp_words,
+    )
+    return _parse_to_outline_json(raw)
 
 
 def map_to_to_source_indices(

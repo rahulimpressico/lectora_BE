@@ -6,6 +6,7 @@ Each LLM call receives the FULL paragraph text for that section's para_start
 to para_end range — no truncation.
 """
 
+import json
 import re
 
 from docx import Document
@@ -16,12 +17,62 @@ def count_tokens_approx(text: str) -> int:
     return int(len(re.findall(r"\w+", text)) / 0.75)
 
 
-def load_doc_paragraphs(docx_path: str) -> list[str]:
+def _load_paragraphs_from_indexed_content(indexed_content: str) -> list[str]:
     """
-    Load and return all non-empty paragraph texts from a .docx file.
+    Convert ``[P<N>] text`` blocks from A0's indexed_content into an ordered
+    list of paragraph strings (index → position in list).
+
+    Gaps in the ``[P<N>]`` sequence are filled with empty strings so that
+    ``doc_paragraphs[para_idx]`` gives the correct block for any para_idx
+    stored in the section map.
+    """
+    pairs: list[tuple[int, str]] = []
+    for m in re.finditer(r"\[P(\d+)\]\s*(.*?)(?=\[P\d+\]|\Z)", indexed_content, re.DOTALL):
+        idx = int(m.group(1))
+        text = m.group(2).strip()
+        pairs.append((idx, text))
+
+    if not pairs:
+        return []
+
+    max_idx = max(i for i, _ in pairs)
+    result: list[str] = [""] * (max_idx + 1)
+    for idx, text in pairs:
+        result[idx] = text
+    return result
+
+
+def load_doc_paragraphs(
+    docx_path: str,
+    shared_state_path: str | None = None,
+) -> list[str]:
+    """
+    Load and return all paragraph texts (by index) from a source document.
+
+    For **DOCX** files: opens the file with python-docx and returns stripped
+    paragraph texts in document order.
+
+    For **PDF** files: paragraphs are reconstructed from the ``[P<N>]``-
+    annotated ``indexed_content`` field in ``shared_state.json``.  The
+    ``shared_state_path`` argument must be provided for the PDF path to work;
+    if it is absent or the field is empty the function returns ``[]``.
+
     Call once per pipeline run and pass the result to the helpers below
     to avoid repeated disk reads.
     """
+    if docx_path.lower().endswith(".pdf"):
+        if not shared_state_path:
+            return []
+        try:
+            with open(shared_state_path) as fh:
+                state = json.load(fh)
+            indexed_content: str = (
+                state.get("extracted_inputs", {}).get("indexed_content", "") or ""
+            )
+            return _load_paragraphs_from_indexed_content(indexed_content)
+        except Exception:
+            return []
+
     doc = Document(docx_path)
     return [p.text.strip() for p in doc.paragraphs]
 

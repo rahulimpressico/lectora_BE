@@ -16,8 +16,8 @@ import json
 from lectora_backend.pipeline.rule_pack_config.prompt_bundle import bundle_rule_pack_for_prompt
 
 
-def _build_teaching_style_section(rule_pack: dict) -> str:
-    """Optional mentor-style block when the active rule pack configures it."""
+def _build_teaching_style_section(rule_pack: dict, audience: str = "") -> str:
+    """Build the mandatory instructor-style teaching block, enhanced with rule-pack specifics."""
     style = rule_pack.get("style_constraints") or {}
     content = rule_pack.get("content_rules") or {}
     labels = style.get("instructional_emphasis_labels") or []
@@ -26,64 +26,84 @@ def _build_teaching_style_section(rule_pack: dict) -> str:
     ex_range = content.get("require_examples_per_section")
     callout_range = content.get("require_callouts_per_section")
 
-    audience = (style.get("audience_focus") or "").strip().lower()
-    if not any([labels, scenarios, transitions, ex_range, callout_range, audience]):
-        return ""
+    audience_line = f"- Audience: **{audience}** — calibrate every example, scenario, and explanation for this specific learner." if audience.strip() else ""
 
     lines = [
         "## Teaching style (human mentor — CRITICAL)",
         "",
-        "Write like a **real instructor mentoring a student**, not generic AI prose.",
-        "- Audience: **students / learners** — practical, conversational, immersive, beginner-friendly.",
-        "- Address the reader as a student preparing for professional practice (per voice rules).",
-        "- Vary sentence rhythm; use concrete language; avoid filler openers "
-        '("In this section we will discuss…", "It is important to note that…").',
+        "Write like a **real instructor teaching a live class**, NOT like an encyclopedia or dictionary.",
+        "",
+        "### The core rule: TEACH, don't DEFINE",
+        "",
+        "WRONG (dictionary style, avoid this):",
+        '> "Coinsurance is a provision in an insurance policy requiring the insured to maintain coverage equal to a specified percentage of the property\'s value."',
+        "",
+        "RIGHT (instructor style, use this):",
+        '> "Imagine a business owner who insures a $1 million building for only $300,000. If a fire causes $500,000 in damage, the insurer won\'t pay the full claim — because the property was significantly underinsured. Coinsurance rules exist for exactly this reason: to encourage policyholders to carry coverage that actually reflects what they\'re protecting."',
+        "",
+        "Every section must answer ALL of these questions:",
+        "  1. **What is this?** (brief, plain-English definition)",
+        "  2. **Why does it matter?** (real consequences for the learner or their clients)",
+        "  3. **How is it used in practice?** (scenario, client conversation, or example)",
+        "  4. **What mistakes should be avoided?** (common pitfalls, misconceptions)",
+        "  5. **What should the learner know in a real situation?** (actionable takeaway)",
+        "",
+        "### Voice and tone",
+        "- Address the reader directly (second person: 'you', 'your', 'your client').",
+        "- Conversational but professional — like an experienced colleague explaining something.",
+        "- Vary sentence length. Short punchy sentences for key rules. Longer sentences for context.",
+        '- NEVER start a section with "In this section we will discuss…" or "It is important to note that…"',
+        '- NEVER use filler openers. Jump straight into the teaching.',
     ]
+
+    if audience_line:
+        lines.extend(["", audience_line])
+
+    lines.extend([
+        "",
+        "### Real-world examples and scenarios",
+        "- Every section of 200+ words MUST include at least one scenario or real-world example.",
+        "- A good scenario is 2–5 sentences: a realistic client situation → what happens → what the learner should do or know.",
+        "- Use business situations, client conversations, agent decisions, compliance situations.",
+        "- Scenarios should feel like things that actually happen, not hypotheticals.",
+    ])
 
     if scenarios or ex_range:
         lo, hi = (ex_range or [1, 2])[:2] if ex_range else (1, 2)
         lines.extend([
-            "",
-            "### Scenarios and real-world examples",
-            f"- Include **at least {lo}** lightweight scenario or real-world example(s) per section "
-            f"(up to ~{hi} when word budget allows).",
-            "- **Lightweight** scenarios only (2–5 sentences): a realistic client/situation, then what the "
-            "student should notice or do — not long case studies.",
-            "- Tie examples to the section's learning objectives when possible.",
+            f"- Rule-pack requires **{lo}–{hi}** example(s) per section.",
         ])
 
     if transitions:
         lines.extend([
             "",
             "### Transitions",
-            "- Open or close major idea shifts with a **smooth transition sentence** "
-            "(e.g. linking prior concept to the next topic).",
-            "- Do not jump between unrelated bullets without a bridging line.",
+            "- Bridge between major ideas with a smooth transition sentence.",
+            "- Do not jump abruptly between bullet points and prose.",
         ])
 
     if labels or callout_range:
         lo_c, hi_c = (callout_range or [1, 2])[:2] if callout_range else (1, 2)
-        label_list = ", ".join(f'"{x}"' for x in labels) if labels else '"Important"'
+        label_list = ", ".join(f'"{x}"' for x in labels) if labels else '"Important", "Pro Tip", "Common Mistake", "Warning"'
         lines.extend([
             "",
             "### Instructional emphasis callouts",
-            f"- Use **{lo_c}–{hi_c}** `important_callout` block(s) per section when appropriate.",
-            f"- Each callout MUST include a `label` field — choose from: {label_list}.",
-            '- Example: `{{"type": "important_callout", "label": "Pro Tip", "content": "..."}}`',
-            "- Match label to content (e.g. Common Mistake for pitfalls, Warning for compliance risk).",
-            "- Callout `content` is the teaching point only; do not repeat the label inside `content`.",
+            f"- Use **{lo_c}–{hi_c}** `important_callout` block(s) per section.",
+            f"- Label options: {label_list}",
+            '- Example: {{"type": "important_callout", "label": "Common Mistake", "content": "Many agents assume coinsurance only applies to commercial policies — it applies to residential as well."}}',
+            "- Use 'Common Mistake' for pitfalls, 'Warning' for compliance risk, 'Pro Tip' for best practices.",
         ])
 
     lines.append("")
     return "\n".join(lines)
 
 
-def build_lesson_system_prompt(rule_pack: dict) -> str:
+def build_lesson_system_prompt(rule_pack: dict, audience: str = "") -> str:
     """System prompt: output contract + authority rules; voice/KC details come from rule pack JSON."""
     fam = rule_pack.get("family", "CE")
     ver = rule_pack.get("version", "")
     meta = f"{fam} v{ver}" if ver else fam
-    teaching_block = _build_teaching_style_section(rule_pack)
+    teaching_block = _build_teaching_style_section(rule_pack, audience=audience)
     max_page = int((rule_pack.get("lectora_constraints") or {}).get("max_words_per_page") or 400)
     active_difficulty = (
         rule_pack.get("active_difficulty")
@@ -219,6 +239,8 @@ def build_lesson_user_message(
     rule_constraints: dict,
     lesson_wc: int,
     feedback: str | None = None,
+    audience: str = "",
+    special_instructions: str | None = None,
 ) -> str:
     """
     Build a single user message that asks the LLM to generate content for ALL
@@ -326,6 +348,14 @@ Source Content (reference material — paraphrase faithfully; do NOT copy verbat
             f"{feedback.strip()}\n"
         )
 
+    audience_block = ""
+    if audience.strip():
+        audience_block = f"\n\n## Target Audience (CRITICAL — calibrate ALL content for this learner)\n{audience.strip()}\nEvery example, scenario, callout, and explanation must be relevant and practical for this audience. Do not write generic content."
+
+    special_instructions_block = ""
+    if special_instructions and special_instructions.strip():
+        special_instructions_block = f"\n\n## Special Instructions from the Course Author (follow these EXACTLY)\n{special_instructions.strip()}\nThese instructions override default style choices. Apply them throughout every section of this lesson."
+
     return f"""## Lesson
 Title      : {lesson_title}
 Description: {lesson_content[:400] if lesson_content else "(none)"}
@@ -339,7 +369,7 @@ Interactive elements: {json.dumps(lesson_ie)}
 ## Prior Sections Summary (do NOT repeat these concepts)
 
 {prior_summary if prior_summary else "(No prior sections — this is the first lesson)"}
-{feedback_block}
+{feedback_block}{audience_block}{special_instructions_block}
 ## Sections to Generate  [{n} total — return as JSON array in this exact order]
 
 {sections_block}

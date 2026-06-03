@@ -1,32 +1,33 @@
 """
 A0 — Request Synthesizer & Input Normalizer
 
-Accepts one or more source .docx files and an optional Timed Outline .docx.
+Accepts one or more source .docx / .pdf files and an optional Timed Outline.
 
 Scenario 1 — TO provided:
-  Uses the TO as the course structure. All source documents are merged for
-  classification and content extraction with equal priority.
+  Parses the uploaded TO (DOCX/PDF) via LLM into structured outline JSON.
 
 Scenario 2 — NO TO provided:
-  Analyzes all source documents together and calls the LLM to generate a complete
-  Timed Outline automatically from the combined content.
+  Extracts structured content from source files (headings + para indices for DOCX,
+  TOC entries + section content for PDF) and sends only the structured data to the
+  LLM using GENERATE_TO_PROMPT.  No raw file upload to the Files API.
 
-In both scenarios A0 runs rule-family classification, resolves assessment fields
-from rule_pack_config, and writes shared_state plus sidecars including
+In both scenarios A0 runs rule-family classification and writes shared_state plus
 llm_to_outline.json for downstream agents.
 """
 
 import json
 import logging
 import os
+import shutil
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .utils.doc_parser import CourseDocParser
+from .utils.pdf_parser import PDFSourceParser
 from .utils.classifier import (
     classify_with_llm,
     resolve_value,
@@ -34,12 +35,9 @@ from .utils.classifier import (
     generate_to_with_llm,
     map_to_to_source_indices,
 )
-from .utils.pdf_extractor import (
-    extract_pdf_text,
-    extract_pdf_indexed_content,
-    extract_pdf_learning_objectives,
-    extract_pdf_heading_tree,
-    get_pdf_title,
+from .prompt.classification import (
+    DEFAULT_TO_DURATION_HOURS,
+    compute_calculated_word_count,
 )
 from .utils.outline_metrics import enrich_outline_metrics
 from .utils.title_cleaner import clean_outline_titles
@@ -59,94 +57,178 @@ from lectora_backend.pipeline.models import (
 from lectora_backend.pipeline.rule_pack_config.rule_packs import (
     RULE_PACKS,
 )
+from lectora_backend.pipeline.shared_utils.learning_objectives import (
+    normalize_learning_objectives,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _build_heading_map_from_heading_tree(
+    heading_tree: list[dict],
+) -> list[tuple[int, str, int, str]]:
+    """Convert heading_tree entries into heading_map tuples."""
+    return [
+        (
+            int(entry["para_idx"]),
+            str(entry["text"]),
+            int(entry["level"]),
+            str(entry.get("source") or "source"),
+        )
+        for entry in heading_tree
+        if entry.get("para_idx") is not None and entry.get("text")
+    ]
+
 
 
 class A0RequestSynthesizer:
     """
     A0 — Request Synthesizer & Input Normalizer
 
-    All source docs (`docx_paths`): title, course ID, learning objectives, content,
-    headings, indexed paragraphs, images, and rule-family classification are drawn
-    from every file with equal priority (no primary/extra split).
+    All source docs (`docx_paths` / `pdf_paths`): metadata, headings, indexed
+    paragraphs, images, and rule-family classification are extracted in code.
 
     Timed-outline doc (`to_outline_doc_path`, optional):
       - If provided: parsed via LLM into structured outline JSON (Scenario 1).
-      - If omitted: A0 generates a complete TO from the combined source content
-        via LLM (Scenario 2). No longer falls back to a synthetic single-lesson stub.
+      - If omitted: TO is generated from uploaded source files via LLM (Scenario 2).
 
     Outputs: request_spec, provenance_log, shared_state, and llm_to_outline JSON
-    files written under `output_dir/{doc_stem}/`.
+    files written under `output_dir/{course_slug}/`.
     """
 
     def __init__(
         self,
         docx_paths: Optional[list[str]] = None,
+        pdf_paths: Optional[list[str]] = None,
         to_outline_doc_path: Optional[str] = None,
         output_dir: str = "shared_state",
         course_difficulty: str = "intermediate",
         extra_text_contents: Optional[list[str]] = None,
         custom_to_prompt: Optional[str] = None,
         course_type_hint: Optional[str] = None,
+        step_logger: Optional[Callable[[str, str, str | None], None]] = None,
         *,
         docx_path: Optional[str] = None,
         extra_docx_paths: Optional[list[str]] = None,
         course_output_slug: Optional[str] = None,
+        duration_hours: Optional[int] = None,
+        difficulty_level: Optional[str] = None,
+        calculated_word_count: Optional[int] = None,
     ):
         paths: list[str] = [str(p) for p in (docx_paths or []) if p]
+        pdfs: list[str] = [str(p) for p in (pdf_paths or []) if p]
         if not paths and docx_path:
             paths = [str(docx_path)]
             paths.extend(str(p) for p in (extra_docx_paths or []) if p)
-        if not paths:
-            raise ValueError("At least one docx path is required")
+        if not paths and not pdfs:
+            raise ValueError("At least one docx or pdf path is required")
         self.docx_paths = paths
-        # Backward-compatible alias (first path) for downstream agents that read one file
-        self.docx_path = paths[0]
+        self.pdf_paths = pdfs
+        self.docx_path = paths[0] if paths else pdfs[0]
         self.to_outline_doc_path = to_outline_doc_path
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.course_difficulty = (course_difficulty or "intermediate").strip().lower()
         self.run_id = str(uuid.uuid4())[:8]
-        # Pre-extracted text from PDF files (or any non-DOCX supplemental content).
-        # Merged into combined content for LLM classification and TO generation.
         self.extra_text_contents: list[str] = extra_text_contents or []
-        # Optional custom system prompt for TO generation (overrides GENERATE_TO_PROMPT).
         self.custom_to_prompt: Optional[str] = custom_to_prompt
-        # Optional domain context (e.g. "Washington LTC Compliance Course").
-        # Passed to generate_to_with_llm to prioritize relevant topics.
         self.course_type_hint: Optional[str] = course_type_hint
         self.course_output_slug = (course_output_slug or "").strip() or None
+        self.step_logger = step_logger
+
+        self.difficulty_level: str = (
+            (difficulty_level or course_difficulty or "intermediate").strip().lower()
+        )
+        self._generate_to_from_source: bool = not bool(to_outline_doc_path)
+        if self._generate_to_from_source:
+            self.duration_hours: int = (
+                int(duration_hours)
+                if duration_hours is not None
+                else DEFAULT_TO_DURATION_HOURS
+            )
+            self.calculated_word_count: int = (
+                int(calculated_word_count)
+                if calculated_word_count is not None
+                else compute_calculated_word_count(
+                    self.duration_hours, self.difficulty_level
+                )
+            )
+        else:
+            self.duration_hours = int(duration_hours) if duration_hours is not None else None
+            self.calculated_word_count = (
+                int(calculated_word_count) if calculated_word_count is not None else None
+            )
+
+    def _emit_step(self, message: str, *, level: str = "info", stage: str = "A0") -> None:
+        if self.step_logger:
+            self.step_logger(level, message, stage)
 
     def run(self) -> A0Result:
         """Execute the full A0 pipeline and return a typed A0Result."""
 
-        # -- Step 1: Extract raw inputs from all source documents
         has_pdf_text = bool(self.extra_text_contents)
+        self._emit_step("Loading source documents and extracting structure…")
         logger.info(
-            "[A0] Parsing %s DOCX source(s)%s...",
+            "[A0] Parsing %s DOCX source(s), %s PDF source(s)%s...",
             len(self.docx_paths),
+            len(self.pdf_paths),
             f" + {len(self.extra_text_contents)} PDF text block(s)" if has_pdf_text else "",
         )
 
-        # When the timed-outline path is a pre-generated JSON file (from the
-        # generate-to preview step) we must NOT pass it to CourseDocParser —
-        # python-docx would try to open it as a DOCX ZIP and raise
-        # PackageNotFoundError.  The JSON is loaded later in the LLM section.
         _to_is_json = (
             self.to_outline_doc_path is not None
             and self.to_outline_doc_path.lower().endswith(".json")
         )
-        parser = CourseDocParser(
-            docx_paths=self.docx_paths,
-            to_outline_doc_path=None if _to_is_json else self.to_outline_doc_path,
+        _to_is_pdf = (
+            self.to_outline_doc_path is not None
+            and self.to_outline_doc_path.lower().endswith(".pdf")
         )
-        title = parser.extract_title()
-        course_id = parser.extract_course_id()
-        learning_objectives = parser.extract_merged_learning_objectives()
-        content_sample = parser.extract_merged_full_content(max_words=8000)
+        parser = (
+            CourseDocParser(
+                docx_paths=self.docx_paths,
+                to_outline_doc_path=None if (_to_is_json or _to_is_pdf) else self.to_outline_doc_path,
+            )
+            if self.docx_paths
+            else None
+        )
+        pdf_parser = PDFSourceParser(self.pdf_paths) if self.pdf_paths else None
+        to_outline_pdf_parser = (
+            PDFSourceParser([self.to_outline_doc_path]) if _to_is_pdf and self.to_outline_doc_path else None
+        )
 
-        # Merge in any pre-extracted PDF text content
+        title = (
+            (parser.extract_title() if parser else "")
+            or (pdf_parser.extract_title() if pdf_parser else "")
+            or "Course"
+        )
+        course_id = (
+            (parser.extract_course_id() if parser else None)
+            or (pdf_parser.extract_course_id() if pdf_parser else None)
+        )
+
+        learning_objectives: list[str] = []
+        seen_objectives: set[str] = set()
+        for items in (
+            parser.extract_merged_learning_objectives() if parser else [],
+            pdf_parser.extract_merged_learning_objectives() if pdf_parser else [],
+        ):
+            for obj in items:
+                key = obj.lower()
+                if key not in seen_objectives:
+                    learning_objectives.append(obj)
+                    seen_objectives.add(key)
+
+        content_parts: list[str] = []
+        if parser:
+            docx_content = parser.extract_merged_full_content(max_words=8000)
+            if docx_content:
+                content_parts.append(docx_content)
+        if pdf_parser:
+            pdf_content = pdf_parser.extract_merged_full_content(max_words=8000)
+            if pdf_content:
+                content_parts.append(pdf_content)
+        content_sample = "\n\n".join(part for part in content_parts if part.strip())
+
         if self.extra_text_contents:
             pdf_combined = "\n\n".join(t for t in self.extra_text_contents if t.strip())
             if pdf_combined:
@@ -156,45 +238,265 @@ class A0RequestSynthesizer:
                     len(self.extra_text_contents),
                 )
 
-        classification_sample = parser.extract_content_sample(max_chars=3000)
-        to_outline_content = parser.extract_to_outline_text()
-        total_doc_word_count = parser.count_total_doc_words()
+        classification_parts: list[str] = []
+        if parser:
+            sample = parser.extract_content_sample(max_chars=3000)
+            if sample:
+                classification_parts.append(sample)
+        if pdf_parser:
+            sample = pdf_parser.extract_content_sample(max_chars=3000)
+            if sample:
+                classification_parts.append(sample)
+        classification_sample = "\n\n".join(classification_parts)
+
+        # Only extract the TO outline text when a TO document is actually provided
+        # (Scenario 1). For Scenario 2 (no TO) this extraction is skipped entirely.
+        to_outline_content = ""
+        if self.to_outline_doc_path and not _to_is_json:
+            to_outline_content = (
+                to_outline_pdf_parser.extract_to_outline_text()
+                if to_outline_pdf_parser
+                else (parser.extract_to_outline_text() if parser else "")
+            )
+            to_word_count = len(to_outline_content.split())
+            logger.info(
+                "[A0] TO document extracted: %d words from %s",
+                to_word_count,
+                Path(self.to_outline_doc_path).name,
+            )
+            if not to_outline_content.strip():
+                logger.warning(
+                    "[A0] WARNING — TO document %r extracted to empty string. "
+                    "The file may use text boxes, SmartArt, or non-paragraph content "
+                    "that python-docx cannot read. LLM will receive no TO content.",
+                    Path(self.to_outline_doc_path).name,
+                )
+
+        total_doc_word_count = (
+            (parser.count_total_doc_words() if parser else 0)
+            + (pdf_parser.count_total_doc_words() if pdf_parser else 0)
+        )
         logger.info("[A0] Source doc word count: %s", total_doc_word_count)
 
-        indexed_content = parser.extract_indexed_content(max_words=8000)
-        heading_map = parser.get_section_heading_map()
-        total_paragraphs = parser.count_paragraphs()
+        indexed_parts: list[str] = []
+        _docx_indexed_words = 0
+        _pdf_indexed_words = 0
+        if parser:
+            indexed = parser.extract_indexed_content(max_words=None)
+            if indexed:
+                _docx_indexed_words = len(indexed.split())
+                indexed_parts.append(indexed)
+        if pdf_parser:
+            indexed = pdf_parser.extract_indexed_content(max_words=None)
+            if indexed:
+                _pdf_indexed_words = len(indexed.split())
+                indexed_parts.append(indexed)
+        indexed_content = "\n".join(indexed_parts)
+
+        total_paragraphs = 0
+        if parser:
+            total_paragraphs += parser.count_paragraphs()
+        if pdf_parser:
+            total_paragraphs += pdf_parser.count_paragraphs()
+
+        # ── Branch detection: log which pipeline path will be taken ─────────────
+        if _to_is_json:
+            logger.info(
+                "[TO MODE] Existing TO detected (pre-generated JSON: %s) — "
+                "will load directly from disk, no LLM TO call needed.",
+                self.to_outline_doc_path,
+            )
+        elif self.to_outline_doc_path:
+            logger.info(
+                "[TO MODE] Existing TO detected (%s) — continuing with detected TO.",
+                Path(self.to_outline_doc_path).name,
+            )
+        else:
+            logger.info(
+                "[STRUCTURED CONTENT MODE] TO not found — extracted headings and indexed "
+                "content will be sent to LLM (DOCX: heading_tree + indexed paragraphs; "
+                "PDF: TOC entries + section content) "
+                "(duration=%sh, difficulty=%s, target_words=%d).",
+                self.duration_hours,
+                self.difficulty_level,
+                self.calculated_word_count,
+            )
+
+        heading_map: list = []
+        if parser:
+            heading_map.extend(parser.get_section_heading_map())
+        pdf_heading_tree = (
+            pdf_parser.extract_merged_heading_tree() if pdf_parser else []
+        )
+        if pdf_parser:
+            heading_map.extend(_build_heading_map_from_heading_tree(pdf_heading_tree))
+
         logger.info("[A0] Heading anchors across sources: %s", len(heading_map))
 
-        heading_tree = parser.extract_merged_heading_tree()
-        # Augment with headings detected in any PDF extra_text_contents (if paths were stored).
-        # The paths are not stored here directly, but pdf heading trees are passed in from
-        # generate_to.py via extra_text_contents already encoded as text.
+        heading_tree: list[dict] = []
+        seen_headings: set[tuple[str, str]] = set()
+        for tree in [
+            *(parser.extract_merged_heading_tree() if parser else []),
+            *pdf_heading_tree,
+        ]:
+            source = str(tree.get("source") or "")
+            key = (source, str(tree["text"]).lower())
+            if key in seen_headings:
+                continue
+            heading_tree.append(tree)
+            seen_headings.add(key)
         logger.info("[A0] Heading tree entries: %s", len(heading_tree))
 
-        # -- Step 1b: Extract images (no LLM)
+        # ── Detailed extraction log — always emitted regardless of TO path ──────
+        logger.info("[EXTRACT] ══════════════ SOURCE EXTRACTION SUMMARY ══════════════")
+        if parser:
+            docx_headings = [h for h in heading_tree
+                             if not str(h.get("source", "")).lower().endswith(".pdf")]
+            logger.info(
+                "[EXTRACT]  DOCX  → %d headings extracted | %d words indexed",
+                len(docx_headings),
+                _docx_indexed_words,
+            )
+            if docx_headings:
+                logger.info("[EXTRACT]  ── DOCX titles ──────────────────────────────────")
+                for h in docx_headings:
+                    indent = "  " * max(0, int(h.get("level", 1)) - 1)
+                    logger.info(
+                        "[EXTRACT]     [L%s] %s%s",
+                        h.get("level", "?"),
+                        indent,
+                        h.get("text", ""),
+                    )
+        else:
+            logger.info("[EXTRACT]  DOCX  → (not provided)")
+
+        if pdf_parser:
+            pdf_headings = [h for h in heading_tree
+                            if str(h.get("source", "")).lower().endswith(".pdf")]
+            if not pdf_headings:
+                pdf_headings = pdf_heading_tree
+            logger.info(
+                "[EXTRACT]  PDF   → %d headings/TOC entries | %d words indexed",
+                len(pdf_headings),
+                _pdf_indexed_words,
+            )
+            if pdf_headings:
+                logger.info("[EXTRACT]  ── PDF TOC / headings ─────────────────────────────")
+                for h in pdf_headings:
+                    indent = "  " * max(0, int(h.get("level", 1)) - 1)
+                    logger.info(
+                        "[EXTRACT]     [L%s] %s%s",
+                        h.get("level", "?"),
+                        indent,
+                        h.get("text", ""),
+                    )
+        else:
+            logger.info("[EXTRACT]  PDF   → (not provided)")
+
+        total_indexed = _docx_indexed_words + _pdf_indexed_words
+        logger.info(
+            "[EXTRACT]  COMBINED → %d total words from %s source(s) "
+            "(DOCX: %d | PDF: %d)",
+            total_indexed,
+            (1 if parser else 0) + (1 if pdf_parser else 0),
+            _docx_indexed_words,
+            _pdf_indexed_words,
+        )
+        logger.info("[EXTRACT] ══════════════════════════════════════════════════════════")
+
+        self._emit_step("Extracting source images and preparing prompts…")
         logger.info("[A0] Extracting images...")
         if self.course_output_slug:
             stem = self.course_output_slug
         elif len(self.docx_paths) == 1:
             stem = Path(self.docx_paths[0]).stem
+        elif len(self.pdf_paths) == 1 and not self.docx_paths:
+            stem = Path(self.pdf_paths[0]).stem
         else:
             stem = f"multi_{self.run_id}"
         doc_dir = self.output_dir / stem
         doc_dir.mkdir(parents=True, exist_ok=True)
+        input_docs_dir = doc_dir / "doc"
+        input_docs_dir.mkdir(parents=True, exist_ok=True)
+
+        persisted_inputs: list[str] = []
+        for src_path in [*self.docx_paths, *self.pdf_paths]:
+            src = Path(src_path)
+            if not src.exists() or not src.is_file():
+                continue
+            dest = input_docs_dir / src.name
+            shutil.copy2(src, dest)
+            persisted_inputs.append(dest.name)
+
+        if self.to_outline_doc_path and not _to_is_json:
+            to_src = Path(self.to_outline_doc_path)
+            if to_src.exists() and to_src.is_file():
+                dest = input_docs_dir / to_src.name
+                shutil.copy2(to_src, dest)
+                persisted_inputs.append(dest.name)
+
+        if persisted_inputs:
+            logger.info(
+                "[A0] Persisted %s input file(s) -> %s",
+                len(persisted_inputs),
+                input_docs_dir,
+            )
+
         images_dir = doc_dir / "images"
-        images = parser.extract_all_images(images_dir)
+        images: list[dict] = []
+        if parser:
+            images.extend(parser.extract_all_images(images_dir))
+        if pdf_parser:
+            images.extend(
+                pdf_parser.extract_all_images(
+                    images_dir,
+                    start_seq=len(images),
+                    heading_anchors=pdf_heading_tree if pdf_heading_tree else None,
+                )
+            )
         logger.info("[A0] Extracted %s images -> %s", len(images), images_dir)
-        # -- Step 2: LLM calls (run in parallel — two sequential o3 calls doubled wall time)
+
+        # ── Build multi-doc title list for classification (extract from each source) ─
+        _classify_all_titles: list[str] = []
+        if parser:
+            for _dp in self.docx_paths:
+                try:
+                    _ip = CourseDocParser(docx_paths=[str(_dp)])
+                    _t = _ip.extract_title()
+                    if _t and _t.strip():
+                        _classify_all_titles.append(_t.strip())
+                except Exception:
+                    pass
+        if pdf_parser:
+            for _pp in self.pdf_paths:
+                try:
+                    _ip2 = PDFSourceParser([str(_pp)])
+                    _t = _ip2.extract_title()
+                    if _t and _t.strip():
+                        _classify_all_titles.append(_t.strip())
+                except Exception:
+                    pass
+        if not _classify_all_titles and title:
+            _classify_all_titles = [title]
+        logger.info("[A0] Classification titles from all docs: %s", _classify_all_titles)
+
+        # ── Build richer classification content sample (larger than default 3000 chars) ─
+        _classify_parts: list[str] = []
+        if parser:
+            _s = parser.extract_content_sample(max_chars=8000)
+            if _s:
+                _classify_parts.append(_s)
+        if pdf_parser:
+            _s = pdf_parser.extract_content_sample(max_chars=8000)
+            if _s:
+                _classify_parts.append(_s)
+        _rich_classification_sample = "\n\n".join(_classify_parts) or classification_sample
+
         hints_arg = None
         t_llm = time.perf_counter()
+        self._emit_step("Running rule-family classification and TO generation…")
         logger.info("[A0] Starting parallel LLM calls (classify + TO)...")
 
-        # ── Detect pre-generated TO JSON (from generate-to preview step) ──────
-        # When the FE passes a .json file as timedOutline.blobPath the TO was
-        # already generated by A0 during the generate-to preview — load it
-        # directly to avoid a redundant LLM call and ensure the pipeline uses
-        # the same TO the user reviewed/edited in the UI.
         _to_is_pregenerated_json = (
             self.to_outline_doc_path is not None
             and self.to_outline_doc_path.lower().endswith(".json")
@@ -205,36 +507,121 @@ class A0RequestSynthesizer:
                 classify_with_llm,
                 title,
                 learning_objectives,
-                classification_sample,
+                _rich_classification_sample,
+                all_doc_titles=_classify_all_titles or None,
+                heading_tree=heading_tree or None,
                 validation_hints=hints_arg,
             )
 
             if _to_is_pregenerated_json:
-                # Fast path: load pre-generated TO, no LLM call needed
+                # ── TO MODE: pre-generated JSON — load from disk, no LLM needed ──
+                logger.info(
+                    "[TO MODE] Existing TO detected — loading pre-generated JSON from disk."
+                )
+
                 def _load_pregenerated_to():
                     with open(self.to_outline_doc_path, encoding="utf-8") as fh:  # type: ignore[arg-type]
                         payload = json.load(fh)
                     return payload.get("llm_to_outline") or payload
 
                 to_future = pool.submit(_load_pregenerated_to)
+
             elif self.to_outline_doc_path:
+                # ── TO MODE: TO document provided → parse via LLM ───────────────
+                logger.info(
+                    "[TO MODE] Existing TO detected — sending TO document to LLM for parsing."
+                )
                 to_future = pool.submit(
                     classify_to_outline_with_llm,
                     to_outline_content,
                     validation_hints=hints_arg,
                 )
+
             else:
-                to_future = pool.submit(
-                    generate_to_with_llm,
-                    title=title,
-                    objectives=learning_objectives,
-                    indexed_content=indexed_content,
-                    course_difficulty=self.course_difficulty,
-                    validation_hints=hints_arg,
-                    custom_system_prompt=self.custom_to_prompt,
-                    heading_tree=heading_tree if heading_tree else None,
-                    course_type_hint=self.course_type_hint,
-                )
+                # ── STRUCTURED CONTENT MODE: send extracted headings/TOC to LLM ──
+                # For DOCX sources: FORMAT B — heading_tree + [P<N>]-prefixed paragraphs.
+                # For PDF-only sources with an embedded TOC: FORMAT A — TOC entries
+                #   + per-section indexed content (anchored to para indices).
+                # For PDF-only sources without a TOC: FORMAT B fallback.
+                def _generate_to_from_structured(
+                    _title=title,
+                    _objectives=learning_objectives,
+                    _indexed=indexed_content,
+                    _htree=heading_tree,
+                ):
+                    _pdf_toc_outline = None
+                    if pdf_parser and parser:
+                        _pdf_entries = pdf_parser.extract_toc_entries(
+                            include_heading_fallback=True
+                        )
+                        if _pdf_entries:
+                            _outline_lines = [
+                                "## PDF SOURCE OUTLINE (bookmarks — structure from PDF; "
+                                "body text includes DOCX + PDF below)"
+                            ]
+                            for _entry in _pdf_entries[:200]:
+                                _page = f" p{_entry.page}" if _entry.page else ""
+                                _indent = "  " * max(0, _entry.level - 1)
+                                _outline_lines.append(
+                                    f"{_indent}[L{_entry.level}] {_entry.text}{_page}"
+                                )
+                            _pdf_toc_outline = "\n".join(_outline_lines)
+                            logger.info(
+                                "[A0] Mixed sources: attached PDF bookmark outline "
+                                "(%d entries, %d lines in prompt)",
+                                len(_pdf_entries),
+                                len(_outline_lines) - 1,
+                            )
+
+                    _toc_section_contents = None
+                    if pdf_parser and not parser:
+                        # PDF-only: bookmark TOC + per-section snippets (FORMAT A)
+                        _pdf_toc = pdf_parser.extract_toc_entries(
+                            include_heading_fallback=True
+                        )
+                        if _pdf_toc:
+                            _toc_budget = min(
+                                16_000,
+                                max(8_000, 40 * len(_pdf_toc)),
+                            )
+                            _toc_section_contents = pdf_parser.extract_toc_section_contents(
+                                _pdf_toc, total_word_budget=_toc_budget
+                            )
+                    # Collect titles from each individual source file for multi-doc title synthesis
+                    _all_doc_titles: list[str] = []
+                    for _dp in self.docx_paths:
+                        try:
+                            _ip = CourseDocParser(docx_paths=[str(_dp)])
+                            _t = _ip.extract_title()
+                            if _t:
+                                _all_doc_titles.append(_t)
+                        except Exception:
+                            pass
+                    for _pp in self.pdf_paths:
+                        try:
+                            _ip2 = PDFSourceParser([str(_pp)])
+                            _t = _ip2.extract_title()
+                            if _t:
+                                _all_doc_titles.append(_t)
+                        except Exception:
+                            pass
+                    return generate_to_with_llm(
+                        _title,
+                        _objectives,
+                        _indexed,
+                        heading_tree=_htree,
+                        pdf_toc_outline=_pdf_toc_outline,
+                        toc_section_contents=_toc_section_contents,
+                        course_difficulty=self.difficulty_level,
+                        course_type_hint=self.course_type_hint,
+                        duration_hours=self.duration_hours,
+                        calculated_word_count=self.calculated_word_count,
+                        custom_system_prompt=self.custom_to_prompt,
+                        validation_hints=hints_arg,
+                        all_doc_titles=_all_doc_titles,
+                    )
+
+                to_future = pool.submit(_generate_to_from_structured)
 
             llm_result = classify_future.result()
             llm_to_outline_result = to_future.result()
@@ -244,22 +631,27 @@ class A0RequestSynthesizer:
             time.perf_counter() - t_llm,
         )
 
+        paragraphs_by_source: dict[str, int] = {}
+        if parser:
+            paragraphs_by_source.update(
+                {path.name: len(doc.paragraphs) for path, doc in parser._sources}
+            )
+        if pdf_parser:
+            paragraphs_by_source.update(pdf_parser.paragraphs_by_source())
+
         if _to_is_pregenerated_json:
-            # Pre-generated TO already has paragraph indices from the preview step;
-            # skip re-mapping and mark as reused so downstream can log it correctly.
-            logger.info("[A0] Using pre-generated TO from preview step (skipping LLM + mapping).")
+            logger.info(
+                "[TO MODE] Pre-generated TO loaded from disk — no LLM TO generation was performed."
+            )
             llm_to_outline_result["_reused_from_preview"] = True
         elif self.to_outline_doc_path:
+            # ── TO MODE completed: map TO sections → source paragraph indices ────
             raw_sections = (llm_to_outline_result or {}).get("sections") or []
+            logger.info(
+                "[TO MODE] Continuing with detected TO — mapping %d TO section(s) to source headings.",
+                len(raw_sections),
+            )
             if raw_sections and heading_map:
-                logger.info(
-                    "[A0] Mapping %s TO sections to source paragraph indices...",
-                    len(raw_sections),
-                )
-                paragraphs_by_source = {
-                    path.name: len(doc.paragraphs)
-                    for path, doc in parser._sources
-                }
                 mapped_sections = map_to_to_source_indices(
                     sections=raw_sections,
                     heading_map=heading_map,
@@ -270,27 +662,54 @@ class A0RequestSynthesizer:
                     1 for s in mapped_sections if s.get("para_idx_start") is not None
                 )
                 logger.info(
-                    "[A0] Matched %s/%s sections to source headings.",
+                    "[TO MODE] Matched %d/%d section(s) to source headings.",
                     matched,
                     len(mapped_sections),
                 )
                 llm_to_outline_result["sections"] = mapped_sections
         else:
+            # ── STRUCTURED CONTENT MODE completed: tag metadata on the LLM-generated outline
+            n_sections = len((llm_to_outline_result or {}).get("sections") or [])
+            logger.info(
+                "[STRUCTURED CONTENT MODE] LLM generated %d section(s) from extracted content "
+                "(duration=%sh, difficulty=%s, target_words=%d).",
+                n_sections,
+                self.duration_hours,
+                self.difficulty_level,
+                self.calculated_word_count,
+            )
             llm_to_outline_result["_generated_from_source"] = True
+            llm_to_outline_result["_dynamic_flow"] = True
+            llm_to_outline_result["_duration_hours"] = self.duration_hours
+            llm_to_outline_result["_difficulty_level"] = self.difficulty_level
+            llm_to_outline_result["_calculated_word_count"] = self.calculated_word_count
+
+        # Backfill learning objectives from the TO (or generated outline) when the
+        # study guide itself has none. This covers DOCX sources where the LOs live
+        # in the uploaded TO file, not in the raw study guide document.
+        if not learning_objectives:
+            llm_learning_objectives = normalize_learning_objectives(
+                (llm_to_outline_result or {}).get("learning_objectives", [])
+            )
+            if llm_learning_objectives:
+                learning_objectives = llm_learning_objectives
+                source_label = "TO document" if self.to_outline_doc_path else "generated TO"
+                logger.info(
+                    "[A0] Backfilled %s learning objective(s) from %s "
+                    "(none found in study guide).",
+                    len(learning_objectives),
+                    source_label,
+                )
 
         rule_family_key = llm_result["rule_family"]
-        # -- Step 3: Look up active rule pack
         if rule_family_key not in RULE_PACKS:
             raise ValueError(
                 f"LLM returned unknown rule family '{rule_family_key}'. "
                 f"Valid: {list(RULE_PACKS.keys())}"
             )
         rule_pack = RULE_PACKS[rule_family_key]
-
-        # -- Step 4: Identify rule family
         family_name = rule_pack["family"]
 
-        # -- Step 5: Build inferred values (from LLM output)
         inferred = {
             "topic": llm_result.get("topic"),
             "audience": llm_result.get("audience"),
@@ -298,7 +717,6 @@ class A0RequestSynthesizer:
             "category": llm_result.get("category"),
         }
 
-        # -- Step 6: Resolve all values with typed provenance
         resolve_keys = [
             "words_per_credit_hour",
             "topic",
@@ -315,13 +733,10 @@ class A0RequestSynthesizer:
                 if key == "words_per_credit_hour"
                 else {}
             )
-            val, source = resolve_value(
-                key, {}, rule_defaults, inferred
-            )
+            val, source = resolve_value(key, {}, rule_defaults, inferred)
             resolved[key] = val
             provenance_log[key] = ProvenanceEntry(value=val, source=source)
 
-        # -- Step 7: Build typed RequestSpec
         request_spec = RequestSpec(
             run_id=self.run_id,
             timestamp=datetime.now(timezone.utc),
@@ -342,7 +757,6 @@ class A0RequestSynthesizer:
             ),
         )
 
-        # -- Step 7.5: Extract TO total word count from raw LLM result
         _raw_totals = (llm_to_outline_result or {}).get("totals") or {}
         try:
             to_outline_total_word_count = int(_raw_totals.get("word_count") or 0)
@@ -350,16 +764,17 @@ class A0RequestSynthesizer:
             to_outline_total_word_count = 0
         logger.info("[A0] TO outline total word count (from LLM): %s", to_outline_total_word_count)
 
-        # -- Step 8: Build typed SharedState
-        # LLMClassification.model_validate ignores extra keys from the raw dict
         llm_classification = LLMClassification.model_validate(llm_result)
+        heading_map_serialized: list[list] = [list(entry) for entry in heading_map]
 
         shared_state = SharedState(
             run_id=self.run_id,
             status="a0_completed",
             request_spec=request_spec,
             provenance_log=provenance_log,
-            source_document=", ".join(os.path.basename(p) for p in self.docx_paths),
+            source_document=", ".join(
+                os.path.basename(p) for p in [*self.docx_paths, *self.pdf_paths]
+            ),
             extracted_inputs=ExtractedInputs(
                 title=title,
                 course_id=course_id,
@@ -367,14 +782,21 @@ class A0RequestSynthesizer:
                 content_sample=content_sample,
                 total_doc_word_count=total_doc_word_count,
                 to_outline_total_word_count=to_outline_total_word_count,
+                heading_tree=heading_tree,
+                heading_map=heading_map_serialized,
+                indexed_content=indexed_content,
+                toc_entries=[],
+                toc_section_contents=[],
+                total_paragraphs=total_paragraphs,
+                paragraphs_by_source=paragraphs_by_source,
             ),
-            images=images,                          # raw dicts from doc_parser
+            images=images,
             llm_classification=llm_classification,
             llm_to_outline_classification=llm_to_outline_result,
             agent_outputs=AgentOutputSlots(),
         )
 
-        # -- Step 9: Persist to disk using model serialization
+        self._emit_step("Persisting A0 outputs and generated TO artifacts…")
         spec_path = doc_dir / "request_spec.json"
         prov_path = doc_dir / "provenance_log.json"
         state_path = doc_dir / "shared_state.json"
@@ -389,13 +811,11 @@ class A0RequestSynthesizer:
             "llm_to_outline": llm_to_outline_result,
         }
 
-        # ── Save unmodified copy before enrichment ────────────────────────
         llm_outline_copy_path = doc_dir / "llm_to_outline_COPY.json"
         with open(llm_outline_copy_path, "w", encoding="utf-8") as f:
             json.dump(llm_to_outline_payload, f, indent=2, ensure_ascii=False, default=str)
         logger.info("[A0] llm_to_outline_COPY (original) written -> %s", llm_outline_copy_path)
 
-        # ── Strip "page N" / "pg N" artefacts from every title ────────────
         outline_inner = llm_to_outline_payload.get("llm_to_outline") or {}
         _, n_titles_cleaned = clean_outline_titles(outline_inner)
         if n_titles_cleaned:
@@ -404,7 +824,6 @@ class A0RequestSynthesizer:
                 n_titles_cleaned,
             )
 
-        # ── Normalize TO hierarchy: promote topics out of reserved sections ─
         outline_inner = llm_to_outline_payload.get("llm_to_outline") or {}
         normalized_inner, hierarchy_modified = normalize_to_hierarchy(outline_inner)
         if hierarchy_modified:
@@ -415,16 +834,14 @@ class A0RequestSynthesizer:
             )
             llm_to_outline_payload["llm_to_outline"] = normalized_inner
 
-        # ── Enrich missing word_count / minutes / credit_hour fields ──────
         enriched_payload, was_modified = enrich_outline_metrics(
             llm_to_outline_payload,
-            difficulty=self.course_difficulty,
+            difficulty=self.difficulty_level if self._generate_to_from_source else self.course_difficulty,
         )
         if was_modified:
             logger.info("[A0] outline_metrics enricher filled in missing pacing fields.")
             llm_to_outline_payload = enriched_payload
 
-        # ── Embed totals in llm_to_outline.json for reference ────────────
         llm_to_outline_payload["total_doc_word_count"] = total_doc_word_count
         llm_to_outline_payload["to_outline_total_word_count"] = to_outline_total_word_count
 
@@ -436,23 +853,21 @@ class A0RequestSynthesizer:
             (prov_path, prov_serializable),
             (state_path, shared_state.model_dump(mode="json")),
         ]:
-            with open(path, "w") as f:
-                json.dump(data, f, indent=2, default=str)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
 
         logger.info("[A0] llm_to_outline written -> %s", llm_outline_path)
-
-        output_files = A0OutputFiles(
-            request_spec=str(spec_path),
-            provenance_log=str(prov_path),
-            shared_state=str(state_path),
-            llm_to_outline=str(llm_outline_path),
-            llm_to_outline_raw=str(llm_outline_copy_path),
-        )
 
         return A0Result(
             request_spec=request_spec,
             provenance_log=provenance_log,
             shared_state_path=str(state_path),
-            output_files=output_files,
+            output_files=A0OutputFiles(
+                request_spec=str(spec_path),
+                provenance_log=str(prov_path),
+                shared_state=str(state_path),
+                llm_to_outline=str(llm_outline_path),
+                llm_to_outline_raw=str(llm_outline_copy_path),
+            ),
             llm_to_outline=llm_to_outline_result,
         )

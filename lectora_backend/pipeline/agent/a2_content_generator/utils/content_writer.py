@@ -131,12 +131,14 @@ def _generate_lesson_single_call(
     retries: int,
     *,
     batch_info: str = "",
+    audience: str = "",
+    special_instructions: str | None = None,
 ) -> list[dict]:
     """One LLM round-trip for a slice of subtopic_specs (internal)."""
     if not subtopic_specs:
         return []
 
-    system_prompt = build_lesson_system_prompt(rule_pack)
+    system_prompt = build_lesson_system_prompt(rule_pack, audience=audience)
 
     user_msg = build_lesson_user_message(
         lesson=lesson,
@@ -146,6 +148,8 @@ def _generate_lesson_single_call(
         rule_constraints=rule_pack,
         lesson_wc=lesson_wc,
         feedback=feedback,
+        audience=audience,
+        special_instructions=special_instructions,
     )
 
     last_error: str | None = None
@@ -194,7 +198,22 @@ def _generate_lesson_single_call(
                 last_error,
             )
             if attempt < retries:
-                time.sleep(2 * attempt)
+                # Azure OpenAI server errors (500) need recovery time before retry.
+                # Short sleep suffices for parse/validation failures (our fault).
+                _err_lower = last_error.lower()
+                is_server_err = (
+                    "500" in last_error
+                    or "server_error" in _err_lower
+                    or "internal server" in _err_lower
+                )
+                wait_s = 30 if is_server_err else (2 * attempt)
+                if is_server_err:
+                    logger.info(
+                        "  [A2] %sServer error — waiting %ss for Azure to recover "
+                        "before attempt %s/%s…",
+                        prefix, wait_s, attempt + 1, retries,
+                    )
+                time.sleep(wait_s)
 
     return [
         {
@@ -218,6 +237,8 @@ def generate_lesson(
     lesson_wc: int,
     max_retries: int | None = None,
     feedback: str | None = None,
+    audience: str = "",
+    special_instructions: str | None = None,
 ) -> list[dict]:
     """
     Generate content for ALL subtopics of one TO lesson (one or more LLM calls).
@@ -259,6 +280,8 @@ def generate_lesson(
             lesson_wc=lesson_wc,
             feedback=feedback,
             retries=retries,
+            audience=audience,
+            special_instructions=special_instructions,
         )
 
     n_batches = (n_specs + MAX_SECTIONS_PER_LLM_CALL - 1) // MAX_SECTIONS_PER_LLM_CALL
@@ -292,6 +315,8 @@ def generate_lesson(
                 feedback=feedback,
                 retries=retries,
                 batch_info=batch_label,
+                audience=audience,
+                special_instructions=special_instructions,
             )
         )
 
@@ -307,6 +332,9 @@ def generate_all_sections(
     rule_pack: dict,
     feedback: str | None = None,
     source_chunks: list[dict] | None = None,
+    shared_state_path: str | None = None,
+    audience: str = "",
+    special_instructions: str | None = None,
 ) -> list[dict]:
     """
     Generate content for every lesson in enriched_sections.
@@ -318,13 +346,16 @@ def generate_all_sections(
 
     Args:
         enriched_sections : List of TO-lesson dicts from Section Mapper.
-        docx_path         : Path to the source .docx file.
+        docx_path         : Path to the source .docx file (DOCX or PDF).
         learning_objectives: Full list of course learning objectives.
         rule_pack         : Active rule pack constraints.
         feedback          : Optional S2 feedback to inject into generation.
         source_chunks     : Optional pre-built chunk list from chunk_files().
                             When provided, topic-wise retrieval supplements
                             paragraph-range extraction for each subtopic.
+        shared_state_path : Path to shared_state.json.  Required when
+                            ``docx_path`` is a PDF so that paragraphs can be
+                            reconstructed from ``indexed_content``.
 
     Returns:
         Flat list of generated section dicts in document order.
@@ -333,7 +364,7 @@ def generate_all_sections(
     total_lessons = len(enriched_sections)
 
     try:
-        doc_paragraphs = load_doc_paragraphs(docx_path)
+        doc_paragraphs = load_doc_paragraphs(docx_path, shared_state_path=shared_state_path)
     except (OSError, ValueError) as exc:
         logger.warning("  [A2] Could not load doc paragraphs: %s", exc)
         doc_paragraphs = []
@@ -527,6 +558,8 @@ def generate_all_sections(
             rule_pack=rule_pack,
             lesson_wc=lesson_wc,
             feedback=feedback,
+            audience=audience,
+            special_instructions=special_instructions,
         )
 
         # ── Attach metadata and collect ───────────────────────────────────────

@@ -1621,3 +1621,95 @@ async def download_artifact(job_id: str) -> FileResponse:
         filename=f"course_{job_id[:8]}.docx",
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+
+@router.post(
+    "/{job_id}/artifacts/save-to-azure",
+    summary="Upload the generated DOCX to Azure Blob Storage",
+)
+async def save_artifact_to_azure(job_id: str) -> JSONResponse:
+    from lectora_backend.config import settings as _settings
+    from lectora_backend.repositories.blob_repository import BlobRepository
+
+    if not _settings.is_azure_storage_configured():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "azure_not_configured",
+                "message": (
+                    "Azure Blob Storage is not configured. "
+                    "Set AZURE_STORAGE_CONNECTION_STRING in .env to enable this feature."
+                ),
+            },
+        )
+
+    store = get_local_course_job_store()
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown or expired jobId: {job_id}",
+        )
+
+    if job.status != LocalJobStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job not completed (status: {job.status.value})",
+        )
+
+    if not job.shared_state_path or not Path(job.shared_state_path).exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shared state not found — cannot build DOCX",
+        )
+
+    # Rebuild DOCX from latest shared_state so any FE edits are included.
+    try:
+        loop = asyncio.get_event_loop()
+        docx_path = await loop.run_in_executor(
+            None,
+            render_study_guide_from_state,
+            job.shared_state_path,
+        )
+        store.update_study_guide_path(job_id, docx_path)
+    except Exception as exc:
+        docx_path = job.study_guide_path
+        if not docx_path or not Path(docx_path).exists():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"DOCX rebuild failed: {exc}",
+            ) from exc
+
+    course_slug = sanitize_course_slug(job.course_title)
+    file_name = f"{course_slug}_study_guide.docx"
+    blob_path = f"{course_slug}/output/{file_name}"
+
+    container = _settings.generated_courses_container_name
+    try:
+        repo = BlobRepository(container_name=container)
+        repo.upload_file(
+            local_path=docx_path,
+            blob_path=blob_path,
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    except Exception as exc:
+        logger.exception("[save_to_azure] Upload failed for job %s: %s", job_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "upload_failed",
+                "message": f"Azure upload failed: {exc}",
+            },
+        ) from exc
+
+    logger.info(
+        "[save_to_azure] Uploaded %s for job %s → %s/%s",
+        file_name, job_id, container, blob_path,
+    )
+    return JSONResponse(content={
+        "status": "uploaded",
+        "jobId": job_id,
+        "fileName": file_name,
+        "blobPath": blob_path,
+        "containerName": container,
+    })

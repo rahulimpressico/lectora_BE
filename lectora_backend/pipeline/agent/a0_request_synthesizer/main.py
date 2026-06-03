@@ -456,6 +456,42 @@ class A0RequestSynthesizer:
             )
         logger.info("[A0] Extracted %s images -> %s", len(images), images_dir)
 
+        # ── Build multi-doc title list for classification (extract from each source) ─
+        _classify_all_titles: list[str] = []
+        if parser:
+            for _dp in self.docx_paths:
+                try:
+                    _ip = CourseDocParser(docx_paths=[str(_dp)])
+                    _t = _ip.extract_title()
+                    if _t and _t.strip():
+                        _classify_all_titles.append(_t.strip())
+                except Exception:
+                    pass
+        if pdf_parser:
+            for _pp in self.pdf_paths:
+                try:
+                    _ip2 = PDFSourceParser([str(_pp)])
+                    _t = _ip2.extract_title()
+                    if _t and _t.strip():
+                        _classify_all_titles.append(_t.strip())
+                except Exception:
+                    pass
+        if not _classify_all_titles and title:
+            _classify_all_titles = [title]
+        logger.info("[A0] Classification titles from all docs: %s", _classify_all_titles)
+
+        # ── Build richer classification content sample (larger than default 3000 chars) ─
+        _classify_parts: list[str] = []
+        if parser:
+            _s = parser.extract_content_sample(max_chars=8000)
+            if _s:
+                _classify_parts.append(_s)
+        if pdf_parser:
+            _s = pdf_parser.extract_content_sample(max_chars=8000)
+            if _s:
+                _classify_parts.append(_s)
+        _rich_classification_sample = "\n\n".join(_classify_parts) or classification_sample
+
         hints_arg = None
         t_llm = time.perf_counter()
         self._emit_step("Running rule-family classification and TO generation…")
@@ -471,7 +507,9 @@ class A0RequestSynthesizer:
                 classify_with_llm,
                 title,
                 learning_objectives,
-                classification_sample,
+                _rich_classification_sample,
+                all_doc_titles=_classify_all_titles or None,
+                heading_tree=heading_tree or None,
                 validation_hints=hints_arg,
             )
 
@@ -549,6 +587,24 @@ class A0RequestSynthesizer:
                             _toc_section_contents = pdf_parser.extract_toc_section_contents(
                                 _pdf_toc, total_word_budget=_toc_budget
                             )
+                    # Collect titles from each individual source file for multi-doc title synthesis
+                    _all_doc_titles: list[str] = []
+                    for _dp in self.docx_paths:
+                        try:
+                            _ip = CourseDocParser(docx_paths=[str(_dp)])
+                            _t = _ip.extract_title()
+                            if _t:
+                                _all_doc_titles.append(_t)
+                        except Exception:
+                            pass
+                    for _pp in self.pdf_paths:
+                        try:
+                            _ip2 = PDFSourceParser([str(_pp)])
+                            _t = _ip2.extract_title()
+                            if _t:
+                                _all_doc_titles.append(_t)
+                        except Exception:
+                            pass
                     return generate_to_with_llm(
                         _title,
                         _objectives,
@@ -562,6 +618,7 @@ class A0RequestSynthesizer:
                         calculated_word_count=self.calculated_word_count,
                         custom_system_prompt=self.custom_to_prompt,
                         validation_hints=hints_arg,
+                        all_doc_titles=_all_doc_titles,
                     )
 
                 to_future = pool.submit(_generate_to_from_structured)

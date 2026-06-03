@@ -48,29 +48,99 @@ def classify_with_llm(
     objectives: list[str],
     content_sample: str,
     *,
+    all_doc_titles: list[str] | None = None,
+    heading_tree: list[dict] | None = None,
     validation_hints: str | None = None,
 ) -> dict:
-    """Classify the course into a rule family and infer metadata via AzureOpenAI."""
-    user_msg = (
-        f"## Course Title\n{title}\n\n"
-        f"## Learning Objectives\n"
-        + "\n".join(f"- {obj}" for obj in objectives)
-        + f"\n\n## Content Sample\n{content_sample}"
-    )
+    """Classify the course into a rule family and infer metadata via AzureOpenAI.
+
+    Uses multiple content signals for accurate classification:
+      - title: primary title (from first/primary source document)
+      - all_doc_titles: titles from every uploaded source document
+      - objectives: merged learning objectives from all sources
+      - content_sample: representative text from all source documents
+      - heading_tree: structured heading hierarchy from all sources
+
+    The richer the signals provided, the more accurate the classification.
+    """
+    parts: list[str] = []
+
+    # ── Multi-doc title signal ───────────────────────────────────────────────
+    if all_doc_titles and len(all_doc_titles) > 1:
+        parts.append(
+            "## Source Document Titles (" + str(len(all_doc_titles)) + " files)\n"
+            + "\n".join(f"- {t}" for t in all_doc_titles if t)
+        )
+    else:
+        parts.append(f"## Course / Document Title\n{title}")
+
+    # ── Learning objectives ──────────────────────────────────────────────────
+    if objectives:
+        parts.append(
+            "## Learning Objectives\n"
+            + "\n".join(f"- {obj}" for obj in objectives)
+        )
+
+    # ── Document heading structure (strong structural signal) ────────────────
+    if heading_tree:
+        heading_lines: list[str] = []
+        for h in heading_tree[:80]:  # first 80 headings are sufficient
+            level = int(h.get("level", 1))
+            text = str(h.get("text", "")).strip()
+            if text:
+                indent = "  " * max(0, level - 1)
+                heading_lines.append(f"[L{level}] {indent}{text}")
+        if heading_lines:
+            parts.append("## Document Heading Structure\n" + "\n".join(heading_lines))
+
+    # ── Content sample ───────────────────────────────────────────────────────
+    if content_sample:
+        parts.append(f"## Content Sample (from all source files)\n{content_sample}")
+
+    # ── Validation hints ─────────────────────────────────────────────────────
     if validation_hints:
-        user_msg += (
-            "\n\n## Prior S1 validation feedback (resolve inconsistencies with this run)\n"
+        parts.append(
+            "## Prior S1 validation feedback (resolve inconsistencies)\n"
             + validation_hints.strip()
         )
 
+    user_msg = "\n\n".join(parts)
+
+    # ── Logging ─────────────────────────────────────────────────────────────
+    logger.info("[CLASSIFY] ══════════════ RULE FAMILY CLASSIFICATION ══════════════")
+    logger.info("[CLASSIFY]  Primary title      : %s", title)
+    if all_doc_titles:
+        logger.info("[CLASSIFY]  All doc titles     : %s", all_doc_titles)
+    logger.info("[CLASSIFY]  Objectives         : %d items", len(objectives))
+    logger.info("[CLASSIFY]  Heading entries    : %d", len(heading_tree) if heading_tree else 0)
+    logger.info(
+        "[CLASSIFY]  Content sample     : %d chars",
+        len(content_sample) if content_sample else 0,
+    )
+    logger.info("[CLASSIFY]  Sending to LLM (model=A0 → %s)…", get_deployment("A0"))
+
     raw = chat(CLASSIFICATION_PROMPT, user_msg)
+
+    logger.info("[CLASSIFY]  LLM raw response   : %s", raw[:300].replace("\n", " "))
+
     try:
-        return json.loads(_strip_fences(raw))
+        result = json.loads(_strip_fences(raw))
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"LLM returned invalid JSON for course classification. "
             f"Raw output (first 500 chars): {raw[:500]!r}"
         ) from exc
+
+    logger.info(
+        "[CLASSIFY]  ── RESULT: rule_family=%s | confidence=%.2f | topic=%s",
+        result.get("rule_family"),
+        float(result.get("confidence") or 0),
+        result.get("topic"),
+    )
+    logger.info("[CLASSIFY]  ── REASONING: %s", result.get("reasoning", ""))
+    logger.info("[CLASSIFY] ══════════════════════════════════════════════════════════")
+
+    return result
 
 
 def resolve_value(
@@ -119,6 +189,7 @@ def _build_to_user_message(
     course_type_hint: str | None = None,
     calculated_word_count: int | None = None,
     validation_hints: str | None = None,
+    all_doc_titles: list[str] | None = None,
 ) -> str:
     """Build the user message for GENERATE_TO_PROMPT.
 
@@ -131,6 +202,13 @@ def _build_to_user_message(
     if calculated_word_count:
         parts.append(f"## Target Word Count\n{calculated_word_count}")
     parts.append(f"## Course Title\n{title}")
+    if all_doc_titles and len(all_doc_titles) > 1:
+        parts.append(
+            "## Source Document Titles (ALL uploaded files)\n"
+            "The course is assembled from " + str(len(all_doc_titles)) + " source document(s). "
+            "Generate a course title that comprehensively covers ALL the topics across these files:\n"
+            + "\n".join(f"- {t}" for t in all_doc_titles)
+        )
     if objectives:
         parts.append(
             "## Learning Objectives\n"
@@ -214,6 +292,7 @@ def generate_to_with_llm(
     calculated_word_count: int | None = None,
     custom_system_prompt: str | None = None,
     validation_hints: str | None = None,
+    all_doc_titles: list[str] | None = None,
 ) -> dict:
     """Generate a structured Timed Outline from extracted source document content.
 
@@ -241,6 +320,7 @@ def generate_to_with_llm(
         calculated_word_count: Target total word count derived from duration + difficulty.
         custom_system_prompt:  When set, takes highest priority as the system prompt.
         validation_hints:      Optional S1/S2 retry feedback to embed in the request.
+        all_doc_titles:        Titles extracted from every source doc (not just the first). Enables multi-doc title synthesis.
 
     Returns:
         Parsed ``llm_to_outline`` dict.
@@ -299,6 +379,7 @@ def generate_to_with_llm(
         course_type_hint=course_type_hint,
         calculated_word_count=calculated_word_count,
         validation_hints=validation_hints,
+        all_doc_titles=all_doc_titles,
     )
 
     user_msg_words = len(user_msg.split())

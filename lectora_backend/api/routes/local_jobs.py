@@ -1723,7 +1723,7 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
     file_name = f"{course_slug}_study_guide.docx"
     blob_path = f"{course_slug}/output/{file_name}"
 
-    container = _settings.generated_courses_container_name
+    container = _settings.blob_container_name  # main artifacts container — same one the pipeline writes to
     try:
         repo = BlobRepository(container_name=container)
         repo.upload_file(
@@ -1741,14 +1741,46 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
             },
         ) from exc
 
+    # Save a metadata sidecar so the Asset Library and downstream tools
+    # can discover course info without downloading the full DOCX.
+    with open(job.shared_state_path, encoding="utf-8") as _fh:
+        shared_state = json.load(_fh)
+    try:
+        _a2_out: dict = shared_state.get("agent_outputs", {}).get("A2", {})
+        _sections: list = _a2_out.get("sections", [])
+        _meta: dict = {
+            "courseTitle":   job.course_title,
+            "courseId":      job_id,
+            "courseType":    job.course_type or "",
+            "fileName":      file_name,
+            "blobPath":      blob_path,
+            "containerName": container,
+            "savedAt":       datetime.now(timezone.utc).isoformat(),
+            "totalSections": len(_sections),
+            "totalWordCount": sum(
+                len(str(s.get("body_paragraphs", "") or "").split())
+                for s in _sections
+            ),
+        }
+        _meta_blob = f"{course_slug}/output/{course_slug}_metadata.json"
+        repo.upload_bytes(
+            _meta_blob,
+            json.dumps(_meta, indent=2, ensure_ascii=False).encode("utf-8"),
+            content_type="application/json",
+        )
+        logger.info("[save-to-azure] Metadata saved → %s", _meta_blob)
+    except Exception as _meta_exc:
+        logger.warning("[save-to-azure] Could not save metadata: %s", _meta_exc)
+
     logger.info(
         "[save_to_azure] Uploaded %s for job %s → %s/%s",
         file_name, job_id, container, blob_path,
     )
     return JSONResponse(content={
-        "status": "uploaded",
-        "jobId": job_id,
-        "fileName": file_name,
-        "blobPath": blob_path,
+        "status":        "uploaded",
+        "jobId":         job_id,
+        "fileName":      file_name,
+        "blobPath":      blob_path,
         "containerName": container,
+        "savedAt":       datetime.now(timezone.utc).isoformat(),
     })

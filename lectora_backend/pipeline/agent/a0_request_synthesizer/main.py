@@ -258,6 +258,19 @@ class A0RequestSynthesizer:
                 if to_outline_pdf_parser
                 else (parser.extract_to_outline_text() if parser else "")
             )
+            to_word_count = len(to_outline_content.split())
+            logger.info(
+                "[A0] TO document extracted: %d words from %s",
+                to_word_count,
+                Path(self.to_outline_doc_path).name,
+            )
+            if not to_outline_content.strip():
+                logger.warning(
+                    "[A0] WARNING — TO document %r extracted to empty string. "
+                    "The file may use text boxes, SmartArt, or non-paragraph content "
+                    "that python-docx cannot read. LLM will receive no TO content.",
+                    Path(self.to_outline_doc_path).name,
+                )
 
         total_doc_word_count = (
             (parser.count_total_doc_words() if parser else 0)
@@ -614,15 +627,21 @@ class A0RequestSynthesizer:
             llm_to_outline_result["_difficulty_level"] = self.difficulty_level
             llm_to_outline_result["_calculated_word_count"] = self.calculated_word_count
 
-        if pdf_parser and not parser and not learning_objectives:
+        # Backfill learning objectives from the TO (or generated outline) when the
+        # study guide itself has none. This covers DOCX sources where the LOs live
+        # in the uploaded TO file, not in the raw study guide document.
+        if not learning_objectives:
             llm_learning_objectives = normalize_learning_objectives(
                 (llm_to_outline_result or {}).get("learning_objectives", [])
             )
             if llm_learning_objectives:
                 learning_objectives = llm_learning_objectives
+                source_label = "TO document" if self.to_outline_doc_path else "generated TO"
                 logger.info(
-                    "[A0] Backfilled %s learning objective(s) from generated TO for PDF-only source.",
+                    "[A0] Backfilled %s learning objective(s) from %s "
+                    "(none found in study guide).",
                     len(learning_objectives),
+                    source_label,
                 )
 
         rule_family_key = llm_result["rule_family"]

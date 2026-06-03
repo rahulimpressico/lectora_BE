@@ -592,17 +592,28 @@ async def browse_by_category(
         return local
 
     if category == "generated-courses":
+        # The pipeline (PipelineAdapter) saves all artifacts — including the final
+        # study_guide.docx — to the MAIN artifacts container (blob_container_name,
+        # default "regedlectoraaistorage") under {course_slug}/output/.
+        # The separate "generated-courses" container is only populated by the
+        # manual "Save to Azure" button in the course editor.
+        # For the Asset Library we browse the main container so that every
+        # pipeline-generated course is visible without requiring a manual save.
+        azure_prefix = _artifacts_browse_prefix(prefix)
         if _azure_configured():
             try:
-                from lectora_backend.config import settings as _settings
-                _gc_container = getattr(_settings, "generated_courses_container_name", "generated-courses")
-                _gc_repo = BlobRepository(container_name=_gc_container)
-                return _azure_browse_container(_gc_repo, prefix.lstrip("/"))
+                result = _azure_browse(azure_prefix)
+                result.container_name = _main_container_name()
+                if result.entries or prefix:
+                    return result
+                logger.info(
+                    "[storage/categories] generated-courses: empty at prefix=%r in main container.",
+                    azure_prefix,
+                )
             except Exception as exc:
                 logger.warning("[storage/categories] generated-courses Azure failed (%s), using local.", exc)
-        # Local dev: browse pipeline/courses/ and return only output DOCX files
         local = _local_browse_artifacts(prefix)
-        local.container_name = "generated-courses (local)"
+        local.container_name = f"{_main_container_name()} (local)"
         return local
 
     # pipeline-artifacts and test-data → main artifacts container

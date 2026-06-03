@@ -634,8 +634,13 @@ def _run_pipeline_inner(
             log("info", f"Re-analyzing document with quality feedback (attempt {gate_cycle})…", "A0")
         store.start_stage(job_id, "A0")
 
-        # On retry cycles let A0 re-run fully (don't reuse pre-generated TO)
-        to_path_for_cycle = effective_to_path if gate_cycle == 1 else timed_outline_path
+        # Always keep the user-supplied TO across retry cycles.
+        # effective_to_path holds either the three-panel JSON override or the
+        # original uploaded TO file. Falling back to timed_outline_path on
+        # retries is wrong when to_override was used (timed_outline_path may be
+        # None) — that caused A0 to silently discard the user's TO and generate
+        # a fresh one, losing learning objectives and section structure.
+        to_path_for_cycle = effective_to_path
 
         job_rec = store.get(job_id)
         course_slug = sanitize_course_slug(

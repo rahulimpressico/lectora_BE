@@ -14,6 +14,9 @@ The SSE `id:` field is set to the latest log row ID so the browser can send
 The connection closes automatically when:
   - The job reaches COMPLETED or FAILED (terminal state)
   - 30 minutes elapse (safety cut-off)
+
+Session lifetime: a **fresh DB session is opened and closed for every poll
+tick** so we never hold a connection open for the full 30-minute window.
 """
 from __future__ import annotations
 
@@ -22,15 +25,14 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
 
-from lectora_backend.dependencies import get_db_session
+from lectora_backend.dependencies import SessionLocal
 from lectora_backend.repositories.job_repository import JobRepository
 from lectora_backend.repositories.job_log_repository import JobLogRepository
 from lectora_backend.models.job_enums import JobStatus
-from lectora_backend.models.constants import PIPELINE_ORDER
+from lectora_backend.models.constants import PIPELINE_ORDER, STAGE_ORDER
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +46,7 @@ _TERMINAL_STATUSES = {JobStatus.COMPLETED, JobStatus.FAILED}
 # ── Serialisation helpers ──────────────────────────────────────────────────────
 
 def _serialise_stage(stage) -> dict:
-    """Convert a StageProgress ORM row to a JSON-safe dict.
-
-    Parses `error_detail` to expose per-stage blockers and retry attempt
-    count so the frontend can render them inline without a separate request.
-    """
+    """Convert a StageProgress ORM row to a JSON-safe dict."""
     result: dict = {
         "stage": stage.stage_id.value,
         "status": stage.status.value,
@@ -91,7 +89,12 @@ def _find_primary_error(ordered_stages) -> dict | None:
                 return {**payload, "stage": s.stage_id.value}
         except (json.JSONDecodeError, TypeError):
             pass
-        return {"code": "UNKNOWN", "message": str(s.error_detail), "retryable": False, "stage": s.stage_id.value}
+        return {
+            "code": "UNKNOWN",
+            "message": str(s.error_detail),
+            "retryable": False,
+            "stage": s.stage_id.value,
+        }
     return None
 
 
@@ -101,14 +104,18 @@ def _serialise_log(log) -> dict:
         "level": log.level,
         "message": log.message,
         "stageId": log.stage_id,
-        "createdAt": log.created_at.isoformat() if log.created_at else datetime.now(timezone.utc).isoformat(),
+        "createdAt": (
+            log.created_at.isoformat()
+            if log.created_at
+            else datetime.now(timezone.utc).isoformat()
+        ),
     }
 
 
 def _build_event(job, new_logs: list, latest_log_id: int) -> str:
     ordered = sorted(
         job.stage_progress,
-        key=lambda s: PIPELINE_ORDER.index(s.stage_id),
+        key=lambda s: STAGE_ORDER.get(s.stage_id, len(PIPELINE_ORDER)),
     )
 
     error = _find_primary_error(s for s in ordered if s.status.value == "FAILED")
@@ -122,37 +129,41 @@ def _build_event(job, new_logs: list, latest_log_id: int) -> str:
         "error": error,
         "logs": [_serialise_log(lg) for lg in new_logs],
     }
-    # SSE id: field — browser uses this as Last-Event-ID on reconnect
     return f"id: {latest_log_id}\ndata: {json.dumps(payload)}\n\n"
 
 
 # ── Event generator ────────────────────────────────────────────────────────────
 
-async def _event_generator(job_id: str, session: Session, last_log_id: int):
-    """Yield SSE-formatted strings until the job terminates or timeout."""
-    repository = JobRepository(session)
-    log_repository = JobLogRepository(session)
+async def _event_generator(job_id: str, last_log_id: int):
+    """Yield SSE-formatted strings until the job terminates or timeout.
+
+    Opens a fresh DB session per poll tick and closes it immediately after —
+    no connection is held across the asyncio.sleep() call.
+    """
     deadline = asyncio.get_event_loop().time() + _MAX_STREAM_SEC
     cursor = last_log_id
 
     yield ": connected\n\n"
 
     while asyncio.get_event_loop().time() < deadline:
-        # Expire ORM identity map so each loop iteration reads fresh DB state
-        session.expire_all()
+        # Short-lived session: opened, used, and closed within this block.
+        with SessionLocal() as session:
+            job = JobRepository(session).get_job(job_id)
+            if job is None:
+                yield 'event: error\ndata: {"message": "Job not found"}\n\n'
+                return
 
-        job = repository.get_job(job_id)
-        if job is None:
-            yield 'event: error\ndata: {"message": "Job not found"}\n\n'
-            return
+            new_logs = JobLogRepository(session).get_logs_since(
+                job_id, after_id=cursor
+            )
+            latest_log_id = new_logs[-1].id if new_logs else cursor
+            event_str = _build_event(job, new_logs, latest_log_id)
+            is_terminal = job.status in _TERMINAL_STATUSES
 
-        new_logs = log_repository.get_logs_since(job_id, after_id=cursor)
-        latest_log_id = new_logs[-1].id if new_logs else cursor
-
-        yield _build_event(job, new_logs, latest_log_id)
+        yield event_str
         cursor = latest_log_id
 
-        if job.status in _TERMINAL_STATUSES:
+        if is_terminal:
             yield "event: done\ndata: {}\n\n"
             return
 
@@ -167,7 +178,6 @@ async def _event_generator(job_id: str, session: Session, last_log_id: int):
 async def stream_job_events(
     job_id: str,
     request: Request,
-    session: Session = Depends(get_db_session),
 ) -> StreamingResponse:
     """Open an SSE stream that emits pipeline stage-update events for a job.
 
@@ -175,15 +185,16 @@ async def stream_job_events(
     by the browser's EventSource on reconnect).  Pass `?lastEventId=<n>` as a
     fallback for clients that cannot set custom headers.
     """
-    repository = JobRepository(session)
-    job = repository.get_job(job_id)
-    if job is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found.",
-        )
+    # Verify the job exists before opening the stream — avoids a dangling
+    # 200-response SSE connection for a job that doesn't exist.
+    with SessionLocal() as session:
+        job = JobRepository(session).get_job(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found.",
+            )
 
-    # Resolve the log cursor for reconnect support
     raw_cursor = (
         request.headers.get("last-event-id")
         or request.query_params.get("lastEventId")
@@ -195,7 +206,7 @@ async def stream_job_events(
         last_log_id = 0
 
     return StreamingResponse(
-        _event_generator(job_id, session, last_log_id),
+        _event_generator(job_id, last_log_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

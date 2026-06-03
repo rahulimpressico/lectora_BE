@@ -26,6 +26,17 @@ class GenerateTORequest(BaseModel):
     Multi:    { "blobPaths": ["folder/a.docx", "folder/b.pdf"], "difficulty": "...",
                 "customToPrompt": "..." }
 
+    New dynamic flow (when user selects duration + difficulty in the UI):
+      {
+        "blobPaths": [...],
+        "durationHours": 3,
+        "difficultyLevel": "advanced",
+        "calculatedWordCount": 18000
+      }
+    When ``durationHours`` and ``calculatedWordCount`` are provided, A0 skips
+    TOC/heading extraction and sends file content directly to the LLM with a
+    dynamic prompt built from the course configuration.
+
     At least one of ``blobPath`` or ``blobPaths`` must be provided.
     ``blobPath`` is kept for backward compatibility; ``blobPaths`` takes precedence.
     """
@@ -52,7 +63,45 @@ class GenerateTORequest(BaseModel):
     to_doc_blob_path: str | None = Field(
         default=None,
         alias="toDocBlobPath",
-        description="Optional user-uploaded TO document blob path (DOCX). When provided, A0 parses this as the Timed Outline instead of generating one from scratch.",
+        description="Optional user-uploaded TO document blob path (DOCX or PDF). When provided, A0 parses this as the Timed Outline instead of generating one from scratch.",
+    )
+
+    # ── New dynamic TO generation params ─────────────────────────────────────
+    duration_hours: int | None = Field(
+        default=None,
+        alias="durationHours",
+        description=(
+            "Course duration selected by the user (1–5 hours). "
+            "When provided together with calculatedWordCount, activates the new "
+            "dynamic TO generation flow (raw file content → LLM with config prompt)."
+        ),
+    )
+    difficulty_level: str | None = Field(
+        default=None,
+        alias="difficultyLevel",
+        description=(
+            "Difficulty level selected by the user: 'basic', 'intermediate', or 'advanced'. "
+            "Used in the dynamic TO prompt for word count and credit hour calculations."
+        ),
+    )
+    calculated_word_count: int | None = Field(
+        default=None,
+        alias="calculatedWordCount",
+        description=(
+            "Word count target calculated by the frontend: "
+            "(duration_hours × 9000) / difficulty_multiplier. "
+            "Embedded in the dynamic TO prompt so the LLM distributes words correctly."
+        ),
+    )
+
+    audience: str | None = Field(
+        default=None,
+        alias="audience",
+        description=(
+            "Target audience for the course (e.g. 'Trained Insurance Agents', "
+            "'New Agents', 'Business Owners'). When provided, the TO generation "
+            "and content writing are calibrated to this audience."
+        ),
     )
 
     model_config = {"populate_by_name": True}
@@ -107,5 +156,6 @@ class GenerateTOJobPollResponse(BaseModel):
     to: dict[str, Any] | None = None
     rules: dict[str, Any] | None = None
     to_blob_path: str | None = Field(default=None, alias="toBlobPath")
+    logs: list[dict[str, Any]] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}

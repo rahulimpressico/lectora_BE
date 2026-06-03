@@ -35,6 +35,7 @@ class LocalStageProgress:
     outcome: str | None = None
     blockers: list[dict[str, Any]] = field(default_factory=list)
     retry_attempt: int = 0
+    error_message: str | None = None  # persisted by fail_stage()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +46,7 @@ class LocalStageProgress:
             "outcome": self.outcome,
             "blockers": self.blockers,
             "retryAttempt": self.retry_attempt,
+            "errorMessage": self.error_message,
         }
 
 
@@ -215,6 +217,7 @@ class LocalCourseJobStore:
             if stage:
                 stage.status = "FAILED"
                 stage.completed_at = datetime.now(timezone.utc).isoformat()
+                stage.error_message = error_message  # surfaced in to_dict()
             job.updated_at = datetime.now(timezone.utc).isoformat()
 
     def append_log(

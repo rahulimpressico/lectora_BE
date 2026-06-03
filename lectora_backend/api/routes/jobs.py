@@ -3,8 +3,8 @@ import json
 import logging
 import math
 import time
+import uuid
 from datetime import datetime, timezone
-from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
@@ -19,6 +19,7 @@ from lectora_backend.api.schemas.course_schemas import (
     CourseContentMeta,
     CourseContentResponse,
     CourseSectionSchema,
+    SectionImageSchema,
 )
 from lectora_backend.api.schemas.job_schemas import (
     JobCreateRequest,
@@ -36,14 +37,15 @@ from lectora_backend.core.blob_layout import build_blob_layout_for_course
 from lectora_backend.core.course_storage import sanitize_course_slug
 from lectora_backend.core.storage_cleanup import delete_course_output_tree
 from lectora_backend.core.state_manager import StateManager
-from lectora_backend.core.queue_publisher import QueuePublisher
-from lectora_backend.models.constants import PIPELINE_ORDER
+from lectora_backend.core.queue_publisher import get_queue_publisher
+from lectora_backend.models.constants import PIPELINE_ORDER, STAGE_ORDER
 
 logger = logging.getLogger(__name__)
 
-
 router = APIRouter()
 
+
+# ── Error response helpers ─────────────────────────────────────────────────────
 
 def _missing_input_response(message: str) -> JSONResponse:
     return JSONResponse(
@@ -72,6 +74,8 @@ def _job_init_error_response(message: str, retryable: bool) -> JSONResponse:
         },
     )
 
+
+# ── Mapping helpers ────────────────────────────────────────────────────────────
 
 def _map_job_error(error_detail: str | None) -> JobErrorDetail | None:
     if not error_detail:
@@ -107,9 +111,11 @@ def _map_job_error(error_detail: str | None) -> JobErrorDetail | None:
 
 
 def _map_job_detail(job) -> JobDetailResponse:
+    # Use precomputed O(1) lookup instead of PIPELINE_ORDER.index() which raises
+    # ValueError on unknown stages and is O(n) per call.
     ordered_stage_progress = sorted(
         job.stage_progress,
-        key=lambda item: PIPELINE_ORDER.index(item.stage_id),
+        key=lambda item: STAGE_ORDER.get(item.stage_id, len(PIPELINE_ORDER)),
     )
 
     return JobDetailResponse(
@@ -131,7 +137,13 @@ def _map_job_detail(job) -> JobDetailResponse:
         ],
         error=_map_job_error(
             next(
-                (stage.error_detail for stage in ordered_stage_progress if stage.error_detail), None)
+                (
+                    stage.error_detail
+                    for stage in ordered_stage_progress
+                    if stage.error_detail
+                ),
+                None,
+            )
         ),
     )
 
@@ -192,21 +204,19 @@ def _map_artifacts(job) -> list[ArtifactSummary]:
     return artifacts
 
 
+# ── Job creation ───────────────────────────────────────────────────────────────
+
 @router.post("", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
 async def create_job(
     payload: JobCreateRequest,
     session: Session = Depends(get_db_session),
 ) -> JobCreateResponse:
-    # timedOutline is strongly recommended — the pipeline's Section Mapper
-    # relies on it to map course sections to TO lessons. Without it the worker
-    # will fall back to Scenario C (algorithmic KC placement), which may reduce
-    # content quality. We log a warning but do NOT reject the request.
     if payload.inputs.timed_outline is None:
         logger.warning(
             "[create_job] timedOutline not provided for job — pipeline will use Scenario C (algorithmic KC)."
         )
 
-    job_id = f"j-{uuid4().hex[:8]}"
+    job_id = f"j-{uuid.uuid4().hex[:8]}"
     actor = "system"
     study_guide_blob_path = payload.inputs.study_guide.blob_path
     if not study_guide_blob_path or not study_guide_blob_path.strip():
@@ -268,19 +278,10 @@ async def create_job(
         "artifactRefs": {},
         "blobLayout": blob_layout.to_dict(),
         "retryHistory": [],
-        # User-edited TO from the three-panel review step.  When present the
-        # pipeline_adapter patches llm_to_outline_classification before A1 runs.
         "toOverride": payload.to_override,
         "stageExecutionState": {
-            "A0": {"status": StageStatus.PENDING.value},
-            "A1": {"status": StageStatus.PENDING.value},
-            "S1": {"status": StageStatus.PENDING.value},
-            "A2": {"status": StageStatus.PENDING.value},
-            "A3": {"status": StageStatus.PENDING.value},
-            "A4": {"status": StageStatus.PENDING.value},
-            "A5": {"status": StageStatus.PENDING.value},
-            "S2": {"status": StageStatus.PENDING.value},
-            "A6": {"status": StageStatus.PENDING.value},
+            stage.value: {"status": StageStatus.PENDING.value}
+            for stage in PIPELINE_ORDER
         },
     }
 
@@ -318,8 +319,7 @@ async def create_job(
         )
 
     try:
-        publisher = QueuePublisher()
-        await publisher.enqueue(job_id)
+        await get_queue_publisher().enqueue(job_id)
     except Exception as exc:
         repository.mark_job_failed(
             job_id=job_id,
@@ -338,6 +338,8 @@ async def create_job(
     )
 
 
+# ── Job detail ─────────────────────────────────────────────────────────────────
+
 @router.get("/{job_id}", response_model=JobDetailResponse)
 async def get_job(
     job_id: str,
@@ -352,6 +354,8 @@ async def get_job(
 
     return _map_job_detail(job)
 
+
+# ── Job deletion ───────────────────────────────────────────────────────────────
 
 @router.delete("/{job_id}", status_code=status.HTTP_200_OK)
 async def delete_job(
@@ -369,15 +373,9 @@ async def delete_job(
     if job.status in (JobStatus.PENDING, JobStatus.PROCESSING):
         repository.update_job_status(job_id, JobStatus.CANCELLED)
 
+    # delete_course_output_tree already removes the {slug}/ prefix from Azure
+    # and local filesystem — no need for a separate state_manager cleanup call.
     delete_course_output_tree(job.course_title)
-
-    state_manager = StateManager()
-    try:
-        state_manager.delete_blobs_under_prefix(
-            f"{sanitize_course_slug(job.course_title)}"
-        )
-    except Exception as exc:
-        logger.warning("[delete_job] Blob cleanup partial failure for %s: %s", job_id, exc)
 
     if not repository.delete_job(job_id):
         raise HTTPException(
@@ -387,6 +385,8 @@ async def delete_job(
     logger.info("[delete_job] Deleted job %s (course=%r)", job_id, job.course_title)
     return {"jobId": job_id, "status": "deleted", "message": "Job and artifacts removed"}
 
+
+# ── Retry ──────────────────────────────────────────────────────────────────────
 
 @router.post("/{job_id}/retry", response_model=RetryResponse)
 async def retry_job(
@@ -407,6 +407,19 @@ async def retry_job(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
 
+    # Re-enqueue so the worker actually processes the retry.
+    try:
+        await get_queue_publisher().enqueue(job_id)
+    except Exception as exc:
+        logger.exception(
+            "[retry_job] Failed to enqueue retry for job %s: %s", job_id, exc
+        )
+        repository.update_job_status(job_id, JobStatus.FAILED)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to enqueue job for retry: {exc}",
+        ) from exc
+
     return RetryResponse(
         job_id=job_id,
         status=job.status,
@@ -415,6 +428,8 @@ async def retry_job(
         overrides=payload.overrides,
     )
 
+
+# ── Artifacts ──────────────────────────────────────────────────────────────────
 
 @router.get("/{job_id}/artifacts", response_model=ArtifactListResponse)
 async def get_job_artifacts(
@@ -439,13 +454,7 @@ async def get_job_artifacts(
 def _build_a2_content_lookup(
     a2_sections: list[dict],
 ) -> tuple[dict[str, dict], dict[str, dict]]:
-    """
-    Build two lookup dicts from A2's flat generated sections list.
-
-    Returns:
-        by_section_id: maps enriched_sections subtopic id → a2 section dict
-        by_lesson_overview: maps TO lesson title → a2 parent overview section dict
-    """
+    """Build two lookup dicts from A2's flat generated sections list."""
     by_section_id: dict[str, dict] = {}
     by_lesson_overview: dict[str, dict] = {}
     for sec in a2_sections or []:
@@ -464,20 +473,18 @@ def _build_section(
     order: int,
     level: int,
     parent_id: str | None,
-    counter: list[int],
     a2_by_id: dict[str, dict] | None = None,
     a2_by_lesson: dict[str, dict] | None = None,
+    course_slug: str = "",
 ) -> CourseSectionSchema:
-    """Recursively convert enriched_sections dict to CourseSectionSchema.
+    """Recursively convert an enriched_sections dict to CourseSectionSchema.
 
     When A2 content is available (a2_by_id / a2_by_lesson) the generated text
     is merged in so the editor gets the real course body, not the raw outline.
     """
-    import uuid as _uuid
-    section_id = raw.get("id") or str(_uuid.uuid4())
+    section_id = raw.get("id") or str(uuid.uuid4())
     title = raw.get("title", "Untitled")
 
-    # Try to pull A2-generated body text
     a2_sec: dict = {}
     if a2_by_id and section_id in a2_by_id:
         a2_sec = a2_by_id[section_id]
@@ -496,12 +503,29 @@ def _build_section(
     )
     word_count = a2_sec.get("word_count") or (len(content.split()) if content else 0)
 
+    # Build image list — images are mapped to sections by A1 and propagated
+    # through section_mapper. Only include when a course_slug is available so
+    # the storage URL can be constructed.
+    raw_images: list[dict] = raw.get("images") or []
+    images: list[SectionImageSchema] = []
+    if course_slug:
+        for img in raw_images:
+            fname = img.get("media_filename") or img.get("fileName") or ""
+            if not fname:
+                continue
+            images.append(SectionImageSchema(
+                id=img.get("id") or fname,
+                file_name=fname,
+                blob_path=f"{course_slug}/images/{fname}",
+                caption=img.get("caption") or None,
+                alt_text=img.get("alt_text") or None,
+            ))
+
     children_raw = raw.get("subtopics", raw.get("chapters", raw.get("children", [])))
-    children: list[CourseSectionSchema] = []
-    for i, child in enumerate(children_raw or []):
-        children.append(
-            _build_section(child, i, level + 1, section_id, counter, a2_by_id, a2_by_lesson)
-        )
+    children: list[CourseSectionSchema] = [
+        _build_section(child, i, level + 1, section_id, a2_by_id, a2_by_lesson, course_slug)
+        for i, child in enumerate(children_raw or [])
+    ]
 
     return CourseSectionSchema(
         id=section_id,
@@ -515,7 +539,18 @@ def _build_section(
         order=order,
         parent_id=parent_id,
         children=children,
+        images=images,
     )
+
+
+def _sum_words_deep(sections: list[CourseSectionSchema]) -> int:
+    """Recursively sum word counts across all nesting levels."""
+    total = 0
+    for s in sections:
+        total += s.word_count
+        if s.children:
+            total += _sum_words_deep(s.children)
+    return total
 
 
 def _state_to_course_content(
@@ -524,38 +559,27 @@ def _state_to_course_content(
     course_type: str,
     state: dict,
 ) -> CourseContentResponse:
-    """Extract course structure from shared_state and return as CourseContentResponse.
-
-    Priority:
-      1. A2 generated sections merged into enriched_sections hierarchy (full content).
-      2. enriched_sections alone (structure, no body text) if A2 hasn't run.
-      3. A1 course_spec as last resort.
-    """
+    """Extract course structure from shared_state and return as CourseContentResponse."""
     agent_outputs = state.get("agent_outputs", {})
 
-    # A2 generated content (flat list written by content_writer.generate_all_sections)
     a2_raw = agent_outputs.get("A2") or {}
     a2_sections: list[dict] = a2_raw.get("sections") or []
     a2_by_id, a2_by_lesson = _build_a2_content_lookup(a2_sections)
 
-    # Structural hierarchy (enriched or course_spec)
     enriched = (
         agent_outputs.get("section_map", {}).get("enriched_sections")
         or agent_outputs.get("A1", {}).get("course_spec", {}).get("sections")
         or []
     )
 
-    sections: list[CourseSectionSchema] = []
-    counter: list[int] = [0]
-    for i, raw in enumerate(enriched or []):
-        sections.append(
-            _build_section(raw, i, 1, None, counter, a2_by_id or None, a2_by_lesson or None)
-        )
+    course_slug = state.get("request", {}).get("courseStorageSlug", "")
 
-    total_words = sum(
-        s.word_count + sum(c.word_count for c in s.children)
-        for s in sections
-    )
+    sections: list[CourseSectionSchema] = [
+        _build_section(raw, i, 1, None, a2_by_id or None, a2_by_lesson or None, course_slug)
+        for i, raw in enumerate(enriched or [])
+    ]
+
+    total_words = _sum_words_deep(sections)
     chapter_count = sum(len(s.children) for s in sections)
     read_min = max(1, math.ceil(total_words / 200))
     generated_at = (
@@ -583,11 +607,7 @@ async def get_job_course_content(
     job_id: str,
     session: Session = Depends(get_db_session),
 ) -> CourseContentResponse:
-    """Return structured course content for the editor.
-
-    Reads enriched_sections (or course_spec as fallback) from the shared state blob.
-    Only available after the job has reached COMPLETED status.
-    """
+    """Return structured course content for the editor (COMPLETED jobs only)."""
     repository = JobRepository(session)
     job = repository.get_job(job_id)
     if job is None:
@@ -613,36 +633,107 @@ async def get_job_course_content(
 
 # ── AI section operations ──────────────────────────────────────────────────────
 
+_AI_OPERATION_PROMPTS: dict[str, str] = {
+    "summarize": (
+        "You are an expert course content editor. "
+        "Summarize the following course section into a concise version that retains all key "
+        "learning points, facts, and concepts. Target roughly 40–60% of the original length. "
+        "Use clear, direct language. "
+        "Output only the summarized content — no preamble, labels, or explanation."
+    ),
+    "expand": (
+        "You are an expert course content writer. "
+        "Expand the following course section by adding more depth, concrete examples, "
+        "and elaboration on key concepts. Maintain the same educational tone and style. "
+        "Only deepen what is already present — do not introduce unrelated topics. "
+        "Output only the expanded content — no preamble, labels, or explanation."
+    ),
+    "simplify": (
+        "You are an expert course content editor. "
+        "Simplify the following course section by using plainer language, shorter sentences, "
+        "and a more accessible writing style. Avoid jargon where possible; "
+        "when technical terms are necessary, briefly explain them. "
+        "Preserve all factual content and learning points exactly. "
+        "Output only the simplified content — no preamble, labels, or explanation."
+    ),
+    "rewrite": (
+        "You are an expert course content writer. "
+        "Rewrite the provided course section following the user's instructions exactly. "
+        "Preserve all factual content and learning points. "
+        "Output only the rewritten section content — no preamble, labels, or explanation."
+    ),
+    "improve_tone": (
+        "You are an expert course content editor specialising in tone and style. "
+        "Rewrite the provided course section in the requested tone and style. "
+        "Preserve all factual content and learning points. "
+        "Output only the revised content — no preamble, labels, or explanation."
+    ),
+    "regenerate": (
+        "You are an expert course content writer. "
+        "Fully rewrite the following course section, creating fresh, engaging content "
+        "that covers the same topics and learning points with a new perspective. "
+        "Output only the rewritten content — no preamble, labels, or explanation."
+    ),
+}
+
+
 @router.post("/{job_id}/ai", response_model=AIOperationResponse)
 async def perform_ai_operation(
     job_id: str,
     payload: AIOperationRequest,
     session: Session = Depends(get_db_session),
 ) -> AIOperationResponse:
-    """Run an AI operation on a specific section's content.
+    """Run an AI operation (summarize / expand / simplify / rewrite / improve_tone / regenerate)
+    on a specific section's content using Azure OpenAI."""
+    import asyncio as _asyncio
 
-    The operation is applied via Azure OpenAI using the job's rule family context.
-    For now this is a structured stub — plug in the LLM call when ready.
-    """
+    from lectora_backend.pipeline.shared_llm_config.llm import LLMConfig
+    from lectora_backend.pipeline.shared_llm_config.llm import chat as llm_chat
+    from lectora_backend.pipeline.shared_llm_config.model_registry import get_deployment
+
     repository = JobRepository(session)
     job = repository.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
 
-    t0 = time.monotonic()
+    system_prompt = _AI_OPERATION_PROMPTS.get(payload.operation)
+    if not system_prompt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown AI operation: '{payload.operation}'",
+        )
 
-    # ── LLM call placeholder ─────────────────────────────────────────────────
-    # TODO: wire to Azure OpenAI using the rule pack's style_constraints.
-    # The operation-to-prompt mapping should be config-driven in rule_pack_config.
-    #
-    # result_content = await azure_openai_client.chat(
-    #     system_prompt=build_ai_op_prompt(payload.operation, job.course_type),
-    #     user_message=payload.content,
-    # )
-    result_content = f"[{payload.operation.upper()}] {payload.content}"
-    # ── End placeholder ──────────────────────────────────────────────────────
+    content = (payload.content or "").strip()
+    user_prompt = (payload.user_prompt or "").strip()
+
+    if payload.operation in ("rewrite", "improve_tone") and user_prompt:
+        label = "REWRITE INSTRUCTIONS" if payload.operation == "rewrite" else "DESIRED TONE/STYLE"
+        user_msg = f"CURRENT SECTION CONTENT:\n{content}\n\n{label}:\n{user_prompt}"
+    else:
+        user_msg = f"COURSE SECTION CONTENT:\n{content}"
+
+    editor_config = LLMConfig(
+        deployment=get_deployment("A2"),
+        temperature=0.35,
+        max_tokens=2000,
+    )
+
+    t0 = time.monotonic()
+    try:
+        loop = _asyncio.get_event_loop()
+        result_content = await loop.run_in_executor(
+            None,
+            lambda: llm_chat(system_prompt, user_msg, config=editor_config, agent="editor"),
+        )
+    except Exception as exc:
+        logger.exception("[%s] AI operation '%s' failed: %s", job_id, payload.operation, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"AI operation failed: {exc}",
+        ) from exc
 
     elapsed_ms = int((time.monotonic() - t0) * 1_000)
+    result_content = (result_content or content).strip()
 
     return AIOperationResponse(
         section_id=payload.section_id,
@@ -661,8 +752,7 @@ async def get_artifact_download_url(
 ) -> ArtifactDownloadResponse:
     """Return a download URL for the generated study_guide.docx.
 
-    In production this should return a short-lived Azure Blob SAS URL.
-    The current implementation returns the raw blob path — replace with
+    TODO: replace blob_path with a short-lived SAS URL via
     BlobRepository.generate_sas_url() when that helper is available.
     """
     repository = JobRepository(session)
@@ -680,7 +770,9 @@ async def get_artifact_download_url(
             else None
         )
     except Exception as exc:
-        logger.warning("Could not resolve artifact blob path for job %s: %s", job_id, exc)
+        logger.warning(
+            "Could not resolve artifact blob path for job %s: %s", job_id, exc
+        )
         blob_path = None
 
     if not blob_path:
@@ -689,7 +781,6 @@ async def get_artifact_download_url(
             detail="DOCX artifact not found. The job may not be complete.",
         )
 
-    # TODO: replace blob_path with a signed URL via BlobRepository.generate_sas_url(blob_path)
     return ArtifactDownloadResponse(
         url=blob_path,
         filename="study_guide.docx",

@@ -72,6 +72,8 @@ def _resolve_and_validate(blob_path: str, label: str) -> str:
 # Course-title output roots (``{slug}/``) — same layout as Azure artifacts.
 _PIPELINE_COURSES_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "courses"
 _PIPELINE_COURSES_DIR.mkdir(parents=True, exist_ok=True)
+_LEGACY_SHARED_STATE_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "shared_state"
+_LEGACY_SHARED_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 from lectora_backend.api.local_course_job_store import (
     LocalJobStatus,
@@ -238,6 +240,70 @@ def _improve_tone_sync(job_id: str, section_id: str, current_content: str, tone_
     return new_content
 
 
+def _summarize_section_sync(job_id: str, section_id: str, current_content: str) -> str:
+    """Summarize section content to a concise version preserving all key learning points."""
+    from lectora_backend.pipeline.shared_llm_config.llm import chat as llm_chat
+    from lectora_backend.pipeline.agent.a2_content_generator.config.llm import COURSE_DESCRIPTION_CONFIG
+
+    system = (
+        "You are an expert course content editor. "
+        "Summarize the following course section into a concise version that retains all key "
+        "learning points, facts, and concepts. Target roughly 40–60% of the original length. "
+        "Use clear, direct language. "
+        "Output only the summarized content — no preamble, labels, or explanation."
+    )
+    user_msg = f"COURSE SECTION CONTENT:\n{current_content}"
+    raw = llm_chat(system, user_msg, config=COURSE_DESCRIPTION_CONFIG, agent="editor")
+    new_content = (raw or "").strip()
+    if not new_content:
+        return current_content
+    _persist_section_text(job_id, section_id, new_content)
+    return new_content
+
+
+def _expand_section_sync(job_id: str, section_id: str, current_content: str) -> str:
+    """Expand section content with additional depth, examples, and elaboration."""
+    from lectora_backend.pipeline.shared_llm_config.llm import chat as llm_chat
+    from lectora_backend.pipeline.agent.a2_content_generator.config.llm import COURSE_DESCRIPTION_CONFIG
+
+    system = (
+        "You are an expert course content writer. "
+        "Expand the following course section by adding more depth, concrete examples, "
+        "and elaboration on key concepts. Maintain the same educational tone and style. "
+        "Only deepen what is already present — do not introduce unrelated topics. "
+        "Output only the expanded content — no preamble, labels, or explanation."
+    )
+    user_msg = f"COURSE SECTION CONTENT:\n{current_content}"
+    raw = llm_chat(system, user_msg, config=COURSE_DESCRIPTION_CONFIG, agent="editor")
+    new_content = (raw or "").strip()
+    if not new_content:
+        return current_content
+    _persist_section_text(job_id, section_id, new_content)
+    return new_content
+
+
+def _simplify_section_sync(job_id: str, section_id: str, current_content: str) -> str:
+    """Simplify section content using plainer language and shorter sentences."""
+    from lectora_backend.pipeline.shared_llm_config.llm import chat as llm_chat
+    from lectora_backend.pipeline.agent.a2_content_generator.config.llm import COURSE_DESCRIPTION_CONFIG
+
+    system = (
+        "You are an expert course content editor. "
+        "Simplify the following course section by using plainer language, shorter sentences, "
+        "and a more accessible writing style. Avoid jargon where possible; "
+        "when technical terms are necessary, briefly explain them. "
+        "Preserve all factual content and learning points exactly. "
+        "Output only the simplified content — no preamble, labels, or explanation."
+    )
+    user_msg = f"COURSE SECTION CONTENT:\n{current_content}"
+    raw = llm_chat(system, user_msg, config=COURSE_DESCRIPTION_CONFIG, agent="editor")
+    new_content = (raw or "").strip()
+    if not new_content:
+        return current_content
+    _persist_section_text(job_id, section_id, new_content)
+    return new_content
+
+
 def _regenerate_section_sync(job_id: str, section_id: str, current_content: str) -> str:
     """
     Regenerate a single section's content via LLM and persist to shared_state.
@@ -299,11 +365,14 @@ def _regenerate_section_sync(job_id: str, section_id: str, current_content: str)
                 para_end = int(sub.get("para_end") or 0)
                 break
 
-    # Extract source text from original input docx when available
+    # Extract source text from original input doc (DOCX or PDF) when available
     source_text = ""
     if job.input_docx_path and Path(job.input_docx_path).exists() and (para_start or para_end):
         try:
-            doc_paragraphs = load_doc_paragraphs(job.input_docx_path)
+            doc_paragraphs = load_doc_paragraphs(
+                job.input_docx_path,
+                shared_state_path=job.shared_state_path,
+            )
             source_text = extract_full_section_text(
                 doc_paragraphs, para_start=para_start, para_end=para_end
             )
@@ -391,6 +460,11 @@ class CreateJobPayload(BaseModel):
     # All source file blob paths (local file paths in dev) used to generate the TO.
     # When provided, A2 builds a chunk index from these files for topic-wise retrieval.
     source_file_paths: list[str] | None = Field(default=None, alias="sourceFilePaths")
+    # Target audience — drives prompt calibration in A2 content generation.
+    audience: str = Field(default="", alias="audience")
+    # Optional special instructions provided by the user before course generation.
+    # Injected into A2 prompts to influence tone, depth, and emphasis.
+    special_instructions: str | None = Field(default=None, alias="specialInstructions")
 
     model_config = {"populate_by_name": True}
 
@@ -458,6 +532,38 @@ def _persist_source_file_paths(shared_state_path: str, paths: list[str]) -> None
         json.dump(state, fh, indent=2, default=str)
 
 
+def _persist_audience(shared_state_path: str, audience: str) -> None:
+    """Store target audience in shared_state for A2 prompt calibration."""
+    p = Path(shared_state_path)
+    with open(p, encoding="utf-8") as fh:
+        state = json.load(fh)
+    state["course_audience"] = audience.strip()
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, default=str)
+
+
+def _persist_special_instructions(shared_state_path: str, instructions: str) -> None:
+    """Store user special instructions in shared_state for A2 prompt injection."""
+    p = Path(shared_state_path)
+    with open(p, encoding="utf-8") as fh:
+        state = json.load(fh)
+    state["special_instructions"] = instructions.strip()
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, default=str)
+
+
+def _sync_legacy_shared_state_dir(course_slug: str) -> None:
+    """Mirror ``pipeline/courses/{slug}`` into legacy ``pipeline/shared_state/{slug}``."""
+    if not course_slug:
+        return
+    source_dir = (_PIPELINE_COURSES_DIR / course_slug).resolve()
+    if not source_dir.is_dir():
+        return
+    target_dir = (_LEGACY_SHARED_STATE_DIR / course_slug).resolve()
+    shutil.rmtree(target_dir, ignore_errors=True)
+    shutil.copytree(source_dir, target_dir)
+
+
 def _format_s1_feedback(report: Any) -> str:
     lines: list[str] = []
     for issue in getattr(report, "issues", []) or []:
@@ -497,6 +603,8 @@ def _run_pipeline_sync(
     to_override: dict[str, Any] | None,
     difficulty: str,
     source_file_paths: list[str] | None = None,
+    audience: str = "",
+    special_instructions: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Execute the full pipeline synchronously.  Returns (shared_state_path, study_guide_docx_path)."""
     store = get_local_course_job_store()
@@ -508,7 +616,7 @@ def _run_pipeline_sync(
     try:
         return _run_pipeline_inner(
             job_id, study_guide_path, timed_outline_path, to_override, difficulty,
-            temp_input_dir, source_file_paths,
+            temp_input_dir, source_file_paths, audience, special_instructions,
         )
     finally:
         # Ephemeral input dir is tiny (user_edited_to.json only); clean up always.
@@ -523,6 +631,8 @@ def _run_pipeline_inner(
     difficulty: str,
     temp_input_dir: Path,
     source_file_paths: list[str] | None = None,
+    audience: str = "",
+    special_instructions: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Inner pipeline body, called from _run_pipeline_sync after temp dir setup."""
     store = get_local_course_job_store()
@@ -553,15 +663,28 @@ def _run_pipeline_inner(
             log("info", f"Re-analyzing document with quality feedback (attempt {gate_cycle})…", "A0")
         store.start_stage(job_id, "A0")
 
-        # On retry cycles let A0 re-run fully (don't reuse pre-generated TO)
-        to_path_for_cycle = effective_to_path if gate_cycle == 1 else timed_outline_path
+        # Always keep the user-supplied TO across retry cycles.
+        # effective_to_path holds either the three-panel JSON override or the
+        # original uploaded TO file. Falling back to timed_outline_path on
+        # retries is wrong when to_override was used (timed_outline_path may be
+        # None) — that caused A0 to silently discard the user's TO and generate
+        # a fresh one, losing learning objectives and section structure.
+        to_path_for_cycle = effective_to_path
 
         job_rec = store.get(job_id)
         course_slug = sanitize_course_slug(
             job_rec.course_title if job_rec else "course"
         )
+        # Route the study guide to the correct parser based on file extension.
+        # A0 accepts docx_paths (python-docx) or pdf_paths (pypdf); passing a
+        # PDF as a DOCX path causes python-docx to crash.
+        _sg_ext = Path(study_guide_path).suffix.lower()
+        _a0_docx_paths: list[str] = [] if _sg_ext == ".pdf" else [study_guide_path]
+        _a0_pdf_paths: list[str] = [study_guide_path] if _sg_ext == ".pdf" else []
+
         a0_result = A0RequestSynthesizer(
-            docx_paths=[study_guide_path],
+            docx_paths=_a0_docx_paths,
+            pdf_paths=_a0_pdf_paths,
             to_outline_doc_path=to_path_for_cycle,
             output_dir=str(_PIPELINE_COURSES_DIR),
             course_difficulty=difficulty,
@@ -577,6 +700,13 @@ def _run_pipeline_inner(
         # index for topic-wise retrieval across all uploaded source files.
         if source_file_paths:
             _persist_source_file_paths(shared_state_path, source_file_paths)
+        # Persist audience so A2 can calibrate content for the correct learner profile.
+        if audience:
+            _persist_audience(shared_state_path, audience)
+        # Persist special instructions so A2 can inject them into generation prompts.
+        if special_instructions:
+            _persist_special_instructions(shared_state_path, special_instructions)
+        _sync_legacy_shared_state_dir(course_slug)
         log("success", "Document analyzed — course structure and rule family identified", "A0")
         store.complete_stage(job_id, "A0", "PASS")
 
@@ -593,12 +723,14 @@ def _run_pipeline_inner(
             docx_path=study_guide_path,
             feedback=a1_feedback,
         )
+        _sync_legacy_shared_state_dir(course_slug)
         log("success", "Course outline built — sections and learning objectives mapped", "A1")
         store.complete_stage(job_id, "A1", "PASS")
 
         log("info", "Reviewing course structure for quality and compliance…", "S1")
         store.start_stage(job_id, "S1")
         s1_result = S1Validator(shared_state_path).run()
+        _sync_legacy_shared_state_dir(course_slug)
 
         if not _s1_blocks(s1_result.status):
             log("success", "Structure review passed — course outline meets quality standards", "S1")
@@ -628,6 +760,7 @@ def _run_pipeline_inner(
     log("info", "Organizing course sections and mapping lessons to the training outline…", "SECTION_MAPPER")
     store.start_stage(job_id, "SECTION_MAPPER")
     section_mapper_run(shared_state_path=shared_state_path)
+    _sync_legacy_shared_state_dir(course_slug)
     log("success", "Course sections organized and lesson mapping complete", "SECTION_MAPPER")
     store.complete_stage(job_id, "SECTION_MAPPER", "PASS")
 
@@ -635,6 +768,7 @@ def _run_pipeline_inner(
     log("info", "Planning interactive knowledge check placement…", "KC_PLANNER")
     store.start_stage(job_id, "KC_PLANNER")
     kc_result = kc_planner_run(shared_state_path=shared_state_path)
+    _sync_legacy_shared_state_dir(course_slug)
     kc_count = kc_result.get("kc_count", 0)
     log("success", f"Knowledge check placement complete — {kc_count} interactive checks planned", "KC_PLANNER")
     store.complete_stage(job_id, "KC_PLANNER", "PASS")
@@ -661,6 +795,7 @@ def _run_pipeline_inner(
             feedback=a2_feedback,
             source_file_paths=source_file_paths,
         ).run()
+        _sync_legacy_shared_state_dir(course_slug)
         log(
             "success",
             f"Content generation complete — {a2_result.stats.generated} lessons written "
@@ -671,6 +806,7 @@ def _run_pipeline_inner(
         log("info", "Checking content quality, accuracy, and completeness…", "S2")
         store.start_stage(job_id, "S2")
         s2_result = S2Validator(shared_state_path).run()
+        _sync_legacy_shared_state_dir(course_slug)
 
         if not _s2_blocks(s2_result.status):
             log("success", "Content quality review passed", "S2")
@@ -696,8 +832,10 @@ def _run_pipeline_inner(
     if s2_result and not _s2_blocks(s2_result.status):
         log("info", "Assembling your final course document…", "A2")
         final_docx_path = render_study_guide_from_state(shared_state_path=shared_state_path)
+        _sync_legacy_shared_state_dir(course_slug)
         log("success", "Your course document is ready", "A2")
     else:
+        _sync_legacy_shared_state_dir(course_slug)
         log("error", "Course document could not be assembled — quality gate blocked", "A2")
 
     return shared_state_path, final_docx_path
@@ -714,6 +852,8 @@ async def _run_pipeline_background(
     to_override: dict[str, Any] | None,
     difficulty: str,
     source_file_paths: list[str] | None = None,
+    audience: str = "",
+    special_instructions: str | None = None,
 ) -> None:
     store = get_local_course_job_store()
     store.update_status(job_id, LocalJobStatus.PROCESSING)
@@ -723,7 +863,7 @@ async def _run_pipeline_background(
     def _sync() -> tuple[str | None, str | None]:
         return _run_pipeline_sync(
             job_id, study_guide_path, timed_outline_path, to_override, difficulty,
-            source_file_paths)
+            source_file_paths, audience, special_instructions)
 
     try:
         shared_state_path, study_guide_docx = await asyncio.to_thread(_sync)
@@ -844,6 +984,8 @@ async def create_job(payload: CreateJobPayload) -> JSONResponse:
             to_override=payload.to_override,
             difficulty=difficulty,
             source_file_paths=source_file_paths,
+            audience=payload.audience,
+            special_instructions=payload.special_instructions,
         )
     )
 
@@ -1041,6 +1183,7 @@ async def get_course_content(job_id: str) -> JSONResponse:
         str(lo) for lo in (extracted.get("learning_objectives") or [])
     ]
     content_sample: str = (extracted.get("content_sample") or "").strip()
+    course_slug: str = shared_state.get("request", {}).get("courseStorageSlug", "")
 
     # ── Build flat section list then assemble into a level-based tree ──────────
     flat: list[dict] = []
@@ -1048,6 +1191,21 @@ async def get_course_content(job_id: str) -> JSONResponse:
         level = min(int(sec.get("level") or 1), 3)  # cap at 3
         content_text = paragraphs_to_text(sec.get("body_paragraphs") or [])
         word_count = int(sec.get("word_count") or len(content_text.split()))
+
+        # Build image list — A1 maps images to sections; A2 inherits them.
+        section_images: list[dict] = []
+        if course_slug:
+            for img in (sec.get("images") or []):
+                fname = img.get("media_filename") or img.get("fileName") or ""
+                if not fname:
+                    continue
+                section_images.append({
+                    "id": img.get("id") or fname,
+                    "fileName": fname,
+                    "blobPath": f"{course_slug}/images/{fname}",
+                    "caption": img.get("caption") or None,
+                    "altText": img.get("alt_text") or None,
+                })
 
         flat.append({
             "id": sec.get("section_id") or f"sec_{i + 1}",
@@ -1060,6 +1218,7 @@ async def get_course_content(job_id: str) -> JSONResponse:
             "hasKnowledgeCheck": bool(sec.get("is_knowledge_check")),
             "order": i,
             "children": [],
+            "images": section_images,
         })
 
     # ── Tree assembly: nest by heading level using a parent-stack ──────────────
@@ -1343,16 +1502,83 @@ async def run_ai_operation(job_id: str, payload: AIOperationPayload) -> JSONResp
             "processingTimeMs": 0,
         })
 
-    # All other operations — acknowledge without transforming content
-    return JSONResponse(content={
-        "jobId": job_id,
-        "sectionId": payload.section_id,
-        "operation": payload.operation,
-        "status": "completed",
-        "content": payload.content or "",
-        "processingTimeMs": 0,
-        "message": f"Operation '{payload.operation}' acknowledged (not yet implemented in local dev)",
-    })
+    if payload.operation == "summarize":
+        try:
+            loop = asyncio.get_event_loop()
+            new_content = await loop.run_in_executor(
+                None,
+                _summarize_section_sync,
+                job_id,
+                payload.section_id,
+                payload.content or "",
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Section summarization failed: {exc}",
+            ) from exc
+        return JSONResponse(content={
+            "jobId": job_id,
+            "sectionId": payload.section_id,
+            "operation": "summarize",
+            "status": "completed",
+            "content": new_content,
+            "processingTimeMs": 0,
+        })
+
+    if payload.operation == "expand":
+        try:
+            loop = asyncio.get_event_loop()
+            new_content = await loop.run_in_executor(
+                None,
+                _expand_section_sync,
+                job_id,
+                payload.section_id,
+                payload.content or "",
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Section expansion failed: {exc}",
+            ) from exc
+        return JSONResponse(content={
+            "jobId": job_id,
+            "sectionId": payload.section_id,
+            "operation": "expand",
+            "status": "completed",
+            "content": new_content,
+            "processingTimeMs": 0,
+        })
+
+    if payload.operation == "simplify":
+        try:
+            loop = asyncio.get_event_loop()
+            new_content = await loop.run_in_executor(
+                None,
+                _simplify_section_sync,
+                job_id,
+                payload.section_id,
+                payload.content or "",
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Section simplification failed: {exc}",
+            ) from exc
+        return JSONResponse(content={
+            "jobId": job_id,
+            "sectionId": payload.section_id,
+            "operation": "simplify",
+            "status": "completed",
+            "content": new_content,
+            "processingTimeMs": 0,
+        })
+
+    # Unknown operation
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Unknown AI operation: '{payload.operation}'",
+    )
 
 
 @router.get(
@@ -1434,3 +1660,95 @@ async def download_artifact(job_id: str) -> FileResponse:
         filename=f"course_{job_id[:8]}.docx",
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+
+@router.post(
+    "/{job_id}/artifacts/save-to-azure",
+    summary="Upload the generated DOCX to Azure Blob Storage",
+)
+async def save_artifact_to_azure(job_id: str) -> JSONResponse:
+    from lectora_backend.config import settings as _settings
+    from lectora_backend.repositories.blob_repository import BlobRepository
+
+    if not _settings.is_azure_storage_configured():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "azure_not_configured",
+                "message": (
+                    "Azure Blob Storage is not configured. "
+                    "Set AZURE_STORAGE_CONNECTION_STRING in .env to enable this feature."
+                ),
+            },
+        )
+
+    store = get_local_course_job_store()
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown or expired jobId: {job_id}",
+        )
+
+    if job.status != LocalJobStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job not completed (status: {job.status.value})",
+        )
+
+    if not job.shared_state_path or not Path(job.shared_state_path).exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shared state not found — cannot build DOCX",
+        )
+
+    # Rebuild DOCX from latest shared_state so any FE edits are included.
+    try:
+        loop = asyncio.get_event_loop()
+        docx_path = await loop.run_in_executor(
+            None,
+            render_study_guide_from_state,
+            job.shared_state_path,
+        )
+        store.update_study_guide_path(job_id, docx_path)
+    except Exception as exc:
+        docx_path = job.study_guide_path
+        if not docx_path or not Path(docx_path).exists():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"DOCX rebuild failed: {exc}",
+            ) from exc
+
+    course_slug = sanitize_course_slug(job.course_title)
+    file_name = f"{course_slug}_study_guide.docx"
+    blob_path = f"{course_slug}/output/{file_name}"
+
+    container = _settings.generated_courses_container_name
+    try:
+        repo = BlobRepository(container_name=container)
+        repo.upload_file(
+            local_path=docx_path,
+            blob_path=blob_path,
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    except Exception as exc:
+        logger.exception("[save_to_azure] Upload failed for job %s: %s", job_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "upload_failed",
+                "message": f"Azure upload failed: {exc}",
+            },
+        ) from exc
+
+    logger.info(
+        "[save_to_azure] Uploaded %s for job %s → %s/%s",
+        file_name, job_id, container, blob_path,
+    )
+    return JSONResponse(content={
+        "status": "uploaded",
+        "jobId": job_id,
+        "fileName": file_name,
+        "blobPath": blob_path,
+        "containerName": container,
+    })

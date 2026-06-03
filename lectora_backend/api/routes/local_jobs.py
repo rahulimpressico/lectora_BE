@@ -460,6 +460,11 @@ class CreateJobPayload(BaseModel):
     # All source file blob paths (local file paths in dev) used to generate the TO.
     # When provided, A2 builds a chunk index from these files for topic-wise retrieval.
     source_file_paths: list[str] | None = Field(default=None, alias="sourceFilePaths")
+    # Target audience — drives prompt calibration in A2 content generation.
+    audience: str = Field(default="", alias="audience")
+    # Optional special instructions provided by the user before course generation.
+    # Injected into A2 prompts to influence tone, depth, and emphasis.
+    special_instructions: str | None = Field(default=None, alias="specialInstructions")
 
     model_config = {"populate_by_name": True}
 
@@ -527,6 +532,26 @@ def _persist_source_file_paths(shared_state_path: str, paths: list[str]) -> None
         json.dump(state, fh, indent=2, default=str)
 
 
+def _persist_audience(shared_state_path: str, audience: str) -> None:
+    """Store target audience in shared_state for A2 prompt calibration."""
+    p = Path(shared_state_path)
+    with open(p, encoding="utf-8") as fh:
+        state = json.load(fh)
+    state["course_audience"] = audience.strip()
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, default=str)
+
+
+def _persist_special_instructions(shared_state_path: str, instructions: str) -> None:
+    """Store user special instructions in shared_state for A2 prompt injection."""
+    p = Path(shared_state_path)
+    with open(p, encoding="utf-8") as fh:
+        state = json.load(fh)
+    state["special_instructions"] = instructions.strip()
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, default=str)
+
+
 def _sync_legacy_shared_state_dir(course_slug: str) -> None:
     """Mirror ``pipeline/courses/{slug}`` into legacy ``pipeline/shared_state/{slug}``."""
     if not course_slug:
@@ -578,6 +603,8 @@ def _run_pipeline_sync(
     to_override: dict[str, Any] | None,
     difficulty: str,
     source_file_paths: list[str] | None = None,
+    audience: str = "",
+    special_instructions: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Execute the full pipeline synchronously.  Returns (shared_state_path, study_guide_docx_path)."""
     store = get_local_course_job_store()
@@ -589,7 +616,7 @@ def _run_pipeline_sync(
     try:
         return _run_pipeline_inner(
             job_id, study_guide_path, timed_outline_path, to_override, difficulty,
-            temp_input_dir, source_file_paths,
+            temp_input_dir, source_file_paths, audience, special_instructions,
         )
     finally:
         # Ephemeral input dir is tiny (user_edited_to.json only); clean up always.
@@ -604,6 +631,8 @@ def _run_pipeline_inner(
     difficulty: str,
     temp_input_dir: Path,
     source_file_paths: list[str] | None = None,
+    audience: str = "",
+    special_instructions: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Inner pipeline body, called from _run_pipeline_sync after temp dir setup."""
     store = get_local_course_job_store()
@@ -671,6 +700,12 @@ def _run_pipeline_inner(
         # index for topic-wise retrieval across all uploaded source files.
         if source_file_paths:
             _persist_source_file_paths(shared_state_path, source_file_paths)
+        # Persist audience so A2 can calibrate content for the correct learner profile.
+        if audience:
+            _persist_audience(shared_state_path, audience)
+        # Persist special instructions so A2 can inject them into generation prompts.
+        if special_instructions:
+            _persist_special_instructions(shared_state_path, special_instructions)
         _sync_legacy_shared_state_dir(course_slug)
         log("success", "Document analyzed — course structure and rule family identified", "A0")
         store.complete_stage(job_id, "A0", "PASS")
@@ -817,6 +852,8 @@ async def _run_pipeline_background(
     to_override: dict[str, Any] | None,
     difficulty: str,
     source_file_paths: list[str] | None = None,
+    audience: str = "",
+    special_instructions: str | None = None,
 ) -> None:
     store = get_local_course_job_store()
     store.update_status(job_id, LocalJobStatus.PROCESSING)
@@ -826,7 +863,7 @@ async def _run_pipeline_background(
     def _sync() -> tuple[str | None, str | None]:
         return _run_pipeline_sync(
             job_id, study_guide_path, timed_outline_path, to_override, difficulty,
-            source_file_paths)
+            source_file_paths, audience, special_instructions)
 
     try:
         shared_state_path, study_guide_docx = await asyncio.to_thread(_sync)
@@ -947,6 +984,8 @@ async def create_job(payload: CreateJobPayload) -> JSONResponse:
             to_override=payload.to_override,
             difficulty=difficulty,
             source_file_paths=source_file_paths,
+            audience=payload.audience,
+            special_instructions=payload.special_instructions,
         )
     )
 

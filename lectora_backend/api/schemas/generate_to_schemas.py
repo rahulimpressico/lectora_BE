@@ -94,6 +94,16 @@ class GenerateTORequest(BaseModel):
         ),
     )
 
+    audience: str | None = Field(
+        default=None,
+        alias="audience",
+        description=(
+            "Target audience for the course (e.g. 'Trained Insurance Agents', "
+            "'New Agents', 'Business Owners'). When provided, the TO generation "
+            "and content writing are calibrated to this audience."
+        ),
+    )
+
     model_config = {"populate_by_name": True}
 
     @model_validator(mode="after")

@@ -214,8 +214,8 @@ def _build_generate_to_response(
 
     to: dict[str, Any] = {
         "course_name": (
-            spec.course_metadata.title
-            or llm_outline.get("course_title")
+            llm_outline.get("course_title")
+            or spec.course_metadata.title
             or "Untitled Course"
         ),
         "rule_family":        rule_family_key,
@@ -554,6 +554,12 @@ async def generate_to(
     blob_paths = body.effective_blob_paths
     difficulty = (body.difficulty or "intermediate").strip().lower()
     custom_to_prompt = (body.custom_to_prompt or "").strip() or None
+    audience = (body.audience or "").strip() or None
+    # Prepend audience context into the custom TO prompt so A0 calibrates content
+    # and learning objectives for the correct target learner profile.
+    if audience:
+        audience_prefix = f"TARGET AUDIENCE: {audience}\n\nWrite all section titles, content objectives, subtopics, and learning objectives specifically for this audience. Calibrate depth and examples accordingly.\n\n"
+        custom_to_prompt = (audience_prefix + (custom_to_prompt or "")).strip() or None
     course_type_hint = (body.course_type_hint or "").strip() or None
 
     # ── Dynamic TO flow params (new) ──────────────────────────────────────────
@@ -597,12 +603,13 @@ async def generate_to(
 
     logger.info(
         "[generate-to] Starting A0 | docx=%d | pdf=%d | difficulty=%s | "
-        "duration_hours=%s | calculated_word_count=%s | custom_prompt=%s | course_hint=%s | wait=%s",
+        "duration_hours=%s | calculated_word_count=%s | audience=%s | custom_prompt=%s | course_hint=%s | wait=%s",
         len(all_docx),
         len(all_pdf),
         difficulty,
         duration_hours,
         calculated_word_count,
+        bool(audience),
         bool(custom_to_prompt),
         bool(course_type_hint),
         wait,

@@ -562,6 +562,61 @@ async def browse_uploaded_documents(
     return _filter_upload_entries(_local_browse_artifacts(prefix))
 
 
+@router.get("/categories/{category}/browse", response_model=BrowseResponse)
+async def browse_by_category(
+    category: str,
+    prefix: str = Query(default="", description="Path prefix to browse. Empty for root."),
+) -> BrowseResponse:
+    """Browse storage by named category.
+
+    Categories:
+      source-documents    — uploaded source DOCX/PDF files (uploaded-documents container)
+      generated-courses   — final generated DOCX outputs (generated-courses container)
+      pipeline-artifacts  — all pipeline artifacts (main artifacts container)
+      test-data           — same as pipeline-artifacts (fallback)
+    """
+    if category == "source-documents":
+        if _azure_configured():
+            try:
+                primary = _browse_uploaded_documents_azure(prefix)
+                filtered = _filter_upload_entries(primary)
+                if prefix or filtered.totalFiles or filtered.totalFolders:
+                    return filtered
+            except Exception as exc:
+                logger.warning("[storage/categories] source-documents Azure failed (%s), using local.", exc)
+        _UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+        local = _filter_upload_entries(
+            _local_browse_at(_UPLOAD_ROOT, _local_uploaded_documents_relative(prefix))
+        )
+        local.container_name = _uploads_container_display_name()
+        return local
+
+    if category == "generated-courses":
+        if _azure_configured():
+            try:
+                from lectora_backend.config import settings as _settings
+                _gc_container = getattr(_settings, "generated_courses_container_name", "generated-courses")
+                _gc_repo = BlobRepository(container_name=_gc_container)
+                return _azure_browse_container(_gc_repo, prefix.lstrip("/"))
+            except Exception as exc:
+                logger.warning("[storage/categories] generated-courses Azure failed (%s), using local.", exc)
+        # Local dev: browse pipeline/courses/ and return only output DOCX files
+        local = _local_browse_artifacts(prefix)
+        local.container_name = "generated-courses (local)"
+        return local
+
+    # pipeline-artifacts and test-data → main artifacts container
+    azure_prefix = _artifacts_browse_prefix(prefix)
+    if _azure_configured():
+        try:
+            result = _azure_browse(azure_prefix)
+            if result.entries or prefix:
+                return result
+        except Exception as exc:
+            logger.warning("[storage/categories] %s Azure failed (%s), using local.", category, exc)
+    return _local_browse_artifacts(prefix)
+
+
 @router.get("/file", summary="Download or preview a file")
 async def get_storage_file(
     path: str = Query(..., description="Blob path from browse response"),

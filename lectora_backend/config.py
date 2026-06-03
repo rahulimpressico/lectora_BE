@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     blob_container_name: str = "regedlectoraaistorage"
     # Container for FE-uploaded source documents (Documents library).
     uploaded_documents_container_name: str = "uploaded-documents"
+    # Container where Save to Azure writes generated course DOCX files.
+    generated_courses_container_name: str = "generated-courses"
 
     # Langfuse
     langfuse_public_key: str = ""
@@ -59,6 +61,10 @@ class Settings(BaseSettings):
 
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    def is_azure_storage_configured(self) -> bool:
+        """True when Azure Blob Storage connection string is present."""
+        return bool(self.azure_storage_connection_string.strip())
 
 
 settings = Settings()

@@ -54,6 +54,17 @@ def _build_teaching_style_section(rule_pack: dict, audience: str = "") -> str:
         "- Vary sentence length. Short punchy sentences for key rules. Longer sentences for context.",
         '- NEVER start a section with "In this section we will discuss…" or "It is important to note that…"',
         '- NEVER use filler openers. Jump straight into the teaching.',
+        "",
+        "### Avoid reference-manual writing",
+        "- The goal is to teach understanding, not to create a glossary or reference document.",
+        "- Do not simply list facts, rules, definitions, or regulations.",
+        "- Instead:",
+        "  - Explain concepts.",
+        "  - Connect ideas together.",
+        "  - Show cause and effect.",
+        "  - Use examples to make concepts memorable.",
+        "  - Help the learner understand how knowledge is applied in real situations."
+
     ]
 
     if audience_line:
@@ -169,6 +180,8 @@ Use an `options` count that stays within `full_rule_pack.kc_placement_rules.min_
 Derive reading level, voice (e.g. second vs third person), tone, organization reference ("we" vs "this course"), and client references **only** from `full_rule_pack.style_constraints` and `full_rule_pack.compliance_elements` (including `required_behaviors`, `forbidden_phrases`, `regulatory_mode`, `disclosure_handling`).
 
 Derive section structure expectations (intro/LO placement, summaries, examples/callouts per section, timed outline flags, etc.) from `full_rule_pack.content_rules`.
+
+The audience is a professional practitioner, frame explanations around decisions they make, client conversations they may have, risks they must recognize, and actions they should take.
 
 ### Voice enforcement (CRITICAL)
 

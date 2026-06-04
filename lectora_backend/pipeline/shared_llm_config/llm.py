@@ -42,17 +42,21 @@ class LLMConfig:
     Holds all per-agent model settings.
 
     Attributes:
-        deployment:   Azure deployment name (agent-specific, NOT from .env).
-        temperature:  Passed through when set (default ``None`` = API default).
-        max_tokens:   Max completion tokens when set.
-        top_k:        Sampling top-k when set (e.g. ``1`` for greedy-ish decoding).
-
+        deployment:     Azure deployment name (agent-specific, NOT from .env).
+        temperature:    Passed through when set (default ``None`` = API default).
+        max_tokens:     Max completion tokens when set.
+        top_k:          Sampling top-k when set (e.g. ``1`` for greedy-ish decoding).
+        response_format: When set, passed directly to the API (e.g.
+                         ``{"type": "json_object"}`` to enforce JSON output).
+                         Only supported by non-o-series models (gpt-4o, gpt-5.x, etc.).
+                         Do NOT set on o3/o1 deployments — they will raise an API error.
     """
 
     deployment: str
     temperature: float | None = None
     max_tokens: int | None = None
     top_k: int | None = None
+    response_format: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +118,8 @@ def chat(
         create_kwargs["max_completion_tokens"] = config.max_tokens
     if config.top_k is not None:
         create_kwargs["top_k"] = config.top_k
+    if config.response_format is not None:
+        create_kwargs["response_format"] = config.response_format
 
     try:
         response = client.chat.completions.create(

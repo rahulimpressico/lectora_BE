@@ -11,6 +11,8 @@ import logging
 import re
 from typing import Any
 
+import json_repair
+
 from ..config.llm import chat, chat_for_to
 from lectora_backend.pipeline.shared_llm_config.model_registry import get_deployment
 from ..prompt.classification import (
@@ -125,11 +127,27 @@ def classify_with_llm(
 
     try:
         result = json.loads(_strip_fences(raw))
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"LLM returned invalid JSON for course classification. "
-            f"Raw output (first 500 chars): {raw[:500]!r}"
-        ) from exc
+    except json.JSONDecodeError as original_exc:
+        logger.warning(
+            "[CLASSIFY] Invalid JSON from LLM — attempting json_repair. "
+            "Raw response (first 500 chars): %r",
+            raw[:500],
+        )
+        try:
+            repaired = json_repair.repair_json(_strip_fences(raw), return_objects=True)
+            if not isinstance(repaired, dict):
+                raise ValueError(
+                    f"json_repair returned {type(repaired).__name__}, expected dict"
+                )
+            logger.info("[CLASSIFY] json_repair successfully recovered malformed classification JSON.")
+            result = repaired
+        except Exception as repair_exc:
+            raise ValueError(
+                f"LLM returned invalid JSON for course classification and repair failed. "
+                f"Original error: {original_exc}. "
+                f"Repair error: {repair_exc}. "
+                f"Raw output (first 500 chars): {raw[:500]!r}"
+            ) from original_exc
 
     logger.info(
         "[CLASSIFY]  ── RESULT: rule_family=%s | confidence=%.2f | topic=%s",
@@ -165,16 +183,33 @@ def _parse_to_outline_json(raw: str) -> dict:
     cleaned = _strip_fences(raw)
     try:
         return json.loads(cleaned)
-    except json.JSONDecodeError as exc:
+    except json.JSONDecodeError as original_exc:
         truncated = len(raw) < 200 or not raw.rstrip().endswith("}")
         hint = (
             " Response appears TRUNCATED — increase max_output_tokens."
             if truncated else ""
         )
-        raise ValueError(
-            f"LLM returned invalid JSON for TO generation.{hint} "
-            f"Raw output (first 500 chars): {raw[:500]!r}"
-        ) from exc
+        logger.warning(
+            "[TO-LLM] Invalid JSON from LLM — attempting json_repair.%s "
+            "Raw response (first 500 chars): %r",
+            hint,
+            raw[:500],
+        )
+        try:
+            repaired = json_repair.repair_json(cleaned, return_objects=True)
+            if not isinstance(repaired, dict):
+                raise ValueError(
+                    f"json_repair returned {type(repaired).__name__}, expected dict"
+                )
+            logger.info("[TO-LLM] json_repair successfully recovered malformed TO JSON.")
+            return repaired
+        except Exception as repair_exc:
+            raise ValueError(
+                f"LLM returned invalid JSON for TO generation and repair failed.{hint} "
+                f"Original error: {original_exc}. "
+                f"Repair error: {repair_exc}. "
+                f"Raw output (first 500 chars): {raw[:500]!r}"
+            ) from original_exc
 
 
 def _build_to_user_message(
@@ -494,12 +529,32 @@ def classify_to_outline_with_llm(
         )
 
     raw = chat(CLASSIFICATIONTO_OUTLINE_PROMPT, user_msg)
+    logger.info(
+        "[TO-CLASSIFY] LLM raw response (first 300 chars): %s",
+        raw[:300].replace("\n", " "),
+    )
     cleaned = _strip_fences(raw)
 
     try:
         return json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"LLM returned invalid JSON for timed-outline classification. "
-            f"Raw output (first 500 chars): {raw[:500]!r}"
-        ) from exc
+    except json.JSONDecodeError as original_exc:
+        logger.warning(
+            "[TO-CLASSIFY] Invalid JSON from LLM — attempting json_repair. "
+            "Raw response (first 500 chars): %r",
+            raw[:500],
+        )
+        try:
+            repaired = json_repair.repair_json(cleaned, return_objects=True)
+            if not isinstance(repaired, dict):
+                raise ValueError(
+                    f"json_repair returned {type(repaired).__name__}, expected dict"
+                )
+            logger.info("[TO-CLASSIFY] json_repair successfully recovered malformed timed-outline JSON.")
+            return repaired
+        except Exception as repair_exc:
+            raise ValueError(
+                f"LLM returned invalid JSON for timed-outline classification and repair failed. "
+                f"Original error: {original_exc}. "
+                f"Repair error: {repair_exc}. "
+                f"Raw output (first 500 chars): {raw[:500]!r}"
+            ) from original_exc

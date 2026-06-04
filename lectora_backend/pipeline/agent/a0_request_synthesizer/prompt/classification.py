@@ -131,6 +131,10 @@ _GENERATE_TO_format = {
 }
 
 GENERATE_TO_PROMPT = f"""\
+IMPORTANT: Your response MUST be a single valid JSON object ONLY.
+Do NOT output markdown, headings, prose, or any text outside the JSON object.
+Start your response with "{{" and end with "}}". No code fences. No explanation.
+
 You are a seasoned industry professional and trainer with years of hands-on experience
 in this field. You have taught this material to real working professionals — you know
 exactly what trips students up, what they actually use on the job, and what is merely
@@ -435,6 +439,10 @@ def build_dynamic_to_prompt(
 
     import json as _json
     return f"""\
+IMPORTANT: Your response MUST be a single valid JSON object ONLY.
+Do NOT output markdown, headings, prose, or any text outside the JSON object.
+Start your response with "{{" and end with "}}". No code fences. No explanation.
+
 These are the source files for a professional continuing education course.
 
 Generate a professional continuing education course outline based on the content of all uploaded source documents.

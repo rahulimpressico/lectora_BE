@@ -19,6 +19,8 @@ import logging
 import re
 import time
 
+import json_repair
+
 from ..config.llm import chat
 from ..prompt.section_prompt import (
     build_lesson_system_prompt,
@@ -85,16 +87,47 @@ def _parse_llm_json_array(raw: str) -> list[dict]:
 
     The LLM is expected to return a bare JSON array. If it wraps the array
     in a dict key (e.g. {"sections": [...]}), the most likely key is unwrapped.
+    Falls back to json_repair when the response contains malformed JSON.
     """
     text = _strip_fences(raw)
-    parsed = json.loads(text)
-    if isinstance(parsed, list):
-        return parsed
-    if isinstance(parsed, dict):
-        for key in ("sections", "results", "data", "content"):
-            if isinstance(parsed.get(key), list):
-                return parsed[key]
-    raise ValueError(f"Expected a JSON array, got {type(parsed).__name__}")
+
+    def _extract_list(parsed: object) -> list[dict] | None:
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            for key in ("sections", "results", "data", "content"):
+                if isinstance(parsed.get(key), list):
+                    return parsed[key]
+        return None
+
+    try:
+        parsed = json.loads(text)
+        result = _extract_list(parsed)
+        if result is not None:
+            return result
+        raise ValueError(f"Expected a JSON array, got {type(parsed).__name__}")
+    except json.JSONDecodeError as original_exc:
+        logger.warning(
+            "[A2] Invalid JSON from LLM — attempting json_repair. "
+            "Raw response (first 500 chars): %r",
+            raw[:500],
+        )
+        try:
+            repaired = json_repair.repair_json(text, return_objects=True)
+            result = _extract_list(repaired)
+            if result is not None:
+                logger.info("[A2] json_repair successfully recovered malformed content JSON array.")
+                return result
+            raise ValueError(
+                f"json_repair returned {type(repaired).__name__}, expected list or dict with list"
+            )
+        except Exception as repair_exc:
+            raise ValueError(
+                f"LLM returned invalid JSON array and repair failed. "
+                f"Original error: {original_exc}. "
+                f"Repair error: {repair_exc}. "
+                f"Raw output (first 500 chars): {raw[:500]!r}"
+            ) from original_exc
 
 
 # ── Word-count helper ─────────────────────────────────────────────────────────

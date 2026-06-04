@@ -34,7 +34,7 @@ class _DynamicTOConfig:
     """Proxy for TO generation — uses A0_TO registry key (gpt-5.4 default)."""
 
     temperature: float | None = None
-    max_tokens: int | None = None
+    max_tokens: int = 16384  # large TO responses require high token budget
     top_k: int | None = None
 
     @property

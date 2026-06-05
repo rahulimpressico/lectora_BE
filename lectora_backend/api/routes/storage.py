@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import logging
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import FileResponse, Response
 
 from pydantic import BaseModel, Field, model_validator
+from azure.storage.blob import BlobSasPermissions, generate_blob_sas
 
 from lectora_backend.core.blob_paths import UPLOADED_DOCUMENTS_PREFIX
 from lectora_backend.repositories.blob_repository import BlobRepository
@@ -73,7 +75,7 @@ class BrowseResponse(BaseModel):
 class DeleteStorageFilesRequest(BaseModel):
     paths: list[str] = Field(default_factory=list, max_length=100)
     folder_paths: list[str] = Field(default_factory=list, alias="folderPaths", max_length=50)
-    source: Literal["artifacts", "uploads"] = "uploads"
+    source: Literal["artifacts", "uploads", "generated-courses"] = "uploads"
 
     model_config = {"populate_by_name": True}
 
@@ -94,6 +96,15 @@ class DeleteStorageFileResult(BaseModel):
 class DeleteStorageFilesResponse(BaseModel):
     results: list[DeleteStorageFileResult]
     deleted_count: int = Field(alias="deletedCount")
+
+    model_config = {"populate_by_name": True}
+
+
+class ExternalPreviewUrlResponse(BaseModel):
+    provider: Literal["microsoft-office-web-viewer"]
+    file_url: str = Field(alias="fileUrl")
+    preview_url: str = Field(alias="previewUrl")
+    expires_at: str = Field(alias="expiresAt")
 
     model_config = {"populate_by_name": True}
 
@@ -196,7 +207,10 @@ def _filter_upload_entries(response: BrowseResponse) -> BrowseResponse:
     )
 
 
-def _normalize_blob_path(path: str, source: Literal["artifacts", "uploads"]) -> str:
+def _normalize_blob_path(
+    path: str,
+    source: Literal["artifacts", "uploads", "generated-courses"],
+) -> str:
     clean = path.strip().lstrip("/")
     if ".." in clean or clean.startswith("/"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid path")
@@ -279,7 +293,10 @@ def _azure_browse_container(
     )
 
 
-def _resolve_local_file(source: Literal["artifacts", "uploads"], relative_path: str) -> Path:
+def _resolve_local_file(
+    source: Literal["artifacts", "uploads", "generated-courses"],
+    relative_path: str,
+) -> Path:
     clean = relative_path.strip().lstrip("/")
     if source == "uploads":
         base = _UPLOAD_ROOT.resolve()
@@ -479,6 +496,40 @@ def _download_azure_blob_from_repo(repo: BlobRepository, blob_path: str) -> tupl
     return data, media
 
 
+def _build_blob_sas_url(
+    *,
+    repo: BlobRepository,
+    blob_path: str,
+    expires_in: timedelta = timedelta(minutes=30),
+) -> tuple[str, str]:
+    blob_client = repo._container_client.get_blob_client(blob_path)  # noqa: SLF001
+    if not blob_client.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Blob not found: {blob_path}",
+        )
+
+    credential = getattr(repo._service_client, "credential", None)  # noqa: SLF001
+    account_key = getattr(credential, "account_key", None)
+    account_name = getattr(repo._service_client, "account_name", None)  # noqa: SLF001
+    if not account_key or not account_name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Azure SAS preview is not available with the current storage credentials.",
+        )
+
+    expires_at = datetime.now(timezone.utc) + expires_in
+    sas_token = generate_blob_sas(
+        account_name=account_name,
+        container_name=repo._container_name,  # noqa: SLF001
+        blob_name=blob_path,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=expires_at,
+    )
+    return f"{blob_client.url}?{sas_token}", expires_at.isoformat()
+
+
 def _file_response_bytes(data: bytes, blob_path: str) -> Response:
     ext = Path(blob_path).suffix.lower()
     media = _MIME.get(ext, "application/octet-stream")
@@ -631,9 +682,12 @@ async def browse_by_category(
 @router.get("/file", summary="Download or preview a file")
 async def get_storage_file(
     path: str = Query(..., description="Blob path from browse response"),
-    source: Literal["artifacts", "uploads"] = Query(
+    source: Literal["artifacts", "uploads", "generated-courses"] = Query(
         default="artifacts",
-        description="artifacts = pipeline output; uploads = uploaded-documents/ in blob",
+        description=(
+            "artifacts = pipeline output; uploads = uploaded-documents/ in blob; "
+            "generated-courses = final course outputs"
+        ),
     ),
 ) -> Response:
     """Serve file bytes for in-browser preview (images, JSON, DOCX) or download."""
@@ -648,7 +702,8 @@ async def get_storage_file(
         media = _MIME.get(ext, "application/octet-stream")
         return FileResponse(path=str(target), media_type=media, filename=target.name)
 
-    # Artifacts: try Azure when listed from blob; fall back to local shared_state.
+    # Artifacts/generated-courses: Rahul's branch stores generated courses in
+    # the main artifacts container, so both sources resolve through this path.
     blob_path = path.strip().lstrip("/")
     azure_result = _try_azure_file(blob_path)
     if azure_result is not None:
@@ -659,6 +714,41 @@ async def get_storage_file(
     ext = target.suffix.lower()
     media = _MIME.get(ext, "application/octet-stream")
     return FileResponse(path=str(target), media_type=media, filename=target.name)
+
+
+@router.get("/external-preview-url", response_model=ExternalPreviewUrlResponse)
+async def get_external_preview_url(
+    path: str = Query(..., description="Blob path from browse response"),
+    source: Literal["uploads", "generated-courses"] = Query(
+        ...,
+        description="Only Azure-backed uploads or generated-courses are supported.",
+    ),
+) -> ExternalPreviewUrlResponse:
+    if not _azure_configured():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="External Office preview requires Azure storage.",
+        )
+
+    blob_path = _normalize_blob_path(path, source)
+    if Path(blob_path).suffix.lower() not in {".docx", ".doc"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="External Office preview is only supported for DOCX/DOC files.",
+        )
+
+    repo = _uploads_blob_repo() if source == "uploads" else BlobRepository()
+    file_url, expires_at = _build_blob_sas_url(repo=repo, blob_path=blob_path)
+    preview_url = (
+        "https://view.officeapps.live.com/op/embed.aspx?src="
+        f"{quote(file_url, safe='')}"
+    )
+    return ExternalPreviewUrlResponse(
+        provider="microsoft-office-web-viewer",
+        file_url=file_url,
+        preview_url=preview_url,
+        expires_at=expires_at,
+    )
 
 
 @router.post("/delete", response_model=DeleteStorageFilesResponse)

@@ -91,6 +91,7 @@ from lectora_backend.pipeline.agent.a2_content_generator.main import (
     A2ContentGenerator,
     render_study_guide_from_state,
 )
+from lectora_backend.pipeline.shared_llm_config.file_llm import _convert_docx_to_pdf
 from lectora_backend.pipeline.agent.kc_planner.main import run as kc_planner_run
 from lectora_backend.pipeline.agent.s1_validator.main import S1Validator
 from lectora_backend.pipeline.agent.s2_validator.main import S2Validator
@@ -1722,8 +1723,12 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
     course_slug = sanitize_course_slug(job.course_title)
     file_name = f"{course_slug}_study_guide.docx"
     blob_path = f"{course_slug}/output/{file_name}"
+    pdf_file_name = f"{course_slug}_study_guide.pdf"
+    pdf_blob_path = f"{course_slug}/output/{pdf_file_name}"
 
     container = _settings.blob_container_name  # main artifacts container — same one the pipeline writes to
+    pdf_uploaded = False
+    pdf_warning: str | None = None
     try:
         repo = BlobRepository(container_name=container)
         repo.upload_file(
@@ -1731,6 +1736,25 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
             blob_path=blob_path,
             content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
+        try:
+            pdf_bytes = await loop.run_in_executor(
+                None,
+                _convert_docx_to_pdf,
+                Path(docx_path),
+            )
+            repo.upload_bytes(
+                blob_path=pdf_blob_path,
+                content=pdf_bytes,
+                content_type="application/pdf",
+            )
+            pdf_uploaded = True
+        except Exception as exc:
+            pdf_warning = str(exc)
+            logger.warning(
+                "[save_to_azure] PDF preview generation skipped for job %s: %s",
+                job_id,
+                exc,
+            )
     except Exception as exc:
         logger.exception("[save_to_azure] Upload failed for job %s: %s", job_id, exc)
         raise HTTPException(
@@ -1754,8 +1778,10 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
             "courseType":    job.course_type or "",
             "fileName":      file_name,
             "blobPath":      blob_path,
+            "pdfBlobPath":   pdf_blob_path if pdf_uploaded else None,
             "containerName": container,
             "savedAt":       datetime.now(timezone.utc).isoformat(),
+            "warning":       pdf_warning,
             "totalSections": len(_sections),
             "totalWordCount": sum(
                 len(str(s.get("body_paragraphs", "") or "").split())
@@ -1781,6 +1807,8 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
         "jobId":         job_id,
         "fileName":      file_name,
         "blobPath":      blob_path,
+        "pdfBlobPath":   pdf_blob_path if pdf_uploaded else None,
         "containerName": container,
         "savedAt":       datetime.now(timezone.utc).isoformat(),
+        "warning":       pdf_warning,
     })

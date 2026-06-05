@@ -138,7 +138,10 @@ def _resolve_local_artifact(path: str) -> Path:
     return target
 
 
-def delete_storage_file(path: str, source: Literal["artifacts", "uploads"]) -> None:
+def delete_storage_file(
+    path: str,
+    source: Literal["artifacts", "uploads", "generated-courses"],
+) -> None:
     """Delete one file from Azure Blob and/or local storage."""
     clean = path.strip().lstrip("/")
     if not clean or ".." in clean:
@@ -190,7 +193,10 @@ def delete_storage_file(path: str, source: Literal["artifacts", "uploads"]) -> N
         )
 
 
-def delete_storage_folder(folder_path: str, source: Literal["artifacts", "uploads"]) -> int:
+def delete_storage_folder(
+    folder_path: str,
+    source: Literal["artifacts", "uploads", "generated-courses"],
+) -> int:
     """Delete all blobs/files under a folder prefix. Returns items removed."""
     clean = folder_path.strip().lstrip("/").rstrip("/")
     if not clean or ".." in clean:

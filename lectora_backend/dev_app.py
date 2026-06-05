@@ -26,6 +26,7 @@ from fastapi import FastAPI
 
 from lectora_backend.api.middleware.cors import add_cors_middleware
 from lectora_backend.api.routes import costing
+from lectora_backend.api.routes import dashboard
 from lectora_backend.api.routes import health
 from lectora_backend.api.routes import generate_to
 from lectora_backend.api.routes import local_jobs
@@ -74,6 +75,7 @@ app.include_router(local_jobs.router,      prefix="/jobs",       tags=["jobs"])
 app.include_router(storage.router,         prefix="/storage",    tags=["storage"])
 app.include_router(settings_routes.router, prefix="/settings",   tags=["settings"])
 app.include_router(costing.router,         prefix="/costing",    tags=["costing"])
+app.include_router(dashboard.router,       prefix="/dashboard",  tags=["dashboard"])
 
 
 @app.get("/", include_in_schema=False)

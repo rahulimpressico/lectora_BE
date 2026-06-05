@@ -7,7 +7,7 @@ from sqlalchemy import text
 
 from lectora_backend.api.middleware.cors import add_cors_middleware
 from lectora_backend.api.middleware.logging_middleware import LoggingMiddleware
-from lectora_backend.api.routes import costing, events, generate_to, health, jobs, storage
+from lectora_backend.api.routes import costing, dashboard, events, generate_to, health, jobs, storage
 from lectora_backend.api.routes import settings as settings_routes
 from lectora_backend.config import settings
 from lectora_backend.dependencies import engine
@@ -61,3 +61,4 @@ app.include_router(storage.router, prefix="/storage", tags=["storage"])
 app.include_router(generate_to.router, prefix="/documents", tags=["documents"])
 app.include_router(settings_routes.router, prefix="/settings", tags=["settings"])
 app.include_router(costing.router, prefix="/costing", tags=["costing"])
+app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])

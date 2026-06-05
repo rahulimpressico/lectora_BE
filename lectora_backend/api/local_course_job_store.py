@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -328,6 +329,41 @@ class LocalCourseJobStore:
     def remove(self, job_id: str) -> bool:
         with self._lock:
             return self._jobs.pop(job_id, None) is not None
+
+    def get_status_counts(self) -> dict[str, int]:
+        """Return lightweight aggregate counts for dashboard-style summaries."""
+        self._evict_expired()
+        with self._lock:
+            total = len(self._jobs)
+            in_progress = sum(
+                1
+                for job in self._jobs.values()
+                if job.status in (LocalJobStatus.PENDING, LocalJobStatus.PROCESSING)
+            )
+            completed = sum(
+                1 for job in self._jobs.values() if job.status == LocalJobStatus.COMPLETED
+            )
+        return {
+            "courses_generated": total,
+            "in_progress": in_progress,
+            "completed": completed,
+        }
+
+    def get_recent_in_progress_count(self, cutoff: datetime) -> int:
+        """Return only local pending/processing jobs updated on or after cutoff."""
+        self._evict_expired()
+        with self._lock:
+            count = 0
+            for job in self._jobs.values():
+                if job.status not in (LocalJobStatus.PENDING, LocalJobStatus.PROCESSING):
+                    continue
+                try:
+                    updated_at = datetime.fromisoformat(job.updated_at)
+                except ValueError:
+                    continue
+                if updated_at >= cutoff:
+                    count += 1
+            return count
 
     def _evict_expired(self) -> None:
         cutoff = time.monotonic() - _TTL_SECONDS

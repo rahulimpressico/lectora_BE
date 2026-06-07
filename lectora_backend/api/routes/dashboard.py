@@ -1,67 +1,120 @@
-"""Dashboard summary endpoints."""
+"""
+GET /dashboard/summary
+
+Returns live job counts.
+
+Strategy (two sources, one endpoint):
+  1. SQL DB (production / Azure): query the `jobs` table when DATABASE_URL
+     is configured and reachable.  Counts come from the real Azure job table.
+  2. In-memory store (dev mode): fallback when the DB is unavailable or not
+     configured (e.g. no absolute SQLite path set).
+
+Dashboard mapping:
+  coursesGenerated = total rows in jobs table (all statuses)
+  inProgress       = rows with status IN (PENDING, PROCESSING)
+                     — these are in the Service Bus queue or actively running
+  completed        = rows with status = COMPLETED
+"""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import logging
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import func, inspect, select
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from fastapi import APIRouter
+from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 
-from lectora_backend.api.local_course_job_store import get_local_course_job_store
-from lectora_backend.api.schemas.dashboard_schemas import DashboardSummaryResponse
-from lectora_backend.dependencies import get_db_session
-from lectora_backend.models.db_models import Job
-from lectora_backend.models.job_enums import JobStatus
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_ACTIVE_JOB_STALE_WINDOW = timedelta(hours=2)
+
+class DashboardSummary(BaseModel):
+    coursesGenerated: int
+    inProgress: int
+    completed: int
 
 
-def _db_counts(db: Session) -> dict[str, int]:
-    """Return DB-backed job counts, or zeros when the jobs table is unavailable."""
-    bind = db.get_bind()
-    if bind is None:
-        return {"courses_generated": 0, "in_progress": 0, "completed": 0}
-
+def _counts_from_db() -> DashboardSummary | None:
+    """
+    Query the SQL jobs table for status counts.
+    Returns None if the DB is not configured or unreachable.
+    """
     try:
-        if "jobs" not in inspect(bind).get_table_names():
-            return {"courses_generated": 0, "in_progress": 0, "completed": 0}
+        from lectora_backend.config import settings
+        from lectora_backend.dependencies import SessionLocal
+        from lectora_backend.models.db_models import Job
+        from lectora_backend.models.job_enums import JobStatus
 
-        cutoff = datetime.now(timezone.utc) - _ACTIVE_JOB_STALE_WINDOW
-        in_progress = db.scalar(
-            select(func.count())
-            .select_from(Job)
-            .where(Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]))
-            .where(Job.updated_at >= cutoff)
-        ) or 0
-        completed = db.scalar(
-            select(func.count())
-            .select_from(Job)
-            .where(Job.status == JobStatus.COMPLETED)
-        ) or 0
-    except SQLAlchemyError:
-        return {"courses_generated": 0, "in_progress": 0, "completed": 0}
+        db = SessionLocal()
+        try:
+            # Single aggregated query: GROUP BY status
+            rows = db.execute(
+                select(Job.status, func.count(Job.job_id).label("cnt"))
+                .group_by(Job.status)
+            ).all()
+        finally:
+            db.close()
 
-    return {
-        "courses_generated": int(completed),
-        "in_progress": int(in_progress),
-        "completed": int(completed),
-    }
+        counts: dict[str, int] = {str(r.status): r.cnt for r in rows}
+
+        total = sum(counts.values())
+        in_progress = (
+            counts.get(JobStatus.PENDING.value, 0)
+            + counts.get(JobStatus.PROCESSING.value, 0)
+        )
+        completed = counts.get(JobStatus.COMPLETED.value, 0)
+
+        logger.debug(
+            "[dashboard] DB counts — total=%d in_progress=%d completed=%d",
+            total, in_progress, completed,
+        )
+        return DashboardSummary(
+            coursesGenerated=total,
+            inProgress=in_progress,
+            completed=completed,
+        )
+
+    except (OperationalError, Exception) as exc:
+        logger.debug("[dashboard] DB unavailable (%s), falling back to local store", exc)
+        return None
 
 
-@router.get("/summary", response_model=DashboardSummaryResponse)
-def get_dashboard_summary(
-    db: Session = Depends(get_db_session),
-) -> DashboardSummaryResponse:
-    db_counts = _db_counts(db)
-    local_store = get_local_course_job_store()
-    local_counts = local_store.get_status_counts()
-    cutoff = datetime.now(timezone.utc) - _ACTIVE_JOB_STALE_WINDOW
-
-    return DashboardSummaryResponse(
-        coursesGenerated=db_counts["courses_generated"] + local_counts["completed"],
-        inProgress=db_counts["in_progress"] + local_store.get_recent_in_progress_count(cutoff),
-        completed=db_counts["completed"] + local_counts["completed"],
+def _counts_from_local_store() -> DashboardSummary:
+    """Read counts from the in-memory LocalCourseJobStore (dev mode)."""
+    from lectora_backend.api.local_course_job_store import (
+        LocalJobStatus,
+        get_local_course_job_store,
     )
+
+    store = get_local_course_job_store()
+    with store._lock:
+        jobs = list(store._jobs.values())
+
+    total = len(jobs)
+    in_progress = sum(
+        1 for j in jobs
+        if j.status in (LocalJobStatus.PENDING, LocalJobStatus.PROCESSING)
+    )
+    completed = sum(1 for j in jobs if j.status == LocalJobStatus.COMPLETED)
+
+    return DashboardSummary(
+        coursesGenerated=total,
+        inProgress=in_progress,
+        completed=completed,
+    )
+
+
+@router.get("/summary", response_model=DashboardSummary)
+async def get_dashboard_summary() -> DashboardSummary:
+    """
+    Live job counts for the dashboard.
+
+    Tries the SQL database first (production / Azure). Falls back to the
+    in-memory job store when the DB is not configured (local dev mode).
+    """
+    result = _counts_from_db()
+    if result is not None:
+        return result
+
+    return _counts_from_local_store()

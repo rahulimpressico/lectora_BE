@@ -60,12 +60,8 @@ def cancel_background_jobs_for_delete(
 
 
 def _azure_configured() -> bool:
-    try:
-        from lectora_backend.config import settings  # type: ignore[attr-defined]
-
-        return bool(getattr(settings, "azure_storage_connection_string", "").strip())
-    except Exception:
-        return False
+    from lectora_backend.config import settings
+    return settings.is_azure_storage_configured()
 
 
 def _uploads_container_name() -> str:
@@ -91,6 +87,7 @@ def _strip_upload_blob_roots(path: str) -> str:
 
 def delete_course_output_tree(course_title: str) -> int:
     """Delete ``{slug}/`` from Azure and local pipeline course output."""
+    import os as _os
     slug = sanitize_course_slug(course_title)
     removed = 0
 
@@ -101,7 +98,13 @@ def delete_course_output_tree(course_title: str) -> int:
         removed += repo.delete_blobs_by_prefix(slug)
         removed += repo.delete_blobs_by_prefix(f"outputs/{slug}")
 
+    _courses_base = _PIPELINE_COURSES_DIR.resolve()
     local_dir = (_PIPELINE_COURSES_DIR / slug).resolve()
+    if not str(local_dir).startswith(str(_courses_base) + _os.sep):
+        logger.error(
+            "[storage_cleanup] Refusing to delete outside courses dir: %s", local_dir
+        )
+        return removed
     if local_dir.is_dir():
         shutil.rmtree(local_dir, ignore_errors=True)
         removed += 1
@@ -138,10 +141,7 @@ def _resolve_local_artifact(path: str) -> Path:
     return target
 
 
-def delete_storage_file(
-    path: str,
-    source: Literal["artifacts", "uploads", "generated-courses"],
-) -> None:
+def delete_storage_file(path: str, source: Literal["artifacts", "uploads"]) -> None:
     """Delete one file from Azure Blob and/or local storage."""
     clean = path.strip().lstrip("/")
     if not clean or ".." in clean:
@@ -193,10 +193,7 @@ def delete_storage_file(
         )
 
 
-def delete_storage_folder(
-    folder_path: str,
-    source: Literal["artifacts", "uploads", "generated-courses"],
-) -> int:
+def delete_storage_folder(folder_path: str, source: Literal["artifacts", "uploads"]) -> int:
     """Delete all blobs/files under a folder prefix. Returns items removed."""
     clean = folder_path.strip().lstrip("/").rstrip("/")
     if not clean or ".." in clean:
@@ -222,8 +219,8 @@ def delete_storage_folder(
             removed += 1
             logger.info("[storage_cleanup] Removed upload folder %s", local_dir)
     else:
+        import os as _os
         rel = strip_legacy_outputs_prefix(clean).strip("/")
-        azure_prefix = f"{rel}/" if rel else ""
         if _azure_configured():
             from lectora_backend.repositories.blob_repository import BlobRepository
 
@@ -231,12 +228,18 @@ def delete_storage_folder(
             removed += repo.delete_blobs_by_prefix(rel)
             if rel:
                 removed += repo.delete_blobs_by_prefix(f"outputs/{rel}")
-        local_dir = (_PIPELINE_COURSES_DIR / rel).resolve()
+        _courses_base = _PIPELINE_COURSES_DIR.resolve()
+        local_dir = (_PIPELINE_COURSES_DIR / rel).resolve() if rel else _courses_base
+        if str(local_dir) != str(_courses_base) and not str(local_dir).startswith(str(_courses_base) + _os.sep):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid folder path")
         if local_dir.is_dir():
             shutil.rmtree(local_dir, ignore_errors=True)
             removed += 1
-        legacy_dir = (_LEGACY_SHARED_STATE_DIR / rel).resolve()
-        if legacy_dir.is_dir():
+        _legacy_base = _LEGACY_SHARED_STATE_DIR.resolve()
+        legacy_dir = (_LEGACY_SHARED_STATE_DIR / rel).resolve() if rel else _legacy_base
+        if str(legacy_dir) != str(_legacy_base) and not str(legacy_dir).startswith(str(_legacy_base) + _os.sep):
+            pass  # silently skip invalid legacy path
+        elif legacy_dir.is_dir():
             shutil.rmtree(legacy_dir, ignore_errors=True)
             removed += 1
 

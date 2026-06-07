@@ -2,7 +2,7 @@
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.orm import Session, selectinload
 
 from lectora_backend.models.db_models import Job, RetryHistory, StageProgress
@@ -79,13 +79,26 @@ class JobRepository:
         overrides: dict[str, object] | None,
         triggered_by: str,
     ) -> Job | None:
-        job = self.get_job(job_id)
-        if job is None:
+        # Lightweight existence check — no need to load relations here.
+        exists = self.session.execute(
+            select(Job.job_id).where(Job.job_id == job_id)
+        ).scalar_one_or_none()
+        if exists is None:
             return None
+
+        # Count existing retries in a single aggregate query.
+        attempt: int = (
+            self.session.execute(
+                select(func.count()).select_from(RetryHistory).where(
+                    RetryHistory.job_id == job_id
+                )
+            ).scalar()
+            or 0
+        ) + 1
 
         retry_entry = RetryHistory(
             job_id=job_id,
-            attempt=len(job.retry_history) + 1,
+            attempt=attempt,
             from_stage=from_stage,
             section_id=section_id,
             triggered_by=triggered_by,
@@ -93,23 +106,30 @@ class JobRepository:
             overrides=json.dumps(overrides) if overrides is not None else None,
             outcome=StageStatus.PROCESSING,
         )
-
-        job.status = JobStatus.PROCESSING
-        job.updated_at = datetime.now(timezone.utc)
-
         self.session.add(retry_entry)
+
+        # Targeted UPDATE — no need to load the full Job + relations.
+        self.session.execute(
+            sa_update(Job)
+            .where(Job.job_id == job_id)
+            .values(
+                status=JobStatus.PROCESSING,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
         self.session.commit()
+
+        # One final load so the caller has the full object with updated fields.
         return self.get_job(job_id)
 
-    def update_job_status(self, job_id: str, status: JobStatus) -> Job | None:
-        job = self.get_job(job_id)
-        if job is None:
-            return None
-
-        job.status = status
-        job.updated_at = datetime.now(timezone.utc)
+    def update_job_status(self, job_id: str, status: JobStatus) -> None:
+        """Update only the job status + updated_at via a targeted SQL UPDATE."""
+        self.session.execute(
+            sa_update(Job)
+            .where(Job.job_id == job_id)
+            .values(status=status, updated_at=datetime.now(timezone.utc))
+        )
         self.session.commit()
-        return self.get_job(job_id)
 
     def update_stage_status(
         self,
@@ -121,28 +141,28 @@ class JobRepository:
         completed_at: datetime | None = None,
         validation_outcome: ValidationOutcome | None = None,
         error_detail: str | None = None,
-    ) -> StageProgress | None:
-        stmt = select(StageProgress).where(
-            StageProgress.job_id == job_id,
-            StageProgress.stage_id == stage_id,
-        )
-        stage = self.session.execute(stmt).scalar_one_or_none()
-        if stage is None:
-            return None
-
-        stage.status = status
-
+    ) -> None:
+        """Update a single stage row via a targeted SQL UPDATE (no entity reload)."""
+        values: dict = {
+            "status": status,
+            # Always written (including None) so callers can explicitly clear them.
+            "validation_outcome": validation_outcome,
+            "error_detail": error_detail,
+        }
         if started_at is not None:
-            stage.started_at = started_at
-
+            values["started_at"] = started_at
         if completed_at is not None:
-            stage.completed_at = completed_at
+            values["completed_at"] = completed_at
 
-        stage.validation_outcome = validation_outcome
-        stage.error_detail = error_detail
-
+        self.session.execute(
+            sa_update(StageProgress)
+            .where(
+                StageProgress.job_id == job_id,
+                StageProgress.stage_id == stage_id,
+            )
+            .values(**values)
+        )
         self.session.commit()
-        return stage
 
     def mark_job_failed(
         self,
@@ -151,31 +171,26 @@ class JobRepository:
         code: str,
         message: str,
         retryable: bool,
-    ) -> Job | None:
-        job = self.get_job(job_id)
-        if job is None:
-            return None
-
-        job.status = JobStatus.FAILED
-        job.updated_at = datetime.now(timezone.utc)
-
-        first_stage = next(
-            (stage for stage in job.stage_progress if stage.stage_id == PipelineStep.A0),
-            None,
+    ) -> None:
+        """Mark job FAILED and stamp the A0 stage with the error detail."""
+        error_json = json.dumps(
+            {"code": code, "message": message, "stage": None, "retryable": retryable}
         )
-        if first_stage is not None:
-            first_stage.status = StageStatus.FAILED
-            first_stage.error_detail = json.dumps(
-                {
-                    "code": code,
-                    "message": message,
-                    "stage": None,
-                    "retryable": retryable,
-                }
-            )
 
+        self.session.execute(
+            sa_update(Job)
+            .where(Job.job_id == job_id)
+            .values(status=JobStatus.FAILED, updated_at=datetime.now(timezone.utc))
+        )
+        self.session.execute(
+            sa_update(StageProgress)
+            .where(
+                StageProgress.job_id == job_id,
+                StageProgress.stage_id == PipelineStep.A0,
+            )
+            .values(status=StageStatus.FAILED, error_detail=error_json)
+        )
         self.session.commit()
-        return self.get_job(job_id)
 
     def delete_job(self, job_id: str) -> bool:
         """Remove job and cascaded stage/retry/log rows."""

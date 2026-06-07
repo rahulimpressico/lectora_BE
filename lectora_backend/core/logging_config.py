@@ -60,6 +60,10 @@ def configure_logging(options: Optional[LoggingOptions] = None) -> None:
         handler.addFilter(_RunContextFilter())
         root.addHandler(handler)
 
+    # Ensure all application loggers under lectora_backend emit at the configured level
+    app_level = getattr(logging, opts.level.upper(), logging.INFO)
+    logging.getLogger("lectora_backend").setLevel(app_level)
+
     # Reduce Azure SDK noise (still overrideable by env if needed)
     logging.getLogger("azure").setLevel(
         getattr(logging, opts.azure_sdk_level.upper(), logging.WARNING)

@@ -11,7 +11,7 @@ class AzureOpenAIClient:
         self._client = AsyncAzureOpenAI(
             azure_endpoint=settings.azure_openai_endpoint,
             api_key=settings.azure_openai_api_key,
-            api_version="2024-02-15-preview",
+            api_version="2025-01-01-preview",
         )
         self._deployment = settings.azure_openai_deployment
 

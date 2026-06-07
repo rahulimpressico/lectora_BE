@@ -21,12 +21,10 @@ class PipelineStep(str, enum.Enum):
     A0 = "A0"
     A1 = "A1"
     S1 = "S1"
+    SECTION_MAPPER = "SECTION_MAPPER"
+    KC_PLANNER = "KC_PLANNER"
     A2 = "A2"
-    A3 = "A3"
-    A4 = "A4"
-    A5 = "A5"
     S2 = "S2"
-    A6 = "A6"
 
 
 class ValidationOutcome(str, enum.Enum):

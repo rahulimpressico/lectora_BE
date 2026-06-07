@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models for jobs and stages."""
-from sqlalchemy import Column, String, ForeignKey, Integer, Text, DateTime, Enum as SAEnum
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship                                
+from sqlalchemy import Column, String, ForeignKey, Integer, Text, DateTime, Enum as SAEnum, UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from lectora_backend.models.job_enums import (
     JobStatus,
     PipelineStep,
@@ -83,6 +83,7 @@ class RetryHistory(Base):
     outcome: Mapped[StageStatus] = mapped_column(SAEnum(StageStatus), nullable=False)
 
     job: Mapped["Job"] = relationship("Job", back_populates="retry_history")
+    __table_args__ = (UniqueConstraint('job_id', 'attempt', name='uq_retry_job_attempt'),)
 
 
 class JobLog(Base):
@@ -90,7 +91,7 @@ class JobLog(Base):
     __tablename__ = "job_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    job_id: Mapped[str] = mapped_column(String(64), ForeignKey("jobs.job_id"), nullable=False, index=True)
+    job_id: Mapped[str] = mapped_column(String(64), ForeignKey("jobs.job_id", ondelete="CASCADE"), nullable=False, index=True)
     stage_id: Mapped[str | None] = mapped_column(String(16), nullable=True)
     level: Mapped[str] = mapped_column(String(16), nullable=False, default="info")
     message: Mapped[str] = mapped_column(Text, nullable=False)

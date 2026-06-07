@@ -42,17 +42,21 @@ class LLMConfig:
     Holds all per-agent model settings.
 
     Attributes:
-        deployment:   Azure deployment name (agent-specific, NOT from .env).
-        temperature:  Passed through when set (default ``None`` = API default).
-        max_tokens:   Max completion tokens when set.
-        top_k:        Sampling top-k when set (e.g. ``1`` for greedy-ish decoding).
-
+        deployment:     Azure deployment name (agent-specific, NOT from .env).
+        temperature:    Passed through when set (default ``None`` = API default).
+        max_tokens:     Max completion tokens when set.
+        top_k:          Sampling top-k when set (e.g. ``1`` for greedy-ish decoding).
+        response_format: When set, passed directly to the API (e.g.
+                         ``{"type": "json_object"}`` to enforce JSON output).
+                         Only supported by non-o-series models (gpt-4o, gpt-5.x, etc.).
+                         Do NOT set on o3/o1 deployments — they will raise an API error.
     """
 
     deployment: str
     temperature: float | None = None
     max_tokens: int | None = None
     top_k: int | None = None
+    response_format: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -111,15 +115,32 @@ def chat(
     if config.temperature is not None:
         create_kwargs["temperature"] = config.temperature
     if config.max_tokens is not None:
+        # Azure OpenAI uses max_completion_tokens for all modern deployments
+        # (both o-series and gpt-5.x+). The legacy max_tokens parameter is not
+        # accepted by gpt-5.4 or o-series models on this API version.
         create_kwargs["max_completion_tokens"] = config.max_tokens
     if config.top_k is not None:
         create_kwargs["top_k"] = config.top_k
+    if config.response_format is not None:
+        create_kwargs["response_format"] = config.response_format
+
+    # Azure OpenAI requires "json" to appear in the messages when
+    # response_format={"type": "json_object"} is set, regardless of casing.
+    # Append a one-line guarantee so custom prompts never trigger the 400 error.
+    effective_system_prompt = system_prompt
+    if (
+        config.response_format is not None
+        and config.response_format.get("type") == "json_object"
+        and "json" not in system_prompt.lower()
+        and "json" not in user_msg.lower()
+    ):
+        effective_system_prompt = system_prompt + "\n\nRespond with a valid JSON object only."
 
     try:
         response = client.chat.completions.create(
             model=config.deployment,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": effective_system_prompt},
                 {"role": "user", "content": user_msg},
             ],
             **create_kwargs,
@@ -137,7 +158,7 @@ def chat(
         write_trace(LLMTrace(
             agent=agent,
             deployment=config.deployment,
-            system_prompt=system_prompt,
+            system_prompt=effective_system_prompt,
             user_msg=user_msg,
             response=response_text,
             latency_ms=latency_ms,

@@ -293,13 +293,13 @@ class A2ContentGenerator:
             if isinstance(raw_paths, list) and raw_paths:
                 effective_paths = [p for p in raw_paths if isinstance(p, str)]
 
-        if effective_paths and len(effective_paths) > 1:
+        if effective_paths and len(effective_paths) >= 1:
             try:
                 from lectora_backend.pipeline.agent.a0_request_synthesizer.utils.chunker import (
                     chunk_files,
                 )
                 existing_paths = [p for p in effective_paths if Path(p).exists()]
-                if len(existing_paths) > 1:
+                if len(existing_paths) >= 1:
                     source_chunks = chunk_files(existing_paths)
                     logger.info(
                         "[A2] Built %d chunks from %d source files for topic-wise retrieval.",

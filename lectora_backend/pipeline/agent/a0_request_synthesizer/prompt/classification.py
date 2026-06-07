@@ -130,6 +130,63 @@ _GENERATE_TO_format = {
     "totals": {"word_count": "", "minutes": "", "credit_hours": ""},
 }
 
+# ── Shared SOURCE CONTENT FORMAT block ──────────────────────────────────────
+# Injected into BOTH GENERATE_TO_PROMPT and build_dynamic_to_prompt so the LLM
+# always knows how to read FORMAT A (TOC) and FORMAT B (flat indexed) user messages.
+_SOURCE_CONTENT_FORMAT_BLOCK = """\
+═══════════════════════════════════════════════════════════
+SOURCE CONTENT FORMAT
+═══════════════════════════════════════════════════════════
+The user message will contain ONE of two content formats:
+
+FORMAT A — DOCUMENT TABLE OF CONTENTS WITH MAPPED SECTION CONTENT (preferred)
+   Provided when the source DOCX contains an explicit Table of Contents.
+   Contains two sub-blocks:
+
+   a) TOC Hierarchy
+      Each line: [L<level>] <heading_text> (para <start>–<end>)
+        L1 = top-level section / chapter
+        L2 = sub-section
+        L3+ = deeper nesting
+      This is the document's own structural intent — use it as your starting point.
+      IMPORTANT: if the user message includes a "STRICT TOC TITLE LOCK MODE" block,
+      that block overrides any merge/drop/title-rewrite guidance for FORMAT A.
+
+   b) Per-Section Content
+      Each section header: ### [L<level>] <title> · para <start>–<end>
+      Followed by [P<N>]-prefixed paragraphs from that section's body text.
+
+   HOW TO USE FORMAT A:
+     • Map every L1 TOC entry that passes the trainer's test → one top-level section
+     • Map L2 entries → subtopics of their parent L1 section
+     • Deeper levels (L3+) → nested subtopic strings inside L2 where genuinely distinct
+     • Merge L1 entries that cover the same concept into one section
+     • Drop L1 entries that fail the trainer's test (pure background, duplicates, admin)
+     • Use the para ranges shown in "## TOC Hierarchy" for para_idx_start / para_idx_end
+     • Derive "content" and "subtopics" from the section's actual body paragraphs
+     • Do NOT invent topics not grounded in the source
+
+FORMAT B — FLAT INDEXED CONTENT + OPTIONAL HEADING STRUCTURE (fallback)
+   Used when no TOC is present in the source document.
+
+   a) DOCUMENT HEADING STRUCTURE (optional)
+      Format: [L<level>] <heading_text>  (L1 = top-level, L2 = sub-topic)
+      Treat as raw material, not final structure. Apply trainer's mindset:
+        • Keep headings that represent critical, actionable knowledge
+        • Merge closely related headings into one lesson
+        • Cut headings that are trivial, duplicated, or purely administrative
+
+   b) SOURCE DOCUMENT CONTENT (with paragraph indices)
+      Multiple files separated by ``--- Document: <filename> ---`` headers.
+      Lines prefixed with [P<N>] where N is the paragraph index in that file.
+      Use indices from the matching document block for para_idx_start / para_idx_end.
+
+COURSE TYPE CONTEXT (optional, either format)
+   A domain hint (e.g. "Washington LTC Compliance"). When present:
+     • Sharpen your topic selection to what matters specifically in that domain
+     • Use precise domain terminology from the source\
+"""
+
 GENERATE_TO_PROMPT = f"""\
 IMPORTANT: Your response MUST be a single valid JSON object ONLY.
 Do NOT output markdown, headings, prose, or any text outside the JSON object.
@@ -185,63 +242,7 @@ LEARNING OBJECTIVES:
   Remove vague objectives like "understand the importance of X" — replace with
   something a student can actually demonstrate.
 
-═══════════════════════════════════════════════════════════
-SOURCE CONTENT FORMAT
-═══════════════════════════════════════════════════════════
-The user message will contain ONE of two content formats:
-
-FORMAT A — DOCUMENT TABLE OF CONTENTS WITH MAPPED SECTION CONTENT (preferred)
-   Provided when the source DOCX contains an explicit Table of Contents.
-   Contains two sub-blocks:
-
-   a) TOC Hierarchy
-      Each line: [L<level>] <heading_text> (para <start>–<end>)
-        L1 = top-level section / chapter
-        L2 = sub-section
-        L3+ = deeper nesting
-      This is the document's own structural intent — use it as your starting point,
-      but apply the trainer's mindset above to decide what stays, merges, or drops.
-      IMPORTANT: if the user message includes a "STRICT TOC TITLE LOCK MODE" block,
-      that block overrides the generic merge/drop/title-rewrite guidance for FORMAT A.
-
-   b) Per-Section Content
-      Each section header: ### [L<level>] <title> · para <start>–<end>
-      Followed by [P<N>]-prefixed paragraphs from that section's body text.
-
-   HOW TO USE FORMAT A:
-     • Map every L1 TOC entry that passes the trainer's test → one top-level section
-     • Map L2 entries → subtopics of their parent L1 section
-     • Deeper levels (L3+) → nested subtopic strings inside L2 where genuinely distinct
-     • Merge L1 entries that cover the same concept into one section
-     • Drop L1 entries that fail the trainer's test (pure background, duplicates, admin)
-     • Use the [P<N>] indices shown in the section header for
-       para_idx_start (first [P<N>] in that block) and
-       para_idx_end   (last  [P<N>] in that block)
-     • Derive "content" and "subtopics" from the section's actual body paragraphs
-     • Do NOT invent topics not grounded in the source
-
-FORMAT B — FLAT INDEXED CONTENT + OPTIONAL HEADING STRUCTURE (fallback)
-   Used when no TOC is present in the source document.
-
-   a) DOCUMENT HEADING STRUCTURE (optional)
-      Format: [L<level>] <heading_text>  (L1 = top-level, L2 = sub-topic)
-      Treat as raw material, not final structure. Apply trainer's mindset:
-        • Keep headings that represent critical, actionable knowledge
-        • Merge closely related headings into one lesson
-        • Elevate sub-headings if they represent a major standalone topic
-        • Cut headings that are trivial, duplicated, or purely administrative
-        • Re-order for the most effective learning flow (simple → complex → applied)
-
-   b) SOURCE DOCUMENT CONTENT (with paragraph indices)
-      Multiple files separated by ``--- Document: <filename> ---`` headers.
-      Lines prefixed with [P<N>] where N is the paragraph index in that file.
-      Use indices from the matching document block for para_idx_start / para_idx_end.
-
-COURSE TYPE CONTEXT (optional, either format)
-   A domain hint (e.g. "Washington LTC Compliance"). When present:
-     • Sharpen your topic selection to what matters specifically in that domain
-     • Cut topics that are generic background unrelated to that domain
-     • Use precise domain terminology from the source
+{_SOURCE_CONTENT_FORMAT_BLOCK}
 
 ═══════════════════════════════════════════════════════════
 CONTENT SELECTION RULES
@@ -342,26 +343,6 @@ Output ONLY valid JSON. No explanation. No markdown fences.
 """
 
 
-_DIFFICULTY_WORD_DIVISORS: dict[str, float] = {
-    "basic": 1.0,
-    "intermediate": 1.25,
-    "advanced": 1.5,
-}
-DEFAULT_TO_DURATION_HOURS = 3
-
-
-def compute_calculated_word_count(
-    duration_hours: int | float,
-    difficulty_level: str,
-) -> int:
-    """Target course word count: (duration_hours × 9,000) / difficulty multiplier."""
-    mult = _DIFFICULTY_WORD_DIVISORS.get(
-        (difficulty_level or "intermediate").strip().lower(),
-        1.25,
-    )
-    return max(1, int(round((float(duration_hours) * 9000) / mult)))
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Dynamic TO generation helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -391,21 +372,98 @@ def build_dynamic_to_prompt(
     duration_hours: int | float,
     difficulty_level: str,
     calculated_word_count: int,
+    audience: str | None = None,
 ) -> str:
     """Build the dynamic system prompt for LLM-based TO generation.
 
-    Used when the user selects a course duration and difficulty level from the
-    UI.  The LLM receives the uploaded file content directly alongside this
-    prompt and generates the full Timed Outline JSON.
+    Used when the user selects a course duration, difficulty level, and (optionally)
+    target audience from the UI.  The LLM receives the structured document content
+    (heading_tree or TOC hierarchy) in the user message alongside this prompt.
 
-    Formula (embedded in the prompt for the LLM):
-      180 words = 1 minute
-      50 minutes = 1 CE hour
-      9,000 words = 1 CE hour (base)
-      Difficulty multipliers: Basic 1×, Intermediate 1.25×, Advanced 1.5×
-      total_words = (duration_hours × 9,000) / multiplier
+    Args:
+        duration_hours:        Course duration selected by the user (e.g. 3).
+        difficulty_level:      "basic" | "intermediate" | "advanced".
+        calculated_word_count: Target total words = (duration_hours × 9000) / multiplier.
+        audience:              Target audience string from the audience popup (e.g.
+                               "trained insurance agents"). When provided, the prompt
+                               instructs the LLM to tailor topic selection, examples,
+                               vocabulary, and learning objectives for this audience.
     """
     _difficulty_cap = difficulty_level.strip().capitalize()
+    _difficulty_low = difficulty_level.strip().lower()
+
+    # Per-difficulty behavioral guidance injected into the prompt so the LLM
+    # knows how to adjust depth, breadth, vocabulary, and example density.
+    _DIFFICULTY_GUIDANCE: dict[str, str] = {
+        "basic": (
+            "BASIC level — treat the student as a complete beginner:\n"
+            "  • SELECT foundational concepts only — what every practitioner must know from day one.\n"
+            "  • AVOID advanced regulatory nuance, edge cases, and complex cross-references.\n"
+            "  • USE plain language; define every industry term the first time it appears.\n"
+            "  • INCLUDE more worked examples and scenario-based subtopics than you would at higher levels.\n"
+            "  • KEEP sections focused on a single core concept per lesson — no dense multi-concept sections.\n"
+            "  • OMIT topics that require prior regulatory or product knowledge to understand."
+        ),
+        "intermediate": (
+            "INTERMEDIATE level — student has foundational knowledge; deepen without overwhelming:\n"
+            "  • SELECT topics that build on core principles — mechanics, application, and compliance practice.\n"
+            "  • INCLUDE some regulatory nuance and practical scenarios, but anchor each in a concrete example.\n"
+            "  • BALANCE breadth and depth — cover more ground than Basic but go deeper on the most critical topics.\n"
+            "  • ASSUME familiarity with key terms; define only specialized or context-specific terminology.\n"
+            "  • SEQUENCE from concept → applied rule → real-world implication within each section."
+        ),
+        "advanced": (
+            "ADVANCED level — student is an experienced professional; provide analytical depth:\n"
+            "  • SELECT topics that cover regulatory edge cases, exceptions, compliance judgment calls, and\n"
+            "    complex cross-product or cross-regulatory interactions.\n"
+            "  • GO DEEP on nuance — explain WHY rules exist and how they interact, not just WHAT they say.\n"
+            "  • INCLUDE analysis-level subtopics: suitability determinations, disclosure obligations under\n"
+            "    specific fact patterns, regulatory gray areas.\n"
+            "  • USE professional terminology without simplification; the student can handle it.\n"
+            "  • PRIORITIZE application, analysis, and evaluation over definitional content.\n"
+            "  • INCLUDE subtopics on common compliance failures and how to avoid them."
+        ),
+    }
+    _diff_guidance = _DIFFICULTY_GUIDANCE.get(
+        _difficulty_low,
+        _DIFFICULTY_GUIDANCE["intermediate"],
+    )
+
+    # Duration-based section count guidance — prevents the LLM from generating
+    # 15 sections for a 1-hour course or 4 sections for a 5-hour course.
+    _SECTION_BUDGET: dict[int, tuple[int, int]] = {
+        1: (3, 5),
+        2: (5, 8),
+        3: (8, 12),
+        4: (10, 15),
+        5: (12, 18),
+    }
+    _dur_int = max(1, min(5, int(round(float(duration_hours)))))
+    _sec_min, _sec_max = _SECTION_BUDGET.get(_dur_int, (8, 12))
+
+    # Audience block — only injected when an audience is specified.
+    _audience_block = ""
+    if audience and audience.strip():
+        _audience_block = f"""\
+═══════════════════════════════════════════════════════════
+TARGET AUDIENCE
+═══════════════════════════════════════════════════════════
+Audience: {audience.strip()}
+
+Tailor EVERY decision below for this specific audience:
+  • TOPIC SELECTION  — Include topics this audience encounters on the job or in
+    their regulatory environment. Exclude topics that are irrelevant to their role.
+  • VOCABULARY       — Use the terminology this audience is trained in. Avoid
+    dumbing down if they are professionals; avoid jargon if they are newcomers.
+  • EXAMPLES         — Ground every scenario in a situation this audience faces
+    (e.g. for insurance agents: client suitability conversations, policy endorsements,
+    state DOI filings; for broker-dealer reps: FINRA exam prep, AML procedures).
+  • LEARNING OBJECTIVES — Write objectives as outcomes this audience will apply
+    in their specific professional context, not generic knowledge statements.
+  • PREREQUISITES    — Assume the knowledge and experience level appropriate
+    for this audience; neither over-explain nor under-explain.
+
+"""
 
     _section_schema = {
         "title": "1. Introduction",
@@ -413,8 +471,10 @@ def build_dynamic_to_prompt(
         "subtopics": [],
         "word_count": 2200,
         "minutes": 12.22,
-        "credit_hours": 0.244,
+        "credit_hour": 0.244,
         "interactive_elements": [],
+        "para_idx_start": None,
+        "para_idx_end": None,
     }
     _subtopic_schema = {
         "title": "2.1 Community",
@@ -426,8 +486,8 @@ def build_dynamic_to_prompt(
     }
     _main_schema = {
         "course_title": "Course name",
-        "course_id": "533",
-        "description": "2-4 sentences explaining audience, learning outcomes, and importance",
+        "course_id": "",
+        "description": "2-4 sentences: who this course is for, what they will be able to do, why it matters",
         "learning_objectives": ["Explain ...", "Identify ..."],
         "sections": [_section_schema],
         "totals": {
@@ -443,87 +503,129 @@ IMPORTANT: Your response MUST be a single valid JSON object ONLY.
 Do NOT output markdown, headings, prose, or any text outside the JSON object.
 Start your response with "{{" and end with "}}". No code fences. No explanation.
 
-These are the source files for a professional continuing education course.
+You are a seasoned industry trainer and curriculum designer. The user message contains
+course content extracted from source documents. Your task: design a Timed Outline (TO)
+that an instructor could teach in exactly the time and at the depth specified below.
 
-Generate a professional continuing education course outline based on the content of all uploaded source documents.
-
+{_audience_block}\
 ═══════════════════════════════════════════════════════════
 COURSE CONFIGURATION
 ═══════════════════════════════════════════════════════════
 Course Duration:   {duration_hours} hour{'s' if duration_hours != 1 else ''}
 Difficulty Level:  {_difficulty_cap}
-Target Word Count: {calculated_word_count:,} words  (calculated from duration + difficulty)
+Target Word Count: {calculated_word_count:,} words
+Section Budget:    {_sec_min}–{_sec_max} top-level sections for a {duration_hours}-hour course
 
 ═══════════════════════════════════════════════════════════
-CREDIT / WORD COUNT FORMULA (for your reference)
+DIFFICULTY REQUIREMENTS — {_difficulty_cap.upper()}
 ═══════════════════════════════════════════════════════════
-180 words  = 1 minute of reading
-50 minutes = 1 CE hour
-9,000 words = 1 CE hour (base)
-
-Difficulty multipliers:
-  Basic        → 1.00×
-  Intermediate → 1.25×
-  Advanced     → 1.50×
-
-Calculation used for this course:
-  base_words = {duration_hours} × 9,000 = {int(duration_hours * 9000):,}
-  total_words = base_words / multiplier  = {calculated_word_count:,}
-
-Rounding rule:
-  fractional ≥ .50 → round up
-  fractional ≤ .49 → round down
+{_diff_guidance}
 
 ═══════════════════════════════════════════════════════════
-TASK — GENERATE TABLE OF CONTENTS
+DURATION & TOPIC SELECTION RULES
 ═══════════════════════════════════════════════════════════
-Create a complete Training Outline (TO) that covers all important topics and
-subtopics found in the uploaded source files.
+This is a {duration_hours}-hour course. Every topic selection decision must be made
+with this constraint in mind:
 
-CRITICAL TITLE RULES — strictly enforced:
-  1. Any title or heading extracted from the source files MUST remain EXACTLY
-     as written in the source.  Do NOT rename, paraphrase, beautify, merge,
-     split, or reorder them.
-  2. Do NOT modify heading wording or capitalize/lowercase titles differently.
-  3. Preserve source terminology exactly — including abbreviations and
-     domain-specific phrases.
-  4. STRIP any trailing "page N" / "pg N" / "p. N" reference from EVERY title
-     (both section titles and subtopic titles).
-     Examples:
-       "1.0 Anywhere There Is Water page 1"  →  "1.0 Anywhere There Is Water"
-       "2.3 Ineligible Property page 3"      →  "2.3 Ineligible Property"
-       "5.6 Cancellations pg 22"             →  "5.6 Cancellations"
+  1. TARGET {_sec_min}–{_sec_max} SECTIONS. A {duration_hours}-hour course cannot
+     adequately cover more than {_sec_max} topics. If the source has more candidates,
+     select only the most critical ones and merge or drop the rest.
 
-WORD COUNT DISTRIBUTION:
-  Distribute the total target word count ({calculated_word_count:,} words)
-  proportionally across all sections and subtopics, weighted by the relative
-  depth and importance of each topic in the source material.
+  2. PRIORITIZE ruthlessly:
+       ✔ Topics that directly affect job performance or compliance obligations
+       ✔ Topics that students will encounter within the first 90 days on the job
+       ✔ Topics explicitly required by the regulatory CE standard for this family
+       ✗ Background history that does not affect current practice
+       ✗ Topics covered in prerequisites or other courses in the series
+       ✗ Administrative details that belong in a reference manual
 
-CONTENT & STRUCTURAL RULES:
-  - Cover all important topics from ALL uploaded files.
-  - Sequence sections logically: foundational → core concepts → application →
-    compliance edge cases.
-  - 3–6 subtopics per section is ideal; more than 8 signals over-splitting.
-  - minutes     = round(word_count / 180, 2)
-  - credit_hour = round(minutes / 50, 3)
-  - Totals      = sum of all section values
+  3. BALANCE: allocate more word count to complex, high-stakes topics and less
+     to foundational or transitional ones. A section's word count should reflect
+     its instructional weight, not just its presence in the source document.
 
-KNOWLEDGE CHECK RULE — CRITICAL:
-  - NEVER add "Knowledge Check" as a subtopic entry (not as a string, not as
-    an object).
-  - If "Knowledge Check" appears in the source as a section or subtopic, add
-    "knowledge_check" to the PARENT section's "interactive_elements" list.
-  - All other "interactive_elements" remain [] — KC Planner handles placement
-    downstream.
+  4. COMPLETE COVERAGE: ensure all major subject areas in the source are
+     represented — do not omit an entire chapter or regulatory domain just
+     because other topics are more interesting. If a topic is too thin for its
+     own section, merge it as a subtopic of the nearest related section.
 
-RESERVED SECTION RULE — CRITICAL:
-  - "Overview", "Introduction", "Learning Objectives", "Learning Outcomes",
-    "Course Objectives", "Summary", "Assessment" are structural placeholders —
-    do NOT create them as content lessons.
-  - Capture their content in the "description" / "learning_objectives" fields.
-  - If one of these titles unavoidably appears as a section, its "subtopics"
-    MUST be [] (empty).  Never nest course topics as subtopics under
-    "Learning Objectives" or "Overview".
+═══════════════════════════════════════════════════════════
+TRAINER'S MINDSET — READ BEFORE SELECTING TOPICS
+═══════════════════════════════════════════════════════════
+Think of yourself as a trainer standing in front of this exact audience for exactly
+{duration_hours} hour{'s' if duration_hours != 1 else ''}. Before writing any section title, ask:
+
+  "If I had only this time with these students, which topics would they absolutely
+   need to walk away confident and competent — and which could I cut without
+   hurting them professionally?"
+
+ONLY include a topic if it passes at least one of:
+  ✔  Students WILL encounter this on the job or in a real compliance scenario.
+  ✔  Misunderstanding this concept causes real-world mistakes or regulatory failures.
+  ✔  This is a prerequisite that unlocks understanding of a later critical topic.
+
+EXCLUDE a topic if it is:
+  ✗  Background trivia professionals already know or can look up in 30 seconds.
+  ✗  A near-duplicate of another section (same concept, different wording).
+  ✗  Regulatory history with no bearing on current practice.
+  ✗  An administrative detail that belongs in a reference manual, not a course.
+
+═══════════════════════════════════════════════════════════
+WORD COUNT & CREDIT FORMULA
+═══════════════════════════════════════════════════════════
+180 words  = 1 reading minute
+50 minutes = 1 CE credit hour
+9,000 words = 1 base CE hour
+
+Difficulty multipliers (NAIC CE):
+  Basic        1.00× → {int(1 * 9000)} base words/hr
+  Intermediate 1.25× → {int(1.25 * 9000)} base words/hr
+  Advanced     1.50× → {int(1.5 * 9000)} base words/hr
+
+This course: {duration_hours} × 9,000 / {_DIFFICULTY_MULTIPLIERS[_difficulty_low]}× = {calculated_word_count:,} words
+
+Distribute {calculated_word_count:,} words proportionally across sections weighted
+by topic depth and importance. Each section's word count drives its minutes and
+credit_hour values.
+
+{_SOURCE_CONTENT_FORMAT_BLOCK}
+
+═══════════════════════════════════════════════════════════
+STRUCTURAL & OUTPUT RULES
+═══════════════════════════════════════════════════════════
+CURRICULUM QUALITY:
+  1. SELECT CRITICALLY — trainer's test above; cut low-value topics
+  2. MERGE — combine headings teaching the same concept into one section
+  3. DEDUPLICATE — never two sections on the same concept
+  4. SEQUENCE — foundational definitions → core mechanics → application → compliance edge cases
+  5. TITLE PROFESSIONALLY — titles a trainer would use in a real training catalogue
+
+SECTION PACING:
+  - Each section covers one coherent topic (typically 10–25 minutes of instruction)
+  - 3–6 subtopics per section is ideal; more than 8 signals over-splitting
+  - Subtopics flow: context → concept → application
+
+SOURCE FIDELITY — CRITICAL:
+  Any title or heading from the source MUST remain EXACTLY as written.
+  Do NOT rename, paraphrase, beautify, merge, or modify wording.
+  STRIP trailing "page N" / "pg N" / "p. N" from ALL titles.
+  Examples:
+    "1.0 Anywhere There Is Water page 1"  →  "1.0 Anywhere There Is Water"
+    "5.6 Cancellations pg 22"             →  "5.6 Cancellations"
+
+RESERVED SECTIONS — NEVER create as content lessons:
+  "Overview", "Introduction", "Learning Objectives", "Learning Outcomes",
+  "Course Objectives", "Summary", "Assessment"
+  → Capture in "description" / "learning_objectives" fields instead.
+
+KNOWLEDGE CHECKS:
+  - NEVER add "Knowledge Check" as a subtopic entry.
+  - If a KC appears in the source, add "knowledge_check" to the PARENT section's
+    "interactive_elements" list. All other "interactive_elements" stay [].
+
+TIMING FORMULAS:
+  minutes     = round(word_count / 180, 2)
+  credit_hour = round(minutes / 50, 3)
+  Totals      = sum of all section values (target ≈ {calculated_word_count:,} words)
 
 ═══════════════════════════════════════════════════════════
 OUTPUT FORMAT — return ONLY valid JSON, no markdown fences
@@ -537,29 +639,26 @@ Subtopic schema (use when subtopic has its own timing data):
 {_json.dumps(_subtopic_schema, indent=2)}
 
 SUBTOPICS — OBJECTS vs PLAIN STRINGS:
-  - When a subtopic has its own word count / timing → emit as an object using
-    the subtopic schema above.
-  - When a subtopic has no timing data → a plain title string is acceptable.
-  - NEVER include "Knowledge Check" entries in subtopics (see rule above).
-  - Example — subtopic with timing:
-      {{"title": "2.1 Community", "content": "", "word_count": 72,
-        "minutes": 0.4, "credit_hour": 0.008, "interactive_elements": []}}
-  - Example — subtopic without timing (plain string):
-      "2.2 Eligible Buildings"
+  - Subtopic with own word count / timing → emit as object (subtopic schema above).
+  - Subtopic with no timing data → plain title string is acceptable.
+  - NEVER include "Knowledge Check" in subtopics.
 
 FIELD RULES:
-- "course_title": derived from the primary source document title
+- "course_title": derive from primary source document title
 - "course_id": course ID from source if present, else ""
 - "description": 2–4 sentence professional summary (audience, outcomes, importance)
 - "learning_objectives": measurable action-verb statements (Bloom's Taxonomy verbs)
-- "sections": ordered lesson list
-  - "title": keep EXACTLY as it appears in the source (page refs stripped)
+  tailored to the target audience and difficulty level
+- "sections": ordered lesson list — only sections that pass the trainer's test
+  - "title": EXACTLY as in source (page refs stripped)
   - "content": trainer-style objective — "Students will learn to [action] …"
   - "subtopics": objects (preferred) or plain strings; NEVER includes KC entries
   - "word_count": integer — proportional share of {calculated_word_count:,} total
   - "minutes": float — word_count / 180
-  - "credit_hours": float — minutes / 50
+  - "credit_hour": float — minutes / 50
   - "interactive_elements": [] unless KC found in source (then ["knowledge_check"])
+  - "para_idx_start": integer index of first paragraph (from [P<N>] tags); null if absent
+  - "para_idx_end": integer index of last paragraph (inclusive); null if absent
 - "totals": sums across all sections (target total ≈ {calculated_word_count:,} words)
 
 Return ONLY valid JSON.  No explanation.  No markdown fences.

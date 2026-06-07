@@ -10,6 +10,7 @@ Overrides are persisted to ``model_overrides.json`` next to this file.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -26,6 +27,7 @@ _lock = threading.Lock()
 
 DEFAULTS: dict[str, str] = {
     "A0": "o3",
+    "A0_TO": "gpt-5.4",   # Responses API file upload (TO generation) — larger context window
     "A1": "gpt-5.4-mini",
     "A2": "gpt-5.4",
 }
@@ -49,8 +51,14 @@ AVAILABLE_MODELS: list[dict] = [
 
 AGENT_META: dict[str, dict] = {
     "A0": {
-        "name": "Request Synthesizer",
-        "role": "Extracts metadata, classifies rule family, generates & parses timed outline",
+        "name": "Request Synthesizer — Classify",
+        "role": "Classifies rule family (insurance_ce / iarce / firm_element) from course title, objectives, and content sample",
+        "pipeline_step": 1,
+        "supports_temperature": False,
+    },
+    "A0_TO": {
+        "name": "Request Synthesizer — TO Generation",
+        "role": "Generates Timed Outline from DOCX + PDF extracted text (large context required)",
         "pipeline_step": 1,
         "supports_temperature": False,
     },
@@ -100,6 +108,24 @@ def get_deployment(agent_id: str) -> str:
     """Return the effective deployment for *agent_id*, respecting any override."""
     overrides = _read_overrides()
     return overrides.get(agent_id) or DEFAULTS.get(agent_id, "gpt-5.4")
+
+
+def get_to_file_deployment() -> str:
+    """Deployment for A0 TO generation via Responses API file upload.
+
+    Resolution order:
+    1. ``A0_TO_FILE_DEPLOYMENT`` env var (explicit override)
+    2. ``A0_TO`` registry override (set via settings API)
+    3. ``A0_TO`` default (``gpt-5.4`` — larger context window for large PDFs)
+
+    ``gpt-5.4`` is used instead of the A0 reasoning model (``o3``) because TO
+    generation sends full source files and needs a larger context window.
+    Override via ``A0_TO_FILE_DEPLOYMENT`` env var if needed.
+    """
+    explicit = os.environ.get("A0_TO_FILE_DEPLOYMENT", "").strip()
+    if explicit:
+        return explicit
+    return get_deployment("A0_TO")
 
 
 def get_all_configs() -> list[dict]:

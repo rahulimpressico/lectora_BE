@@ -171,12 +171,21 @@ def _apply_scenario_b(
             continue
 
         # Find the best placement: last subtopic that is not a summary/conclusion
+        found_target = False
         target_idx = len(subtopics) - 1
         for j in range(len(subtopics) - 1, -1, -1):
             heading = subtopics[j].get("title", subtopics[j].get("heading", ""))
             if not (_SUMMARY_RE.search(heading) or _INTRO_RE.search(heading)):
                 target_idx = j
+                found_target = True
                 break
+
+        if not found_target:
+            logger.warning(
+                "[KCPlanner] All subtopics in '%s' are summary/intro — skipping KC placement",
+                lesson.get("title", ""),
+            )
+            continue
 
         subtopics[target_idx]["has_knowledge_check"] = True
         _ensure_kc_in_ie(subtopics[target_idx])
@@ -303,9 +312,13 @@ def run(shared_state_path: str) -> dict[str, Any]:
         .get("A1", {})
         .get("course_spec", {})
     )
+    sections = course_spec.get("sections")
+    if sections is None:
+        raise RuntimeError("[KCPlanner] course_spec missing 'sections' key — A1 output may be corrupted")
+    if not sections:
+        logger.warning("[KCPlanner] course_spec has empty sections list")
     raw_doc_has_kcs = any(
-        s.get("has_knowledge_check", False)
-        for s in course_spec.get("sections", [])
+        s.get("has_knowledge_check", False) for s in (sections or [])
     )
     logger.info("[KCPlanner] Raw doc has KCs: %s", raw_doc_has_kcs)
 
@@ -325,7 +338,21 @@ def run(shared_state_path: str) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("[KCPlanner] Cannot read llm_to_outline.json (%s) — TO treated as absent", exc)
     else:
-        logger.info("[KCPlanner] llm_to_outline.json not found — TO absent")
+        logger.info("[KCPlanner] llm_to_outline.json not found — trying shared_state fallback")
+        inline = shared_state.get("llm_to_outline_classification") or {}
+        inline_sections = (
+            (inline.get("llm_to_outline") or {}).get("sections")
+            or inline.get("sections")
+            or []
+        )
+        if inline_sections:
+            to_sections = inline_sections
+            logger.info(
+                "[KCPlanner] Using inline llm_to_outline_classification from shared_state (%s lessons)",
+                len(to_sections),
+            )
+        else:
+            logger.info("[KCPlanner] No TO sections in shared_state either — TO absent")
 
     has_to = bool(to_sections)
 

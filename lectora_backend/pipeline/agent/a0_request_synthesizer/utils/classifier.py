@@ -223,6 +223,7 @@ def _build_to_user_message(
     course_difficulty: str = "intermediate",
     course_type_hint: str | None = None,
     calculated_word_count: int | None = None,
+    audience: str | None = None,
     validation_hints: str | None = None,
     all_doc_titles: list[str] | None = None,
 ) -> str:
@@ -236,6 +237,8 @@ def _build_to_user_message(
     parts.append(f"## Course Difficulty\n{course_difficulty}")
     if calculated_word_count:
         parts.append(f"## Target Word Count\n{calculated_word_count}")
+    if audience and audience.strip():
+        parts.append(f"## Target Audience\n{audience.strip()}")
     parts.append(f"## Course Title\n{title}")
     if all_doc_titles and len(all_doc_titles) > 1:
         parts.append(
@@ -325,6 +328,7 @@ def generate_to_with_llm(
     course_type_hint: str | None = None,
     duration_hours: int | float | None = None,
     calculated_word_count: int | None = None,
+    audience: str | None = None,
     custom_system_prompt: str | None = None,
     validation_hints: str | None = None,
     all_doc_titles: list[str] | None = None,
@@ -334,8 +338,10 @@ def generate_to_with_llm(
     Used when no TO document is provided (Scenario 2). Sends structured heading
     and content data to the LLM — not raw files.
 
-    For DOCX sources: passes heading_tree + indexed_content (FORMAT B).
-    For PDF sources with an embedded TOC: passes toc_section_contents (FORMAT A).
+    For DOCX with Word TOC (TOC 1/2/3 styles): passes toc_section_contents (FORMAT A —
+      TOC hierarchy + per-section snippets; full body not sent).
+    For DOCX without TOC: passes heading_tree + indexed_content (FORMAT B).
+    For PDF sources with an embedded TOC/bookmarks: passes toc_section_contents (FORMAT A).
     For PDF sources without a TOC: falls back to FORMAT B.
 
     System prompt priority:
@@ -353,6 +359,9 @@ def generate_to_with_llm(
         course_type_hint:      Optional domain context hint for topic selection.
         duration_hours:        Course duration (e.g. 3); used for dynamic prompt.
         calculated_word_count: Target total word count derived from duration + difficulty.
+        audience:              Target audience string (e.g. "trained insurance agents").
+                               Injected into the dynamic prompt and user message so the
+                               LLM tailors topic selection, vocabulary, and examples.
         custom_system_prompt:  When set, takes highest priority as the system prompt.
         validation_hints:      Optional S1/S2 retry feedback to embed in the request.
         all_doc_titles:        Titles extracted from every source doc (not just the first). Enables multi-doc title synthesis.
@@ -361,15 +370,21 @@ def generate_to_with_llm(
         Parsed ``llm_to_outline`` dict.
     """
     if custom_system_prompt:
+        # User-supplied free-text override — use as-is and log it clearly.
         system_prompt = custom_system_prompt.strip()
-        prompt_source = "custom"
+        prompt_source = "custom (user-supplied override)"
     elif duration_hours is not None and calculated_word_count is not None:
+        # Standard UI-driven flow: duration + difficulty + optional audience all present.
         system_prompt = build_dynamic_to_prompt(
             duration_hours=duration_hours,
             difficulty_level=course_difficulty,
             calculated_word_count=calculated_word_count,
+            audience=audience,
         )
-        prompt_source = f"dynamic (duration={duration_hours}h, words={calculated_word_count:,})"
+        prompt_source = (
+            f"dynamic (duration={duration_hours}h, words={calculated_word_count:,}, "
+            f"difficulty={course_difficulty}, audience={'set' if audience else 'none'})"
+        )
     else:
         system_prompt = GENERATE_TO_PROMPT
         prompt_source = "static (GENERATE_TO_PROMPT)"
@@ -413,6 +428,7 @@ def generate_to_with_llm(
         course_difficulty=course_difficulty,
         course_type_hint=course_type_hint,
         calculated_word_count=calculated_word_count,
+        audience=audience,
         validation_hints=validation_hints,
         all_doc_titles=all_doc_titles,
     )

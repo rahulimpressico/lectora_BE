@@ -106,6 +106,7 @@ class A0RequestSynthesizer:
         extra_text_contents: Optional[list[str]] = None,
         custom_to_prompt: Optional[str] = None,
         course_type_hint: Optional[str] = None,
+        audience: Optional[str] = None,
         step_logger: Optional[Callable[[str, str, str | None], None]] = None,
         *,
         docx_path: Optional[str] = None,
@@ -133,6 +134,7 @@ class A0RequestSynthesizer:
         self.extra_text_contents: list[str] = extra_text_contents or []
         self.custom_to_prompt: Optional[str] = custom_to_prompt
         self.course_type_hint: Optional[str] = course_type_hint
+        self.audience: Optional[str] = (audience or "").strip() or None
         self.course_output_slug = (course_output_slug or "").strip() or None
         self.step_logger = step_logger
 
@@ -539,10 +541,12 @@ class A0RequestSynthesizer:
 
             else:
                 # ── STRUCTURED CONTENT MODE: send extracted headings/TOC to LLM ──
-                # For DOCX sources: FORMAT B — heading_tree + [P<N>]-prefixed paragraphs.
-                # For PDF-only sources with an embedded TOC: FORMAT A — TOC entries
-                #   + per-section indexed content (anchored to para indices).
-                # For PDF-only sources without a TOC: FORMAT B fallback.
+                # Priority order for FORMAT selection:
+                #   1. DOCX with Word TOC (TOC 1/2/3 styles): FORMAT A — TOC hierarchy
+                #      + per-section snippets (pura body nahi, sirf TOC + capped content).
+                #   2. PDF-only with bookmarks/headings:       FORMAT A — same.
+                #   3. DOCX/PDF without any TOC:               FORMAT B — heading_tree
+                #      + full [P<N>]-prefixed indexed body (existing behaviour).
                 def _generate_to_from_structured(
                     _title=title,
                     _objectives=learning_objectives,
@@ -574,7 +578,28 @@ class A0RequestSynthesizer:
                             )
 
                     _toc_section_contents = None
-                    if pdf_parser and not parser:
+
+                    # ── DOCX TOC path (FORMAT A — preferred when Word TOC present) ──
+                    if parser:
+                        _docx_toc = parser.extract_toc_entries()
+                        if _docx_toc:
+                            _toc_budget = min(16_000, max(8_000, 40 * len(_docx_toc)))
+                            _toc_section_contents = parser.extract_toc_section_contents(
+                                _docx_toc, total_word_budget=_toc_budget
+                            )
+                            logger.info(
+                                "[A0] DOCX TOC: %d entries → FORMAT A "
+                                "(TOC hierarchy + section snippets; full body skipped)",
+                                len(_docx_toc),
+                            )
+                        else:
+                            logger.info(
+                                "[A0] DOCX: no Word TOC paragraphs (TOC 1/2/3 styles) found "
+                                "→ FORMAT B (heading_tree + full body)"
+                            )
+
+                    # ── PDF-only TOC path (FORMAT A — only when no DOCX TOC found) ──
+                    if not _toc_section_contents and pdf_parser and not parser:
                         # PDF-only: bookmark TOC + per-section snippets (FORMAT A)
                         _pdf_toc = pdf_parser.extract_toc_entries(
                             include_heading_fallback=True
@@ -608,7 +633,9 @@ class A0RequestSynthesizer:
                     return generate_to_with_llm(
                         _title,
                         _objectives,
-                        _indexed,
+                        # When FORMAT A (TOC) is active, full body is not sent to LLM.
+                        # Pass empty string so classifier.py logs show 0 indexed words.
+                        "" if _toc_section_contents else _indexed,
                         heading_tree=_htree,
                         pdf_toc_outline=_pdf_toc_outline,
                         toc_section_contents=_toc_section_contents,
@@ -616,6 +643,7 @@ class A0RequestSynthesizer:
                         course_type_hint=self.course_type_hint,
                         duration_hours=self.duration_hours,
                         calculated_word_count=self.calculated_word_count,
+                        audience=self.audience,
                         custom_system_prompt=self.custom_to_prompt,
                         validation_hints=hints_arg,
                         all_doc_titles=_all_doc_titles,
@@ -703,10 +731,25 @@ class A0RequestSynthesizer:
 
         rule_family_key = llm_result["rule_family"]
         if rule_family_key not in RULE_PACKS:
-            raise ValueError(
-                f"LLM returned unknown rule family '{rule_family_key}'. "
-                f"Valid: {list(RULE_PACKS.keys())}"
+            # Try partial / fuzzy match before hard-failing
+            _matched = next(
+                (k for k in RULE_PACKS if k in rule_family_key or rule_family_key in k),
+                None,
             )
+            if _matched:
+                logger.warning(
+                    "[A0] Unknown rule_family %r — falling back to matched key %r",
+                    rule_family_key,
+                    _matched,
+                )
+                rule_family_key = _matched
+            else:
+                logger.error(
+                    "[A0] Unknown rule_family %r (valid: %s) — defaulting to 'insurance_ce'",
+                    rule_family_key,
+                    list(RULE_PACKS.keys()),
+                )
+                rule_family_key = "insurance_ce"
         rule_pack = RULE_PACKS[rule_family_key]
         family_name = rule_pack["family"]
 
@@ -858,6 +901,12 @@ class A0RequestSynthesizer:
 
         logger.info("[A0] llm_to_outline written -> %s", llm_outline_path)
 
+        # Return the FINAL enriched+normalized outline dict, not the raw LLM
+        # output — enrich_outline_metrics and normalize_to_hierarchy may have
+        # produced a deep-copy with updated sections that llm_to_outline_result
+        # no longer reflects after those transformations.
+        final_llm_to_outline = llm_to_outline_payload.get("llm_to_outline") or llm_to_outline_result
+
         return A0Result(
             request_spec=request_spec,
             provenance_log=provenance_log,
@@ -869,5 +918,5 @@ class A0RequestSynthesizer:
                 llm_to_outline=str(llm_outline_path),
                 llm_to_outline_raw=str(llm_outline_copy_path),
             ),
-            llm_to_outline=llm_to_outline_result,
+            llm_to_outline=final_llm_to_outline,
         )

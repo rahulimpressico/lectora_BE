@@ -541,10 +541,9 @@ def _insert_image(doc, img: dict, max_width_inches: float = 4.5):
     else:
         width_in = max_width_inches
 
-    # Image paragraph (centered, with left indent matching body)
+    # Image paragraph — centered on page; no left indent (would shift image right-of-centre)
     img_para = doc.add_paragraph()
     img_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    img_para.paragraph_format.left_indent = BODY_LEFT_INDENT
     img_para.paragraph_format.space_before = Pt(8)
     img_para.paragraph_format.space_after = Pt(4)
 

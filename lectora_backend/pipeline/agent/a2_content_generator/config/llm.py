@@ -27,10 +27,12 @@ class _DynamicConfig:
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_k: int | None = None,
+        response_format: dict | None = None,
     ) -> None:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.top_k = top_k
+        self.response_format = response_format
 
     @property
     def deployment(self) -> str:  # type: ignore[override]

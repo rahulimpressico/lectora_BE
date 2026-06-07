@@ -365,6 +365,9 @@ def check_a1_word_counts(course_spec: dict, rule_pack: dict) -> list[dict]:
     lectora = rule_pack.get("lectora_constraints", {})
     max_per_page = lectora.get("max_words_per_page")
 
+    if not max_per_page:
+        return issues
+
     for sec in course_spec.get("sections", []):
         wc = sec.get("word_count")
         if wc is None:
@@ -458,7 +461,6 @@ def check_a1_lo_coverage(course_spec: dict, shared_state: dict, rule_pack: dict)
 def check_a1_learning_objectives_range(shared_state: dict, rule_pack: dict) -> list[dict]:
     """Enforce LO count range when configured (e.g. [5,10] for IARCE/FE)."""
     issues = []
-    print(rule_pack.get("content_rules"))
     rng = rule_pack.get("content_rules", {}).get("learning_objectives_range")
     if not rng or not isinstance(rng, (list, tuple)) or len(rng) != 2:
         return issues

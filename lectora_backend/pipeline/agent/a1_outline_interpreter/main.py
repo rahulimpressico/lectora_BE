@@ -376,12 +376,23 @@ def validate_los(state: A1State) -> A1State:
     los = state["a0_data"].get("extracted_inputs", {}).get("learning_objectives", [])
 
     if not los:
-        logger.error("[A1] CRITICAL — no learning objectives. Stopping pipeline.")
-        return {
-            **state,
-            "status": "stopped",
-            "error": "CRITICAL: learning_objectives missing — pipeline halted",
-        }
+        sections = state.get("raw_sections", [])
+        if sections:
+            logger.warning(
+                "[A1] No learning objectives found — continuing without LOs (sections present)."
+            )
+            return {
+                **state,
+                "status": "complete",
+                "error": "Missing LOs — proceeding without them",
+            }
+        else:
+            logger.error("[A1] CRITICAL — no learning objectives and no sections. Stopping pipeline.")
+            return {
+                **state,
+                "status": "stopped",
+                "error": "No sections and no LOs — cannot proceed",
+            }
 
     logger.info("[A1] %s learning objectives confirmed.", len(los))
     return state
@@ -457,10 +468,8 @@ def enrich_with_llm(state: A1State) -> A1State:
         logger.info("[A1] LLM enriched %s sections.", len(enrichment))
         return {**state, "enrichment": enrichment, "error": None}
     except Exception as e:
-        logger.warning(
-            "[A1] LLM enrichment failed (%s). Continuing without enrichment.", e
-        )
-        return {**state, "enrichment": {}, "error": None}
+        logger.warning("[A1] LLM enrichment failed: %s — continuing without enrichment.", e)
+        return {**state, "enrichment": {}, "error": f"enrich_with_llm failed: {e}"}
 
 
 # -- Node: build_course_spec -------------------------------------------------
@@ -636,8 +645,12 @@ def persist_output(state: A1State) -> A1State:
         shared = json.load(f)
     shared["agent_outputs"]["A1"] = a1_output
     shared["status"] = "A1_complete"
-    with open(state["shared_state_path"], "w") as f:
+    # Write atomically: write to a temp file then replace, so readers never see a partial file
+    import os as _os
+    _tmp_path = state["shared_state_path"] + ".tmp"
+    with open(_tmp_path, "w") as f:
         json.dump(shared, f, indent=2, default=str)
+    _os.replace(_tmp_path, state["shared_state_path"])
 
     output_dir = Path(state["shared_state_path"]).expanduser().resolve().parent
     spec_path = output_dir / "course_spec.json"

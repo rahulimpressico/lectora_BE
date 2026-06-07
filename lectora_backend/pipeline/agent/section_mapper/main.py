@@ -341,7 +341,10 @@ def map_sections(course_spec: dict, outline: dict) -> list[dict]:
     spec_sections = course_spec.get("sections", [])
     to_sections   = outline.get("sections", [])
 
-    if not spec_sections or not to_sections:
+    if not spec_sections:
+        raise RuntimeError("[SectionMapper] A1 course_spec has no sections — check A1 output")
+    if not to_sections:
+        logger.warning("[SectionMapper] No TO sections found — proceeding with empty mapping")
         return []
 
     is_breakdown = _is_breakdown_format(to_sections)
@@ -451,11 +454,22 @@ def run(shared_state_path: str) -> dict[str, Any]:
     # -- Load llm_to_outline sidecar file ----------------------------------------
     outline_path = ss_dir / "llm_to_outline.json"
     if not outline_path.exists():
-        raise RuntimeError(f"[SectionMapper] llm_to_outline not found: {outline_path}")
-
-    with open(outline_path) as f:
-        outline_data = json.load(f)
-    outline = outline_data.get("llm_to_outline", {})
+        logger.warning(
+            "[SectionMapper] llm_to_outline.json not found at %s — trying shared_state fallback",
+            outline_path,
+        )
+        inline_to = shared_state.get("llm_to_outline_classification") or {}
+        outline = (inline_to.get("llm_to_outline") or {}) or inline_to
+        if not outline:
+            raise RuntimeError(
+                f"[SectionMapper] llm_to_outline not found at {outline_path} "
+                "and no llm_to_outline_classification in shared_state"
+            )
+        logger.info("[SectionMapper] Using llm_to_outline_classification from shared_state")
+    else:
+        with open(outline_path) as f:
+            outline_data = json.load(f)
+        outline = outline_data.get("llm_to_outline", {})
     to_totals: dict = outline.get("totals", {})
 
     # -- Run mapping -------------------------------------------------------------

@@ -24,6 +24,7 @@ class _DynamicConfig:
     temperature: float | None = None
     max_tokens: int | None = None
     top_k: int | None = None
+    response_format: dict | None = None  # o3 does not support response_format
 
     @property
     def deployment(self) -> str:  # type: ignore[override]
@@ -31,11 +32,20 @@ class _DynamicConfig:
 
 
 class _DynamicTOConfig:
-    """Proxy for TO generation — uses A0_TO registry key (gpt-5.4 default)."""
+    """Proxy for TO generation — uses A0_TO registry key (gpt-5.4 default).
+
+    response_format=json_object forces the model to emit valid JSON regardless
+    of how the system prompt is phrased. Do NOT apply this to the A0 (o3)
+    classification config — o-series reasoning models do not support it.
+    """
 
     temperature: float | None = None
-    max_tokens: int = 16384  # large TO responses require high token budget
+    # Large courses (18k+ word targets) produce big JSON responses; 32k tokens
+    # gives headroom for ~120-section TOs without truncation.
+    max_tokens: int = 32768
     top_k: int | None = None
+    # Forces the API to return valid JSON — model cannot emit markdown or prose.
+    response_format: dict = {"type": "json_object"}
 
     @property
     def deployment(self) -> str:  # type: ignore[override]

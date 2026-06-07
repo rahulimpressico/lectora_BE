@@ -40,7 +40,7 @@ router = APIRouter()
 
 _POLL_INTERVAL_SEC = 2.0
 _MAX_STREAM_SEC = 30 * 60
-_TERMINAL_STATUSES = {JobStatus.COMPLETED, JobStatus.FAILED}
+_TERMINAL_STATUSES = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
 
 
 # ── Serialisation helpers ──────────────────────────────────────────────────────
@@ -140,12 +140,12 @@ async def _event_generator(job_id: str, last_log_id: int):
     Opens a fresh DB session per poll tick and closes it immediately after —
     no connection is held across the asyncio.sleep() call.
     """
-    deadline = asyncio.get_event_loop().time() + _MAX_STREAM_SEC
+    deadline = asyncio.get_running_loop().time() + _MAX_STREAM_SEC
     cursor = last_log_id
 
     yield ": connected\n\n"
 
-    while asyncio.get_event_loop().time() < deadline:
+    while asyncio.get_running_loop().time() < deadline:
         # Short-lived session: opened, used, and closed within this block.
         with SessionLocal() as session:
             job = JobRepository(session).get_job(job_id)

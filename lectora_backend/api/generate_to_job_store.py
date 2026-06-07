@@ -3,11 +3,16 @@ In-memory job store for async POST /documents/generate-to (dev API).
 
 Keeps long-running A0 work off the HTTP request thread so the FE gets an
 immediate response and polls for results instead of holding the connection open.
+
+Persistence: completed and failed job results are written to a sidecar JSON file
+in ``_CACHE_DIR`` so that polling continues to work across server restarts
+(uvicorn --reload re-imports this module and clears the in-memory dict).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -27,6 +32,65 @@ logger = logging.getLogger(__name__)
 # Limit parallel A0 runs — each loads a full DOCX + multiple LLM calls.
 _MAX_CONCURRENT = max(1, int(os.environ.get("A0_API_MAX_CONCURRENT", "2")))
 _JOB_TTL_SEC = max(300, int(os.environ.get("A0_API_JOB_TTL_SEC", "3600")))
+
+# Disk cache for completed/failed job results — survives server restarts.
+# Falls back to the system temp directory when the pipeline folder is not writable.
+_CACHE_DIR = Path(
+    os.environ.get(
+        "A0_JOB_CACHE_DIR",
+        str(Path(__file__).resolve().parent.parent / "pipeline" / ".generate_to_cache"),
+    )
+)
+
+
+def _cache_path(job_id: str) -> Path:
+    return _CACHE_DIR / f"{job_id}.json"
+
+
+def _write_cache(job_id: str, payload: dict[str, Any]) -> None:
+    """Write a completed/failed job payload to disk (best-effort)."""
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_path(job_id).write_text(
+            json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[generate-to cache] Write failed for %s: %s", job_id, exc)
+
+
+def _read_cache(job_id: str) -> dict[str, Any] | None:
+    """Return a previously persisted job payload, or None if not found/expired."""
+    p = _cache_path(job_id)
+    try:
+        if not p.exists():
+            return None
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        finished_at = payload.get("finished_at")
+        if finished_at and (time.time() - float(finished_at)) > _JOB_TTL_SEC:
+            p.unlink(missing_ok=True)
+            return None
+        return payload
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[generate-to cache] Read failed for %s: %s", job_id, exc)
+        return None
+
+
+def _evict_cache() -> None:
+    """Delete expired cache files (best-effort, called on each store.get())."""
+    try:
+        if not _CACHE_DIR.exists():
+            return
+        cutoff = time.time() - _JOB_TTL_SEC
+        for p in _CACHE_DIR.glob("*.json"):
+            try:
+                payload = json.loads(p.read_text(encoding="utf-8"))
+                finished_at = payload.get("finished_at")
+                if finished_at and float(finished_at) < cutoff:
+                    p.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _cleanup_ephemeral_output_dir(output_dir: str | Path | None) -> None:
@@ -117,7 +181,45 @@ class GenerateTOJobStore:
     def get(self, job_id: str) -> GenerateTOJob | None:
         with self._lock:
             self._purge_expired_locked()
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+            if job:
+                return job
+
+        # Not in memory — check disk cache (server may have restarted).
+        _evict_cache()
+        cached = _read_cache(job_id)
+        if not cached:
+            return None
+
+        # Reconstruct a minimal read-only job object from the cache file.
+        finished_at = cached.get("finished_at")
+        cached_status = cached.get("status", "failed")
+        stub = GenerateTOJob(
+            job_id=job_id,
+            status=GenerateTOJobStatus(cached_status),
+            created_at=float(finished_at or time.time()),
+            blob_path="",
+            blob_paths=[],
+            course_folder=None,
+            difficulty="",
+            message=cached.get("message", ""),
+            result=cached.get("result"),
+            error=cached.get("error"),
+            finished_at=float(finished_at) if finished_at else None,
+            logs=[
+                GenerateTOLogEntry(
+                    id=lg.get("id", 0),
+                    ts=lg.get("ts", 0.0),
+                    level=lg.get("level", "info"),
+                    message=lg.get("message", ""),
+                    stage=lg.get("stage"),
+                )
+                for lg in (cached.get("logs") or [])
+            ],
+        )
+        with self._lock:
+            self._jobs[job_id] = stub
+        return stub
 
     def update_message(self, job_id: str, message: str) -> None:
         with self._lock:
@@ -164,6 +266,14 @@ class GenerateTOJobStore:
             if job.output_dir:
                 _cleanup_ephemeral_output_dir(job.output_dir)
                 job.output_dir = None
+        _write_cache(job_id, {
+            "job_id": job_id,
+            "status": "completed",
+            "message": "A0 complete",
+            "result": result,
+            "finished_at": job.finished_at,
+            "logs": [lg.to_dict() for lg in job.logs],
+        })
 
     def fail(self, job_id: str, error: str) -> None:
         with self._lock:
@@ -179,6 +289,14 @@ class GenerateTOJobStore:
             if job.output_dir:
                 _cleanup_ephemeral_output_dir(job.output_dir)
                 job.output_dir = None
+        _write_cache(job_id, {
+            "job_id": job_id,
+            "status": "failed",
+            "message": "A0 failed",
+            "error": error,
+            "finished_at": job.finished_at,
+            "logs": [lg.to_dict() for lg in job.logs],
+        })
 
     def cancel(self, job_id: str, *, reason: str = "Cancelled") -> bool:
         with self._lock:

@@ -127,7 +127,7 @@ def _clean_sections(sections: list[dict]) -> list[dict]:
     for i, s in enumerate(sections):
         subtopics = s.get("subtopics") or []
         subtopic_titles = [
-            t["title"] if isinstance(t, dict) else str(t)
+            t.get("title") or t.get("name") or str(t) if isinstance(t, dict) else str(t)
             for t in subtopics
         ]
         cleaned.append({
@@ -198,8 +198,45 @@ def _build_generate_to_response(
             llm_outline = outline_payload.get("llm_to_outline") or {}
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("[generate-to] Could not read llm_to_outline: %s", exc)
+
     totals: dict = llm_outline.get("totals") or {}
-    sections: list[dict] = llm_outline.get("sections") or []
+
+    # Try the canonical "sections" key first, then fall back to common
+    # alternative keys the LLM occasionally uses.
+    sections: list[dict] = (
+        llm_outline.get("sections")
+        or llm_outline.get("lessons")
+        or llm_outline.get("modules")
+        or llm_outline.get("table_of_contents")
+        or []
+    )
+
+    if not sections:
+        # If a single wrapper key wraps the whole outline (e.g. {"outline": {...}}),
+        # unwrap it and retry.
+        for _wrapper_key in ("outline", "course_outline", "timed_outline", "to", "result"):
+            _inner = llm_outline.get(_wrapper_key)
+            if isinstance(_inner, dict):
+                sections = (
+                    _inner.get("sections")
+                    or _inner.get("lessons")
+                    or _inner.get("modules")
+                    or []
+                )
+                if sections:
+                    llm_outline = _inner
+                    totals = llm_outline.get("totals") or {}
+                    logger.warning(
+                        "[generate-to] LLM outline was wrapped under key '%s' — unwrapped successfully.",
+                        _wrapper_key,
+                    )
+                    break
+
+    if not sections:
+        logger.warning(
+            "[generate-to] No sections found in llm_outline. Top-level keys: %s",
+            list(llm_outline.keys()) if llm_outline else "empty",
+        )
 
     total_doc_word_count = _safe_int(
         getattr(spec, "total_doc_word_count", None) or totals.get("source_word_count")
@@ -400,6 +437,7 @@ def _make_a0_runner(
     duration_hours: int | None = None,
     difficulty_level: str | None = None,
     calculated_word_count: int | None = None,
+    audience: str | None = None,
 ):
     """Build a callable that runs A0 on all source DOCX/PDF files with equal priority."""
     def _run_a0() -> A0Result:
@@ -411,6 +449,7 @@ def _make_a0_runner(
             extra_text_contents=extra_text_contents or [],
             custom_to_prompt=custom_to_prompt,
             course_type_hint=course_type_hint,
+            audience=audience,
             to_outline_doc_path=str(to_outline_doc_path) if to_outline_doc_path else None,
             course_output_slug=course_output_slug,
             step_logger=step_logger,
@@ -479,15 +518,22 @@ async def upload_document(
 
     folder = _parse_course_topic(course_topic)
 
+    _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
     try:
         content = await file.read()
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to read uploaded file: {exc}",
+            detail="Failed to read uploaded file — see server logs.",
         ) from exc
     finally:
         await file.close()
+
+    if len(content) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large. Maximum allowed upload size is 100 MB.",
+        )
 
     blob_path = _uploads_blob_path(folder, filename)
 
@@ -499,9 +545,10 @@ async def upload_document(
                 content_type=_CONTENT_TYPES.get(ext, "application/octet-stream"),
             )
         except Exception as exc:
+            logger.exception("[upload] Failed to upload to Azure Blob: blob_path=%s", blob_path)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to upload to Azure Blob: {exc}",
+                detail="Failed to upload file to storage — see server logs.",
             ) from exc
         logger.info("[upload] Azure blob %s (%d bytes)", blob_path, len(content))
         return UploadDocumentResponse(blob_path=blob_path, upload_folder=folder)
@@ -554,12 +601,9 @@ async def generate_to(
     blob_paths = body.effective_blob_paths
     difficulty = (body.difficulty or "intermediate").strip().lower()
     custom_to_prompt = (body.custom_to_prompt or "").strip() or None
+    # Audience flows as a dedicated parameter to A0 → build_dynamic_to_prompt,
+    # not as a text prefix injected into the custom prompt.
     audience = (body.audience or "").strip() or None
-    # Prepend audience context into the custom TO prompt so A0 calibrates content
-    # and learning objectives for the correct target learner profile.
-    if audience:
-        audience_prefix = f"TARGET AUDIENCE: {audience}\n\nWrite all section titles, content objectives, subtopics, and learning objectives specifically for this audience. Calibrate depth and examples accordingly.\n\n"
-        custom_to_prompt = (audience_prefix + (custom_to_prompt or "")).strip() or None
     course_type_hint = (body.course_type_hint or "").strip() or None
 
     # ── Dynamic TO flow params (new) ──────────────────────────────────────────
@@ -628,6 +672,7 @@ async def generate_to(
             duration_hours=duration_hours,
             difficulty_level=difficulty_level,
             calculated_word_count=calculated_word_count,
+            audience=audience,
         )
 
     if wait:

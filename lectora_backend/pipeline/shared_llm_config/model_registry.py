@@ -29,7 +29,7 @@ DEFAULTS: dict[str, str] = {
     "A0": "o3",
     "A0_TO": "gpt-5.4",   # Responses API file upload (TO generation) — larger context window
     "A1": "gpt-5.4-mini",
-    "A2": "gpt-5.4",
+    "A2": "gpt-5.4-mini",
 }
 
 # ---------------------------------------------------------------------------

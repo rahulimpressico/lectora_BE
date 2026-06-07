@@ -22,16 +22,28 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv()
 
+# Safety guard — dev_app must never run in a production environment
+if os.getenv("ENVIRONMENT", "").lower() == "production":
+    raise RuntimeError(
+        "dev_app.py MUST NOT run in production. "
+        "Use main.py for production deployments. "
+        "Set ENVIRONMENT != 'production' or use the correct entry point."
+    )
+
+from lectora_backend.core.logging_config import configure_logging
+
+configure_logging()
+
 from fastapi import FastAPI
 
 from lectora_backend.api.middleware.cors import add_cors_middleware
-from lectora_backend.api.routes import costing
-from lectora_backend.api.routes import dashboard
 from lectora_backend.api.routes import health
 from lectora_backend.api.routes import generate_to
 from lectora_backend.api.routes import local_jobs
 from lectora_backend.api.routes import storage
 from lectora_backend.api.routes import settings as settings_routes
+from lectora_backend.api.routes import dashboard
+from lectora_backend.api.routes import costing
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +63,11 @@ def _validate_openai_settings() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _validate_openai_settings()
-    logger.info("[dev_app] Azure OpenAI credentials OK — dev server ready (full pipeline enabled).")
+    logger.info(
+        "[dev_app] Azure OpenAI credentials OK — dev server ready "
+        "(LOG_LEVEL=%s; [EXTRACT]/[TO-LLM]/[A0] logs go to this terminal).",
+        os.getenv("LOG_LEVEL", "INFO"),
+    )
     yield
 
 
@@ -74,8 +90,8 @@ app.include_router(generate_to.router,     prefix="/documents",  tags=["document
 app.include_router(local_jobs.router,      prefix="/jobs",       tags=["jobs"])
 app.include_router(storage.router,         prefix="/storage",    tags=["storage"])
 app.include_router(settings_routes.router, prefix="/settings",   tags=["settings"])
-app.include_router(costing.router,         prefix="/costing",    tags=["costing"])
 app.include_router(dashboard.router,       prefix="/dashboard",  tags=["dashboard"])
+app.include_router(costing.router,         prefix="/costing",    tags=["costing"])
 
 
 @app.get("/", include_in_schema=False)
@@ -98,10 +114,8 @@ async def root() -> dict:
             "GET  /storage/uploaded-documents/browse → uploaded DOCX",
             "GET  /storage/file                → preview / download",
             "POST /storage/delete              → delete selected files",
-            "GET  /costing/summary",
-            "GET  /costing/models",
-            "GET  /costing/trends",
-            "GET  /costing/documents",
-            "GET  /costing/documents/{documentId}",
+            "GET  /dashboard/summary           → live job counts (Courses Generated, In Progress, Completed)",
+            "GET  /costing/summary             → aggregated LLM cost + token usage",
+            "GET  /costing/documents/{docId}   → per-document cost breakdown",
         ],
     }

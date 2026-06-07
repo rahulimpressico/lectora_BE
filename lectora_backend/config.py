@@ -1,6 +1,7 @@
 """Pydantic settings loaded from environment / .env file."""
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,8 +16,22 @@ class Settings(BaseSettings):
     app_name: str = "Lectora Backend"
     app_version: str = "0.1.0"
 
-    # Database
+    # Database — must be an absolute path for SQLite
+    # (relative paths resolve differently from API vs worker processes)
     database_url: str = "sqlite:///./lectora.db"
+
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(cls, v: str) -> str:
+        if v.startswith("sqlite:///./") or (
+            v.startswith("sqlite:///") and not v.startswith("sqlite:////")
+        ):
+            raise ValueError(
+                f"DATABASE_URL '{v}' uses a relative SQLite path. "
+                "Use an absolute path (e.g. sqlite:////absolute/path/to/lectora.db). "
+                "Relative paths resolve differently from the API vs the worker process."
+            )
+        return v
 
     # Azure Service Bus
     service_bus_namespace: str = ""
@@ -42,6 +57,13 @@ class Settings(BaseSettings):
     # Container where Save to Azure writes generated course DOCX files.
     generated_courses_container_name: str = "generated-courses"
 
+    # Azure Cost Management — needed for /costing/summary real billing data
+    # Set to the subscription ID that hosts your Azure OpenAI resource.
+    azure_subscription_id: str = ""
+    # Optional: limit cost query to a specific resource group (e.g. "my-rg").
+    # Leave empty to query the entire subscription.
+    azure_resource_group: str = ""
+
     # Langfuse
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
@@ -56,8 +78,9 @@ class Settings(BaseSettings):
         "https://nimble-cendol-69a81c.netlify.app"
     )
 
-    # Extra origins matched by regex (Netlify branch/preview deploys).
-    cors_origin_regex: str = r"https://.*\.netlify\.app"
+    # Extra origins matched by regex — restrict to specific Netlify site slug
+    # to prevent any arbitrary Netlify subdomain from getting credentialed access.
+    cors_origin_regex: str = r"https://nimble-cendol-69a81c(--[a-z0-9-]+)?\.netlify\.app"
 
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

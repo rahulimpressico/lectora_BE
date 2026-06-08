@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     uploaded_documents_container_name: str = "uploaded-documents"
     # Container where Save to Azure writes generated course DOCX files.
     generated_courses_container_name: str = "generated-courses"
+    # Container used by the production pipeline adapter for all job artifacts.
+    course_generation_artifacts_container_name: str = "course-generation-artifacts"
 
     # Azure Cost Management — needed for /costing/summary real billing data
     # Set to the subscription ID that hosts your Azure OpenAI resource.

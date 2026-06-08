@@ -27,7 +27,7 @@ _lock = threading.Lock()
 
 DEFAULTS: dict[str, str] = {
     "A0": "o3",
-    "A0_TO": "gpt-5.4",   # Responses API file upload (TO generation) — larger context window
+    "A0_TO": "gpt-5.4-mini",   # Responses API file upload (TO generation)
     "A1": "gpt-5.4-mini",
     "A2": "gpt-5.4-mini",
 }
@@ -39,7 +39,6 @@ DEFAULTS: dict[str, str] = {
 AVAILABLE_MODELS: list[dict] = [
     {"id": "o3",           "label": "o3",            "provider": "Azure OpenAI", "tier": "reasoning"},
     {"id": "o4-mini",      "label": "o4 Mini",       "provider": "Azure OpenAI", "tier": "reasoning"},
-    {"id": "gpt-5.4",      "label": "GPT-5.4",       "provider": "Azure OpenAI", "tier": "flagship"},
     {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini",  "provider": "Azure OpenAI", "tier": "efficient"},
     {"id": "gpt-4o",       "label": "GPT-4o",         "provider": "Azure OpenAI", "tier": "previous"},
     {"id": "gpt-4o-mini",  "label": "GPT-4o Mini",    "provider": "Azure OpenAI", "tier": "previous"},
@@ -107,7 +106,7 @@ def _write_overrides(overrides: dict[str, str]) -> None:
 def get_deployment(agent_id: str) -> str:
     """Return the effective deployment for *agent_id*, respecting any override."""
     overrides = _read_overrides()
-    return overrides.get(agent_id) or DEFAULTS.get(agent_id, "gpt-5.4")
+    return overrides.get(agent_id) or DEFAULTS.get(agent_id, "gpt-5.4-mini")
 
 
 def get_to_file_deployment() -> str:
@@ -116,10 +115,10 @@ def get_to_file_deployment() -> str:
     Resolution order:
     1. ``A0_TO_FILE_DEPLOYMENT`` env var (explicit override)
     2. ``A0_TO`` registry override (set via settings API)
-    3. ``A0_TO`` default (``gpt-5.4`` — larger context window for large PDFs)
+    3. ``A0_TO`` default (``gpt-5.4-mini``)
 
-    ``gpt-5.4`` is used instead of the A0 reasoning model (``o3``) because TO
-    generation sends full source files and needs a larger context window.
+    ``gpt-5.4-mini`` is used instead of the A0 reasoning model (``o3``) for TO
+    generation, which sends full source file text.
     Override via ``A0_TO_FILE_DEPLOYMENT`` env var if needed.
     """
     explicit = os.environ.get("A0_TO_FILE_DEPLOYMENT", "").strip()

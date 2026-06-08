@@ -135,6 +135,8 @@ def classify_with_llm(
         )
         try:
             repaired = json_repair.repair_json(_strip_fences(raw), return_objects=True)
+            if isinstance(repaired, list) and repaired and all(isinstance(i, dict) for i in repaired):
+                repaired = {"sections": repaired}
             if not isinstance(repaired, dict):
                 raise ValueError(
                     f"json_repair returned {type(repaired).__name__}, expected dict"
@@ -197,6 +199,9 @@ def _parse_to_outline_json(raw: str) -> dict:
         )
         try:
             repaired = json_repair.repair_json(cleaned, return_objects=True)
+            if isinstance(repaired, list) and repaired and all(isinstance(i, dict) for i in repaired):
+                logger.info("[TO-LLM] json_repair returned list — wrapping as {sections: [...]}")
+                repaired = {"sections": repaired}
             if not isinstance(repaired, dict):
                 raise ValueError(
                     f"json_repair returned {type(repaired).__name__}, expected dict"
@@ -561,6 +566,9 @@ def classify_to_outline_with_llm(
         )
         try:
             repaired = json_repair.repair_json(cleaned, return_objects=True)
+            if isinstance(repaired, list) and repaired and all(isinstance(i, dict) for i in repaired):
+                logger.info("[TO-CLASSIFY] json_repair returned list — wrapping as {sections: [...]}")
+                repaired = {"sections": repaired}
             if not isinstance(repaired, dict):
                 raise ValueError(
                     f"json_repair returned {type(repaired).__name__}, expected dict"

@@ -117,7 +117,7 @@ def chat(
     if config.max_tokens is not None:
         # Azure OpenAI uses max_completion_tokens for all modern deployments
         # (both o-series and gpt-5.x+). The legacy max_tokens parameter is not
-        # accepted by gpt-5.4 or o-series models on this API version.
+        # accepted by gpt-5.4-mini or o-series models on this API version.
         create_kwargs["max_completion_tokens"] = config.max_tokens
     if config.top_k is not None:
         create_kwargs["top_k"] = config.top_k

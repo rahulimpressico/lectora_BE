@@ -7,7 +7,7 @@ restarting the server.
 
 Two separate configs:
   A0        → classification (o3 by default — reasoning model, small payload)
-  A0_TO     → TO generation  (gpt-5.4 by default — large context for DOCX+PDF text)
+  A0_TO     → TO generation  (gpt-5.4-mini by default)
 """
 
 from lectora_backend.pipeline.shared_llm_config.llm import (
@@ -32,7 +32,7 @@ class _DynamicConfig:
 
 
 class _DynamicTOConfig:
-    """Proxy for TO generation — uses A0_TO registry key (gpt-5.4 default).
+    """Proxy for TO generation — uses A0_TO registry key (gpt-5.4-mini default).
 
     response_format=json_object forces the model to emit valid JSON regardless
     of how the system prompt is phrased. Do NOT apply this to the A0 (o3)
@@ -65,5 +65,5 @@ def chat(system_prompt: str, user_msg: str) -> str:
 
 
 def chat_for_to(system_prompt: str, user_msg: str) -> str:
-    """TO generation call — uses A0_TO (gpt-5.4) for large DOCX+PDF context."""
+    """TO generation call — uses A0_TO (gpt-5.4-mini) for DOCX+PDF context."""
     return _chat(system_prompt, user_msg, config=AGENT_TO_CONFIG, agent="A0_TO")

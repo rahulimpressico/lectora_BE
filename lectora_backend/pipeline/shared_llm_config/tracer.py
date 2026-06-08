@@ -111,7 +111,6 @@ class LLMTrace:
 
 _PRICES_PER_1M = {
     # keys are normalized to lowercase
-    "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
     "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
     "o3": {"input": 2.00, "cached_input": 0.50, "output": 8.00},
     "gpt-5-mini": {"input": 0.25, "cached_input": 0.025, "output": 2.00},
@@ -149,6 +148,8 @@ def _compute_cost_usd(
     cached_prompt_tokens: int = 0,
 ) -> tuple[float, float, float]:
     key = (deployment or "").strip().lower()
+    if key == "gpt-5.4":
+        key = "gpt-5.4-mini"
     prices = _PRICES_PER_1M.get(key)
     if not prices:
         return 0.0, 0.0, 0.0

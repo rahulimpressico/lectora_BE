@@ -1,28 +1,28 @@
 """
 GET /dashboard/summary
 
-Returns live job counts.
+All counts come from Azure — no local filesystem or in-memory store.
 
-Strategy (two sources, one endpoint):
-  1. SQL DB (production / Azure): query the `jobs` table when DATABASE_URL
-     is configured and reachable.  Counts come from the real Azure job table.
-  2. In-memory store (dev mode): fallback when the DB is unavailable or not
-     configured (e.g. no absolute SQLite path set).
+  coursesGenerated / completed
+      Study-guide blobs across Azure containers:
+        • generated-courses
+        • course-generation-artifacts
+        • regedlectoraaistorage (main/legacy)
 
-Dashboard mapping:
-  coursesGenerated = total rows in jobs table (all statuses)
-  inProgress       = rows with status IN (PENDING, PROCESSING)
-                     — these are in the Service Bus queue or actively running
-  completed        = rows with status = COMPLETED
+  inProgress
+      PENDING + PROCESSING rows in the SQL ``jobs`` table (production queue/worker).
+      Returns 0 when the DB is unavailable.
+
+Why coursesGenerated == completed:
+  study_guide.docx is written only after S2 passes. Each matching blob = one
+  completed course.
 """
 from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import func, select
-from sqlalchemy.exc import OperationalError
 
 logger = logging.getLogger(__name__)
 
@@ -33,22 +33,19 @@ class DashboardSummary(BaseModel):
     coursesGenerated: int
     inProgress: int
     completed: int
+    dataSource: str = "azure_blob"
 
 
-def _counts_from_db() -> DashboardSummary | None:
-    """
-    Query the SQL jobs table for status counts.
-    Returns None if the DB is not configured or unreachable.
-    """
+def _in_progress_from_db() -> int:
+    """Count PENDING + PROCESSING rows in the SQL jobs table."""
     try:
-        from lectora_backend.config import settings
+        from sqlalchemy import func, select
         from lectora_backend.dependencies import SessionLocal
         from lectora_backend.models.db_models import Job
         from lectora_backend.models.job_enums import JobStatus
 
         db = SessionLocal()
         try:
-            # Single aggregated query: GROUP BY status
             rows = db.execute(
                 select(Job.status, func.count(Job.job_id).label("cnt"))
                 .group_by(Job.status)
@@ -57,64 +54,85 @@ def _counts_from_db() -> DashboardSummary | None:
             db.close()
 
         counts: dict[str, int] = {str(r.status): r.cnt for r in rows}
-
-        total = sum(counts.values())
         in_progress = (
             counts.get(JobStatus.PENDING.value, 0)
             + counts.get(JobStatus.PROCESSING.value, 0)
         )
-        completed = counts.get(JobStatus.COMPLETED.value, 0)
+        logger.debug("[dashboard] DB in_progress=%d", in_progress)
+        return in_progress
 
+    except Exception as exc:
+        logger.debug("[dashboard] DB unavailable for in_progress (%s)", exc)
+        return 0
+
+
+def _is_study_guide_blob(name: str) -> bool:
+    """True when blob path is a completed course study guide under /output/."""
+    lower = name.lower()
+    return "/output/" in lower and "study_guide" in lower and lower.endswith(".docx")
+
+
+def _count_study_guides_in_container(container_name: str) -> int:
+    """Return number of study_guide blobs in a single Azure container."""
+    try:
+        from lectora_backend.repositories.blob_repository import BlobRepository
+
+        repo = BlobRepository(container_name=container_name)
+        blobs = repo.list_blobs("")
+        count = sum(1 for b in blobs if _is_study_guide_blob(b))
+        logger.debug("[dashboard] container=%r study_guides=%d", container_name, count)
+        return count
+    except Exception as exc:
         logger.debug(
-            "[dashboard] DB counts — total=%d in_progress=%d completed=%d",
-            total, in_progress, completed,
+            "[dashboard] container=%r list failed (%s) — skipping", container_name, exc
         )
-        return DashboardSummary(
-            coursesGenerated=total,
-            inProgress=in_progress,
-            completed=completed,
+        return 0
+
+
+def _completed_from_azure() -> int:
+    """
+    Count completed courses across all Azure containers that hold study guide outputs.
+    """
+    from lectora_backend.config import settings
+
+    if not settings.azure_storage_connection_string.strip():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Azure Blob Storage is not configured (AZURE_STORAGE_CONNECTION_STRING).",
         )
 
-    except (OperationalError, Exception) as exc:
-        logger.debug("[dashboard] DB unavailable (%s), falling back to local store", exc)
-        return None
+    containers_to_scan = [
+        settings.generated_courses_container_name,
+        settings.course_generation_artifacts_container_name,
+        settings.blob_container_name,
+    ]
+    seen: set[str] = set()
+    unique_containers = [
+        c for c in containers_to_scan
+        if c and c.strip() and not (c in seen or seen.add(c))  # type: ignore[func-returns-value]
+    ]
 
-
-def _counts_from_local_store() -> DashboardSummary:
-    """Read counts from the in-memory LocalCourseJobStore (dev mode)."""
-    from lectora_backend.api.local_course_job_store import (
-        LocalJobStatus,
-        get_local_course_job_store,
+    total = sum(_count_study_guides_in_container(c) for c in unique_containers)
+    logger.debug(
+        "[dashboard] Azure completed=%d containers=%s", total, unique_containers
     )
-
-    store = get_local_course_job_store()
-    with store._lock:
-        jobs = list(store._jobs.values())
-
-    total = len(jobs)
-    in_progress = sum(
-        1 for j in jobs
-        if j.status in (LocalJobStatus.PENDING, LocalJobStatus.PROCESSING)
-    )
-    completed = sum(1 for j in jobs if j.status == LocalJobStatus.COMPLETED)
-
-    return DashboardSummary(
-        coursesGenerated=total,
-        inProgress=in_progress,
-        completed=completed,
-    )
+    return total
 
 
 @router.get("/summary", response_model=DashboardSummary)
 async def get_dashboard_summary() -> DashboardSummary:
     """
-    Live job counts for the dashboard.
+    Live dashboard counts — Azure Blob only.
 
-    Tries the SQL database first (production / Azure). Falls back to the
-    in-memory job store when the DB is not configured (local dev mode).
+    coursesGenerated == completed (study_guide blobs in Azure).
+    inProgress = PENDING + PROCESSING from SQL jobs table.
     """
-    result = _counts_from_db()
-    if result is not None:
-        return result
+    completed = _completed_from_azure()
+    in_progress = _in_progress_from_db()
 
-    return _counts_from_local_store()
+    return DashboardSummary(
+        coursesGenerated=completed,
+        inProgress=in_progress,
+        completed=completed,
+        dataSource="azure_blob",
+    )

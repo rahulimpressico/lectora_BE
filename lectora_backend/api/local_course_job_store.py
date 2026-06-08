@@ -82,6 +82,8 @@ class LocalCourseJob:
     shared_state_path: str | None = None
     study_guide_path: str | None = None
     temp_dir: str | None = None
+    azure_blob_root: str | None = None
+    artifact_dir: str | None = None
     input_docx_path: str | None = None  # path to original uploaded study guide (needed for regenerate)
     error: dict[str, Any] | None = None
     finished_at: float | None = None
@@ -227,10 +229,19 @@ class LocalCourseJobStore:
         message: str,
         stage_id: str | None = None,
     ) -> None:
+        from lectora_backend.core.pipeline_run_log import flush_job_logs, sync_run_log_to_azure
+
         with self._lock:
             job = self._jobs.get(job_id)
-            if job:
-                job.append_log(level, message, stage_id)
+            if not job:
+                return
+            job.append_log(level, message, stage_id)
+            if job.artifact_dir:
+                flush_job_logs(job)
+        # Azure log upload outside lock (network I/O)
+        job_ref = self.get(job_id)
+        if job_ref and job_ref.artifact_dir:
+            sync_run_log_to_azure(job_ref)
 
     def complete_job(
         self,
@@ -324,6 +335,62 @@ class LocalCourseJobStore:
             job = self._jobs.get(job_id)
             if job:
                 job.study_guide_path = path
+
+    def set_azure_blob_root(self, job_id: str, root: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.azure_blob_root = root.rstrip("/") + "/"
+
+    def set_artifact_dir(self, job_id: str, path: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.artifact_dir = path
+
+    def register_from_filesystem(
+        self,
+        *,
+        job_id: str,
+        course_title: str,
+        course_type: str,
+        shared_state_path: str | None,
+        study_guide_path: str | None = None,
+        temp_dir: str | None = None,
+        azure_blob_root: str | None = None,
+    ) -> LocalCourseJob:
+        """Register a COMPLETED job reconstructed from on-disk artifacts.
+
+        Called after a server restart when the in-memory store is empty but
+        pipeline output files still exist (e.g. shared_state.json on disk).
+        Only inserts if the job_id is not already present.
+        """
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        job = LocalCourseJob(
+            job_id=job_id,
+            course_title=course_title,
+            course_type=course_type,
+            difficulty="intermediate",
+            status=LocalJobStatus.COMPLETED,
+            created_at=now,
+            updated_at=now,
+            shared_state_path=shared_state_path,
+            study_guide_path=study_guide_path,
+            temp_dir=temp_dir,
+            azure_blob_root=azure_blob_root,
+            stages=[LocalStageProgress(stage_id=s, status="COMPLETED") for s in PIPELINE_STAGES],
+        )
+        with self._lock:
+            if job_id not in self._jobs:
+                self._jobs[job_id] = job
+        return self._jobs[job_id]
+
+    def list_all(self) -> list[LocalCourseJob]:
+        """Return a snapshot of all non-expired jobs."""
+        self._evict_expired()
+        with self._lock:
+            return list(self._jobs.values())
 
     def remove(self, job_id: str) -> bool:
         with self._lock:

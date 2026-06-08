@@ -31,7 +31,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse
@@ -168,6 +168,91 @@ def _clean_rule_pack(pack: dict | None) -> dict:
     return {k: v for k, v in pack.items() if k not in _STRIP_FROM_RULES}
 
 
+def _unwrap_llm_outline(raw: dict) -> dict:
+    """Normalise saved JSON payloads to the inner llm_to_outline dict."""
+    if not raw:
+        return {}
+    inner = raw.get("llm_to_outline")
+    return inner if isinstance(inner, dict) else raw
+
+
+def _extract_outline_sections(llm_outline: dict) -> tuple[list[dict], dict, dict]:
+    """Return (sections, totals, unwrapped_outline) from heterogeneous TO JSON."""
+    outline = _unwrap_llm_outline(llm_outline)
+    totals: dict = outline.get("totals") or {}
+    sections: list[dict] = (
+        outline.get("sections")
+        or outline.get("lessons")
+        or outline.get("modules")
+        or outline.get("table_of_contents")
+        or []
+    )
+    if not sections:
+        for wrapper_key in ("outline", "course_outline", "timed_outline", "to", "result"):
+            inner = outline.get(wrapper_key)
+            if isinstance(inner, dict):
+                sections = (
+                    inner.get("sections")
+                    or inner.get("lessons")
+                    or inner.get("modules")
+                    or []
+                )
+                if sections:
+                    outline = inner
+                    totals = outline.get("totals") or {}
+                    break
+    return sections, totals, outline
+
+
+def build_fe_to_response_from_llm_outline(
+    llm_outline: dict,
+    *,
+    difficulty: str = "intermediate",
+    shared_state_path: str | None = None,
+    rule_family_key: str | None = None,
+) -> GenerateTOResponse:
+    """Build the FE TO panel payload from a saved llm_to_outline dict."""
+    sections, totals, outline = _extract_outline_sections(llm_outline)
+
+    family_key = rule_family_key or "insurance_ce"
+    if shared_state_path and Path(shared_state_path).is_file():
+        try:
+            with open(shared_state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+            request_spec = state.get("request_spec") or {}
+            rule_cls = request_spec.get("rule_classification") or {}
+            family_display = rule_cls.get("family") or ""
+            if family_display:
+                family_key = _find_rule_family_key(family_display)
+            difficulty = (state.get("course_difficulty") or difficulty).strip().lower()
+        except Exception:
+            pass
+
+    resolved_pack = resolve_rule_pack(family_key, difficulty)
+    rules = _clean_rule_pack(resolved_pack)
+
+    cleaned_sections = _clean_sections(sections)
+    course_totals = compute_course_totals(cleaned_sections, difficulty=difficulty)
+
+    to: dict[str, Any] = {
+        "course_name": outline.get("course_title") or "Untitled Course",
+        "rule_family": family_key,
+        "difficulty": difficulty,
+        "difficulty_factor": get_difficulty_factor(difficulty),
+        "audience": outline.get("audience") or "",
+        "course_type": outline.get("course_type") or "",
+        "topic": outline.get("topic") or "",
+        "category": outline.get("category") or "",
+        "description": outline.get("description") or "",
+        "total_word_count": course_totals["total_word_count"],
+        "total_minutes": course_totals["total_minutes"],
+        "total_credit_hours": course_totals["total_credit_hours"],
+        "learning_objectives": outline.get("learning_objectives") or [],
+        "sections": cleaned_sections,
+    }
+    return GenerateTOResponse(to=to, rules=rules, to_blob_path=None)
+
+
 def _build_generate_to_response(
     result: A0Result,
     difficulty: str,
@@ -233,9 +318,17 @@ def _build_generate_to_response(
                     break
 
     if not sections:
-        logger.warning(
-            "[generate-to] No sections found in llm_outline. Top-level keys: %s",
-            list(llm_outline.keys()) if llm_outline else "empty",
+        top_keys = list(llm_outline.keys()) if llm_outline else []
+        logger.error(
+            "[generate-to] No sections found in llm_outline after all unwrap attempts. "
+            "Top-level keys: %s",
+            top_keys,
+        )
+        raise ValueError(
+            f"TO generation produced no sections (tried all known wrapper keys). "
+            f"LLM outline top-level keys: {top_keys}. "
+            "The source document may lack recognizable structure, or the model "
+            "returned an unexpected response format."
         )
 
     total_doc_word_count = _safe_int(
@@ -796,6 +889,65 @@ async def cancel_generate_to_job(job_id: str) -> JSONResponse:
     if handle:
         handle.cancel_event.set()
     return JSONResponse(content={"jobId": job_id, "status": "cancelled"})
+
+
+def _read_json_blob(path: str, source: Literal["uploads", "artifacts"]) -> dict:
+    """Load a JSON blob from local temp, pipeline/courses, or Azure."""
+    clean = path.strip().lstrip("/")
+    if source == "uploads":
+        rel = clean
+        if rel.startswith(f"{UPLOADED_DOCUMENTS_PREFIX}/"):
+            rel = rel[len(UPLOADED_DOCUMENTS_PREFIX) + 1 :]
+        local_path = _UPLOAD_ROOT / rel
+        if local_path.is_file():
+            return json.loads(local_path.read_text(encoding="utf-8"))
+        if _azure_storage_ready():
+            data = _uploads_blob_repo().download_bytes(rel)
+            return json.loads(data.decode("utf-8"))
+    else:
+        from lectora_backend.config import settings
+
+        if _azure_storage_ready():
+            try:
+                data = BlobRepository(
+                    container_name=settings.course_generation_artifacts_container_name,
+                ).download_bytes(clean)
+                return json.loads(data.decode("utf-8"))
+            except FileNotFoundError:
+                pass
+            try:
+                data = BlobRepository().download_bytes(clean)
+                return json.loads(data.decode("utf-8"))
+            except FileNotFoundError:
+                pass
+
+        from lectora_backend.api.routes.storage import _local_artifact_path_candidates
+
+        courses_dir = Path(__file__).resolve().parents[2] / "pipeline" / "courses"
+        legacy_dir = Path(__file__).resolve().parents[2] / "pipeline" / "shared_state"
+        for rel in _local_artifact_path_candidates(clean):
+            for base in (courses_dir, legacy_dir):
+                candidate = base / rel
+                if candidate.is_file():
+                    return json.loads(candidate.read_text(encoding="utf-8"))
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Training Outline file not found: {path}",
+    )
+
+
+@router.get(
+    "/load-to",
+    response_model=GenerateTOResponse,
+    response_model_by_alias=True,
+    summary="Load a saved Training Outline JSON for the TO review panel",
+)
+async def load_to_from_path(
+    path: str = Query(..., description="Blob path from upload or artifact browse"),
+    source: Literal["uploads", "artifacts"] = Query(default="uploads"),
+) -> GenerateTOResponse:
+    payload = _read_json_blob(path, source)
+    return build_fe_to_response_from_llm_outline(_unwrap_llm_outline(payload))
 
 
 @router.get(

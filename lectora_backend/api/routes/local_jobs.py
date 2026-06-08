@@ -198,8 +198,25 @@ def _regenerate_special_section_sync(job_id: str, section_id: str) -> str:
     return new_content
 
 
+def _set_trace_context_for_job(job_id: str, *, study_guide_path: str | None = None) -> None:
+    """Tag LLM traces with run_id + doc_name so costing can attribute per-document spend."""
+    from lectora_backend.pipeline.shared_llm_config.tracer import set_run_context
+
+    store = get_local_course_job_store()
+    job = store.get(job_id)
+    doc_name = ""
+    if study_guide_path:
+        doc_name = Path(study_guide_path).stem
+    if not doc_name and job and job.course_title:
+        doc_name = sanitize_course_slug(job.course_title)
+    if not doc_name:
+        doc_name = job_id[:8]
+    set_run_context(job_id, doc_name)
+
+
 def _rewrite_section_sync(job_id: str, section_id: str, current_content: str, user_prompt: str) -> str:
     """Rewrite section content using LLM with user-provided instructions."""
+    _set_trace_context_for_job(job_id)
     from lectora_backend.pipeline.shared_llm_config.llm import chat as llm_chat
     from lectora_backend.pipeline.agent.a2_content_generator.config.llm import COURSE_DESCRIPTION_CONFIG
 
@@ -221,6 +238,7 @@ def _rewrite_section_sync(job_id: str, section_id: str, current_content: str, us
 
 def _improve_tone_sync(job_id: str, section_id: str, current_content: str, tone_prompt: str) -> str:
     """Adjust tone and style of section content using LLM."""
+    _set_trace_context_for_job(job_id)
     from lectora_backend.pipeline.shared_llm_config.llm import chat as llm_chat
     from lectora_backend.pipeline.agent.a2_content_generator.config.llm import COURSE_DESCRIPTION_CONFIG
 
@@ -242,6 +260,7 @@ def _improve_tone_sync(job_id: str, section_id: str, current_content: str, tone_
 
 def _summarize_section_sync(job_id: str, section_id: str, current_content: str) -> str:
     """Summarize section content to a concise version preserving all key learning points."""
+    _set_trace_context_for_job(job_id)
     from lectora_backend.pipeline.shared_llm_config.llm import chat as llm_chat
     from lectora_backend.pipeline.agent.a2_content_generator.config.llm import COURSE_DESCRIPTION_CONFIG
 
@@ -263,6 +282,7 @@ def _summarize_section_sync(job_id: str, section_id: str, current_content: str) 
 
 def _expand_section_sync(job_id: str, section_id: str, current_content: str) -> str:
     """Expand section content with additional depth, examples, and elaboration."""
+    _set_trace_context_for_job(job_id)
     from lectora_backend.pipeline.shared_llm_config.llm import chat as llm_chat
     from lectora_backend.pipeline.agent.a2_content_generator.config.llm import COURSE_DESCRIPTION_CONFIG
 
@@ -284,6 +304,7 @@ def _expand_section_sync(job_id: str, section_id: str, current_content: str) -> 
 
 def _simplify_section_sync(job_id: str, section_id: str, current_content: str) -> str:
     """Simplify section content using plainer language and shorter sentences."""
+    _set_trace_context_for_job(job_id)
     from lectora_backend.pipeline.shared_llm_config.llm import chat as llm_chat
     from lectora_backend.pipeline.agent.a2_content_generator.config.llm import COURSE_DESCRIPTION_CONFIG
 
@@ -641,6 +662,8 @@ def _run_pipeline_inner(
         store.append_log(job_id, level, message, stage)
         logger.info("[%s] [%s] %s", job_id[:8], stage or "pipeline", message)
 
+    _set_trace_context_for_job(job_id, study_guide_path=study_guide_path)
+
     # Resolve effective TO path for first gate cycle
     effective_to_path: str | None = None
     if to_override and isinstance(to_override, dict):
@@ -653,6 +676,16 @@ def _run_pipeline_inner(
     # ── A0 → A1 → S1 gate loop ───────────────────────────────────────────
     shared_state_path: str | None = None
     s1_feedback: str | None = None
+
+    # Compute per-job output slug once — each run gets its own isolated dir:
+    # pipeline/courses/{course_slug}/{job_id}/
+    _job_rec = store.get(job_id)
+    course_slug = sanitize_course_slug(_job_rec.course_title if _job_rec else "course")
+    job_output_slug = f"{course_slug}/{job_id}"
+    artifact_dir = _PIPELINE_COURSES_DIR / course_slug / job_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "logs").mkdir(parents=True, exist_ok=True)
+    store.set_artifact_dir(job_id, str(artifact_dir))
 
     for gate_cycle in range(1, MAX_A0_A1_S1_CYCLES + 1):
         if store.is_cancelled(job_id):
@@ -671,10 +704,6 @@ def _run_pipeline_inner(
         # a fresh one, losing learning objectives and section structure.
         to_path_for_cycle = effective_to_path
 
-        job_rec = store.get(job_id)
-        course_slug = sanitize_course_slug(
-            job_rec.course_title if job_rec else "course"
-        )
         # Route the study guide to the correct parser based on file extension.
         # A0 accepts docx_paths (python-docx) or pdf_paths (pypdf); passing a
         # PDF as a DOCX path causes python-docx to crash.
@@ -688,11 +717,11 @@ def _run_pipeline_inner(
             to_outline_doc_path=to_path_for_cycle,
             output_dir=str(_PIPELINE_COURSES_DIR),
             course_difficulty=difficulty,
-            course_output_slug=course_slug,
+            course_output_slug=job_output_slug,
         ).run()
         shared_state_path = a0_result.shared_state_path
         # Point the job's artifact dir to the actual pipeline output directory
-        # (parent of shared_state.json = pipeline/shared_state/{doc_stem}/).
+        # (parent of shared_state.json = pipeline/courses/{course_slug}/{job_id}/).
         store.set_temp_dir(job_id, str(Path(shared_state_path).parent))
         _persist_difficulty(shared_state_path, difficulty)
 
@@ -706,7 +735,7 @@ def _run_pipeline_inner(
         # Persist special instructions so A2 can inject them into generation prompts.
         if special_instructions:
             _persist_special_instructions(shared_state_path, special_instructions)
-        _sync_legacy_shared_state_dir(course_slug)
+        _sync_legacy_shared_state_dir(job_output_slug)
         log("success", "Document analyzed — course structure and rule family identified", "A0")
         store.complete_stage(job_id, "A0", "PASS")
 
@@ -723,14 +752,14 @@ def _run_pipeline_inner(
             docx_path=study_guide_path,
             feedback=a1_feedback,
         )
-        _sync_legacy_shared_state_dir(course_slug)
+        _sync_legacy_shared_state_dir(job_output_slug)
         log("success", "Course outline built — sections and learning objectives mapped", "A1")
         store.complete_stage(job_id, "A1", "PASS")
 
         log("info", "Reviewing course structure for quality and compliance…", "S1")
         store.start_stage(job_id, "S1")
         s1_result = S1Validator(shared_state_path).run()
-        _sync_legacy_shared_state_dir(course_slug)
+        _sync_legacy_shared_state_dir(job_output_slug)
 
         if not _s1_blocks(s1_result.status):
             log("success", "Structure review passed — course outline meets quality standards", "S1")
@@ -760,7 +789,7 @@ def _run_pipeline_inner(
     log("info", "Organizing course sections and mapping lessons to the training outline…", "SECTION_MAPPER")
     store.start_stage(job_id, "SECTION_MAPPER")
     section_mapper_run(shared_state_path=shared_state_path)
-    _sync_legacy_shared_state_dir(course_slug)
+    _sync_legacy_shared_state_dir(job_output_slug)
     log("success", "Course sections organized and lesson mapping complete", "SECTION_MAPPER")
     store.complete_stage(job_id, "SECTION_MAPPER", "PASS")
 
@@ -768,7 +797,7 @@ def _run_pipeline_inner(
     log("info", "Planning interactive knowledge check placement…", "KC_PLANNER")
     store.start_stage(job_id, "KC_PLANNER")
     kc_result = kc_planner_run(shared_state_path=shared_state_path)
-    _sync_legacy_shared_state_dir(course_slug)
+    _sync_legacy_shared_state_dir(job_output_slug)
     kc_count = kc_result.get("kc_count", 0)
     log("success", f"Knowledge check placement complete — {kc_count} interactive checks planned", "KC_PLANNER")
     store.complete_stage(job_id, "KC_PLANNER", "PASS")
@@ -795,7 +824,7 @@ def _run_pipeline_inner(
             feedback=a2_feedback,
             source_file_paths=source_file_paths,
         ).run()
-        _sync_legacy_shared_state_dir(course_slug)
+        _sync_legacy_shared_state_dir(job_output_slug)
         log(
             "success",
             f"Content generation complete — {a2_result.stats.generated} lessons written "
@@ -806,7 +835,7 @@ def _run_pipeline_inner(
         log("info", "Checking content quality, accuracy, and completeness…", "S2")
         store.start_stage(job_id, "S2")
         s2_result = S2Validator(shared_state_path).run()
-        _sync_legacy_shared_state_dir(course_slug)
+        _sync_legacy_shared_state_dir(job_output_slug)
 
         if not _s2_blocks(s2_result.status):
             log("success", "Content quality review passed", "S2")
@@ -832,10 +861,10 @@ def _run_pipeline_inner(
     if s2_result and not _s2_blocks(s2_result.status):
         log("info", "Assembling your final course document…", "A2")
         final_docx_path = render_study_guide_from_state(shared_state_path=shared_state_path)
-        _sync_legacy_shared_state_dir(course_slug)
+        _sync_legacy_shared_state_dir(job_output_slug)
         log("success", "Your course document is ready", "A2")
     else:
-        _sync_legacy_shared_state_dir(course_slug)
+        _sync_legacy_shared_state_dir(job_output_slug)
         log("error", "Course document could not be assembled — quality gate blocked", "A2")
 
     return shared_state_path, final_docx_path
@@ -872,6 +901,45 @@ async def _run_pipeline_background(
             shared_state_path=shared_state_path,
             study_guide_path=study_guide_docx,
         )
+
+        # Sync all pipeline JSON/DOCX artifacts to Azure Blob Storage.
+        if shared_state_path:
+            from lectora_backend.core.local_artifact_sync import sync_local_artifacts_to_azure
+
+            job = store.get(job_id)
+            course_title = job.course_title if job else "course"
+            sync_result = await asyncio.to_thread(
+                sync_local_artifacts_to_azure,
+                job_id=job_id,
+                course_title=course_title,
+                shared_state_path=shared_state_path,
+                study_guide_path=study_guide_docx,
+            )
+            if sync_result.get("skipped"):
+                logger.debug(
+                    "[%s] Azure artifact sync skipped: %s",
+                    job_id[:8],
+                    sync_result.get("reason"),
+                )
+            elif sync_result.get("uploaded", 0) > 0:
+                blob_root = sync_result.get("blobRoot")
+                if blob_root:
+                    store.set_azure_blob_root(job_id, blob_root)
+                store.append_log(
+                    job_id,
+                    "success",
+                    f"Uploaded {sync_result['uploaded']} artifact(s) to Azure "
+                    f"({sync_result.get('container')}/{blob_root})",
+                    None,
+                )
+            if sync_result.get("errors"):
+                store.append_log(
+                    job_id,
+                    "warn",
+                    f"Some artifacts failed to upload to Azure ({len(sync_result['errors'])} error(s))",
+                    None,
+                )
+
         store.append_log(job_id, "success", "Your course has been generated successfully", None)
     except Exception as exc:
         if str(exc) == "Cancelled" or store.is_cancelled(job_id):
@@ -999,6 +1067,323 @@ async def create_job(payload: CreateJobPayload) -> JSONResponse:
         status_code=status.HTTP_202_ACCEPTED,
         content={"jobId": job.job_id, "status": "PENDING"},
     )
+
+
+# ─── Filesystem-based job reconstruction helpers ──────────────────────────────
+
+def _job_id_from_state_file(state_file: Path) -> str:
+    """Derive job_id from the directory layout when shared_state lacks run.jobId."""
+    parent = state_file.parent
+    if parent.name == "state":
+        return parent.parent.name
+    return parent.name
+
+
+def _artifact_dir_from_state_file(state_file: Path) -> Path:
+    """Return the per-job artifact root (parent of state/ or of shared_state.json)."""
+    parent = state_file.parent
+    if parent.name == "state":
+        return parent.parent
+    return parent
+
+
+def _resolve_study_guide_path(artifact_dir: Path) -> Path | None:
+    for candidate in (
+        artifact_dir / "study_guide.docx",
+        artifact_dir / "output" / "study_guide.docx",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _course_title_from_shared_state(state: dict, course_slug: str) -> str:
+    request_spec = state.get("request_spec") or {}
+    course_metadata = request_spec.get("course_metadata") or {}
+    return (
+        course_metadata.get("title")
+        or state.get("extracted_inputs", {}).get("title")
+        or state.get("request", {}).get("courseTitle")
+        or course_slug.replace("_", " ")
+    )
+
+
+def _course_type_from_shared_state(state: dict) -> str:
+    request_spec = state.get("request_spec") or {}
+    course_metadata = request_spec.get("course_metadata") or {}
+    return (
+        state.get("request", {}).get("courseType")
+        or course_metadata.get("course_type")
+        or "insurance_ce"
+    )
+
+
+def _collect_state_files(course_dir: Path) -> list[Path]:
+    """All shared_state.json locations under one course folder, newest first."""
+    patterns = (
+        "*/shared_state.json",
+        "*/state/shared_state.json",
+        "*/state/pipeline_shared_state.json",
+        "state/shared_state.json",
+    )
+    found: dict[str, Path] = {}
+    for pattern in patterns:
+        for path in course_dir.glob(pattern):
+            found[str(path.resolve())] = path
+    return sorted(found.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _reconstruct_job_from_filesystem(
+    store: "LocalCourseJobStore",
+    course_slug: str,
+) -> "LocalCourseJob | None":
+    """Scan pipeline/courses/{course_slug}/ for the most recent shared_state.json
+    and register a COMPLETED job in the in-memory store.
+
+    This allows the Asset Library to open courses generated before the current
+    server session (e.g. after a dev-server restart where the in-memory store
+    was cleared but disk artifacts remain).
+    """
+    from lectora_backend.api.local_course_job_store import LocalCourseJobStore as _Store  # noqa: F401
+
+    course_dir = _PIPELINE_COURSES_DIR / course_slug
+    if not course_dir.is_dir():
+        return None
+
+    state_files = _collect_state_files(course_dir)
+
+    for state_file in state_files:
+        try:
+            with open(state_file, encoding="utf-8") as fh:
+                state = json.load(fh)
+
+            job_id: str = state.get("run", {}).get("jobId") or _job_id_from_state_file(state_file)
+            if not job_id:
+                continue
+
+            artifact_dir = _artifact_dir_from_state_file(state_file)
+            docx_candidate = _resolve_study_guide_path(artifact_dir)
+
+            return store.register_from_filesystem(
+                job_id=job_id,
+                course_title=_course_title_from_shared_state(state, course_slug),
+                course_type=_course_type_from_shared_state(state),
+                shared_state_path=str(state_file),
+                study_guide_path=str(docx_candidate) if docx_candidate else None,
+                temp_dir=str(artifact_dir),
+            )
+        except Exception:
+            continue
+
+    return None
+
+
+def _find_shared_state_for_job_id(job_id: str) -> Path | None:
+    """Return the path to shared_state.json for the given job_id, or None.
+
+    Supports both the new isolated layout ({course_slug}/{job_id}/state/) and
+    the legacy layout ({course_slug}/state/).  Scans pipeline/courses/.
+    """
+    for pattern in (
+        f"*/{job_id}/shared_state.json",
+        f"*/{job_id}/state/shared_state.json",
+        f"*/{job_id}/state/pipeline_shared_state.json",
+    ):
+        matches = sorted(
+            _PIPELINE_COURSES_DIR.glob(pattern),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if matches:
+            return matches[0]
+
+    # Legacy layout: the shared_state.json may embed the jobId in its "run" block
+    for state_file in _PIPELINE_COURSES_DIR.glob("*/state/shared_state.json"):
+        try:
+            with open(state_file, encoding="utf-8") as fh:
+                state = json.load(fh)
+            if state.get("run", {}).get("jobId") == job_id:
+                return state_file
+        except Exception:
+            continue
+
+    return None
+
+
+def _load_shared_state_dict(job: "LocalCourseJob") -> dict | None:
+    """Load shared state — Azure course-generation-artifacts first, then local disk."""
+    from lectora_backend.core.azure_course_artifacts import (
+        is_azure_artifacts_enabled,
+        load_shared_state_for_job,
+    )
+
+    if is_azure_artifacts_enabled():
+        azure_state = load_shared_state_for_job(job.job_id)
+        if azure_state:
+            return azure_state
+
+    if job.shared_state_path and Path(job.shared_state_path).exists():
+        try:
+            with open(job.shared_state_path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+    return None
+
+
+def _load_llm_outline_for_job(job: "LocalCourseJob") -> dict | None:
+    from lectora_backend.core.azure_course_artifacts import (
+        is_azure_artifacts_enabled,
+        load_llm_outline_for_job,
+    )
+
+    if is_azure_artifacts_enabled():
+        outline = load_llm_outline_for_job(job.job_id)
+        if outline:
+            return outline
+
+    if job.temp_dir:
+        outline = _load_llm_outline_from_dir(Path(job.temp_dir))
+        if outline:
+            return outline
+    return None
+
+
+def _load_llm_outline_from_dir(artifact_dir: Path) -> dict | None:
+    """Read llm_to_outline from local job folder (flat or Azure-mirrored layout)."""
+    for candidate in (
+        artifact_dir / "llm_to_outline.json",
+        artifact_dir / "output" / "llm_to_outline.json",
+    ):
+        if not candidate.is_file():
+            continue
+        try:
+            with open(candidate, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if not isinstance(payload, dict):
+                continue
+            inner = payload.get("llm_to_outline")
+            return inner if isinstance(inner, dict) else payload
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_job_from_azure(
+    store: "LocalCourseJobStore",
+    job_id: str,
+) -> "LocalCourseJob | None":
+    """Reconstruct a COMPLETED job from Azure course-generation-artifacts."""
+    from lectora_backend.core.azure_course_artifacts import (
+        find_job_artifact_root,
+        is_azure_artifacts_enabled,
+        load_shared_state_for_job,
+    )
+
+    if not is_azure_artifacts_enabled():
+        return None
+
+    raw_state = load_shared_state_for_job(job_id)
+    if not raw_state:
+        return None
+
+    return store.register_from_filesystem(
+        job_id=job_id,
+        course_title=_course_title_from_shared_state(raw_state, ""),
+        course_type=_course_type_from_shared_state(raw_state),
+        shared_state_path=None,
+        azure_blob_root=find_job_artifact_root(job_id),
+    )
+
+
+def _resolve_job_with_filesystem(
+    store: "LocalCourseJobStore",
+    job_id: str,
+) -> "LocalCourseJob | None":
+    """Return in-memory job or reconstruct from Azure, then local disk."""
+    job = store.get(job_id)
+    if job:
+        return job
+
+    job = _resolve_job_from_azure(store, job_id)
+    if job:
+        return job
+
+    state_file = _find_shared_state_for_job_id(job_id)
+    if state_file is None:
+        return None
+    try:
+        with open(state_file, encoding="utf-8") as fh:
+            raw_state = json.load(fh)
+        artifact_dir = _artifact_dir_from_state_file(state_file)
+        docx_candidate = _resolve_study_guide_path(artifact_dir)
+        return store.register_from_filesystem(
+            job_id=job_id,
+            course_title=_course_title_from_shared_state(raw_state, ""),
+            course_type=_course_type_from_shared_state(raw_state),
+            shared_state_path=str(state_file),
+            study_guide_path=str(docx_candidate) if docx_candidate else None,
+            temp_dir=str(artifact_dir),
+        )
+    except Exception:
+        return None
+
+
+@router.get(
+    "/by-course-slug/{course_slug}",
+    summary="Find the most recent job by course slug",
+)
+async def get_job_by_course_slug(course_slug: str) -> JSONResponse:
+    """Return the most recent job whose course slug matches.
+
+    Checks the in-memory store first; if empty (e.g. after a server restart),
+    reconstructs the job from on-disk artifacts so the Asset Library can open
+    courses generated in previous sessions.
+    """
+    from lectora_backend.core.course_storage import sanitize_course_slug
+
+    store = get_local_course_job_store()
+    all_jobs = store.list_all()
+    matched = [
+        j for j in all_jobs
+        if sanitize_course_slug(j.course_title) == course_slug
+    ]
+    if matched:
+        best = max(matched, key=lambda j: j.updated_at or j.created_at)
+        return JSONResponse(content={
+            "jobId": best.job_id,
+            "status": best.status.value,
+            "courseTitle": best.course_title,
+        })
+
+    # Fallback: Azure course-generation-artifacts, then local disk
+    from lectora_backend.core.azure_course_artifacts import (
+        find_job_id_for_course_slug,
+        is_azure_artifacts_enabled,
+    )
+
+    if is_azure_artifacts_enabled():
+        azure_job_id = find_job_id_for_course_slug(course_slug)
+        if azure_job_id:
+            reconstructed = _resolve_job_from_azure(store, azure_job_id)
+            if reconstructed is not None:
+                return JSONResponse(content={
+                    "jobId": reconstructed.job_id,
+                    "status": reconstructed.status.value,
+                    "courseTitle": reconstructed.course_title,
+                })
+
+    reconstructed = _reconstruct_job_from_filesystem(store, course_slug)
+    if reconstructed is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No job found for course slug '{course_slug}'.",
+        )
+    return JSONResponse(content={
+        "jobId": reconstructed.job_id,
+        "status": reconstructed.status.value,
+        "courseTitle": reconstructed.course_title,
+    })
 
 
 @router.delete(
@@ -1140,7 +1525,8 @@ async def stream_job_events(job_id: str, request: Request) -> StreamingResponse:
 )
 async def get_course_content(job_id: str) -> JSONResponse:
     store = get_local_course_job_store()
-    job = store.get(job_id)
+    job = _resolve_job_with_filesystem(store, job_id)
+
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1153,14 +1539,12 @@ async def get_course_content(job_id: str) -> JSONResponse:
             detail=f"Job is not completed (status: {job.status.value})",
         )
 
-    if not job.shared_state_path or not Path(job.shared_state_path).exists():
+    shared_state = _load_shared_state_dict(job)
+    if not shared_state:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Course content not available — shared state not found",
+            detail="Course content not available — shared state not found in Azure or local storage",
         )
-
-    with open(job.shared_state_path, encoding="utf-8") as fh:
-        shared_state = json.load(fh)
 
     a2_output: dict = shared_state.get("agent_outputs", {}).get("A2") or {}
 
@@ -1582,21 +1966,67 @@ async def run_ai_operation(job_id: str, payload: AIOperationPayload) -> JSONResp
 
 
 @router.get(
-    "/{job_id}/artifacts",
-    summary="List pipeline artifacts for a completed job",
+    "/{job_id}/training-outline",
+    summary="Training Outline JSON for the TO review panel",
 )
-async def list_artifacts(job_id: str) -> JSONResponse:
+async def get_training_outline(job_id: str) -> JSONResponse:
+    """Return FE-ready TO + rules from saved llm_to_outline.json (disk or Azure)."""
+    from lectora_backend.api.routes.generate_to import build_fe_to_response_from_llm_outline
+
     store = get_local_course_job_store()
-    job = store.get(job_id)
+    job = _resolve_job_with_filesystem(store, job_id)
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Unknown or expired jobId: {job_id}",
         )
 
+    llm_outline = _load_llm_outline_for_job(job)
+    difficulty = "intermediate"
+    state = _load_shared_state_dict(job)
+    if state:
+        difficulty = (state.get("course_difficulty") or difficulty).strip().lower()
+        if not llm_outline or not llm_outline.get("sections"):
+            llm_outline = state.get("llm_to_outline_classification") or llm_outline
+
+    if not llm_outline or not llm_outline.get("sections"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Training Outline not found for this job",
+        )
+
+    response = build_fe_to_response_from_llm_outline(
+        llm_outline,
+        difficulty=difficulty,
+        shared_state_path=job.shared_state_path,
+    )
+    return JSONResponse(content=response.model_dump(by_alias=True))
+
+
+@router.get(
+    "/{job_id}/artifacts",
+    summary="List pipeline artifacts for a completed job",
+)
+async def list_artifacts(job_id: str) -> JSONResponse:
+    store = get_local_course_job_store()
+    job = _resolve_job_with_filesystem(store, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown or expired jobId: {job_id}",
+        )
+
+    from lectora_backend.core.azure_course_artifacts import (
+        is_azure_artifacts_enabled,
+        list_json_artifacts_for_job,
+    )
+
     artifacts: list[dict[str, Any]] = []
 
-    if job.temp_dir and Path(job.temp_dir).exists():
+    if is_azure_artifacts_enabled():
+        artifacts.extend(list_json_artifacts_for_job(job_id))
+
+    if not artifacts and job.temp_dir and Path(job.temp_dir).exists():
         for p in sorted(Path(job.temp_dir).rglob("*")):
             if p.is_file():
                 artifacts.append({
@@ -1604,6 +2034,7 @@ async def list_artifacts(job_id: str) -> JSONResponse:
                     "path": str(p),
                     "size": p.stat().st_size,
                     "type": "docx" if p.suffix == ".docx" else "json",
+                    "source": "local",
                 })
 
     return JSONResponse(content={"jobId": job_id, "artifacts": artifacts})
@@ -1719,62 +2150,42 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
                 detail=f"DOCX rebuild failed: {exc}",
             ) from exc
 
-    course_slug = sanitize_course_slug(job.course_title)
-    file_name = f"{course_slug}_study_guide.docx"
-    blob_path = f"{course_slug}/output/{file_name}"
+    from lectora_backend.core.local_artifact_sync import sync_local_artifacts_to_azure
 
-    container = _settings.blob_container_name  # main artifacts container — same one the pipeline writes to
-    try:
-        repo = BlobRepository(container_name=container)
-        repo.upload_file(
-            local_path=docx_path,
-            blob_path=blob_path,
-            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    sync_result = sync_local_artifacts_to_azure(
+        job_id=job_id,
+        course_title=job.course_title,
+        shared_state_path=job.shared_state_path,
+        study_guide_path=docx_path,
+    )
+    if sync_result.get("skipped"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "azure_not_configured",
+                "message": "Azure Blob Storage is not configured.",
+            },
         )
-    except Exception as exc:
-        logger.exception("[save_to_azure] Upload failed for job %s: %s", job_id, exc)
+    if sync_result.get("uploaded", 0) == 0 and sync_result.get("errors"):
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
                 "error": "upload_failed",
-                "message": f"Azure upload failed: {exc}",
+                "message": f"Azure upload failed: {sync_result['errors'][0]}",
             },
-        ) from exc
-
-    # Save a metadata sidecar so the Asset Library and downstream tools
-    # can discover course info without downloading the full DOCX.
-    with open(job.shared_state_path, encoding="utf-8") as _fh:
-        shared_state = json.load(_fh)
-    try:
-        _a2_out: dict = shared_state.get("agent_outputs", {}).get("A2", {})
-        _sections: list = _a2_out.get("sections", [])
-        _meta: dict = {
-            "courseTitle":   job.course_title,
-            "courseId":      job_id,
-            "courseType":    job.course_type or "",
-            "fileName":      file_name,
-            "blobPath":      blob_path,
-            "containerName": container,
-            "savedAt":       datetime.now(timezone.utc).isoformat(),
-            "totalSections": len(_sections),
-            "totalWordCount": sum(
-                len(str(s.get("body_paragraphs", "") or "").split())
-                for s in _sections
-            ),
-        }
-        _meta_blob = f"{course_slug}/output/{course_slug}_metadata.json"
-        repo.upload_bytes(
-            _meta_blob,
-            json.dumps(_meta, indent=2, ensure_ascii=False).encode("utf-8"),
-            content_type="application/json",
         )
-        logger.info("[save-to-azure] Metadata saved → %s", _meta_blob)
-    except Exception as _meta_exc:
-        logger.warning("[save-to-azure] Could not save metadata: %s", _meta_exc)
+
+    blob_root = sync_result.get("blobRoot", "")
+    container = sync_result.get(
+        "generatedCoursesContainer",
+        _settings.generated_courses_container_name,
+    )
+    blob_path = f"{blob_root}/output/study_guide.docx"
+    file_name = "study_guide.docx"
 
     logger.info(
-        "[save_to_azure] Uploaded %s for job %s → %s/%s",
-        file_name, job_id, container, blob_path,
+        "[save_to_azure] Synced %s artifact(s) for job %s → %s/%s",
+        sync_result.get("uploaded", 0), job_id, container, blob_root,
     )
     return JSONResponse(content={
         "status":        "uploaded",

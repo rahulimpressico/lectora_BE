@@ -15,7 +15,7 @@ from fastapi import Depends
 
 from lectora_backend.api.routes import events, generate_to, health, jobs, storage
 from lectora_backend.api.routes import settings as settings_routes
-from lectora_backend.api.routes import dashboard
+from lectora_backend.api.routes import dashboard, costing
 from lectora_backend.config import settings
 from lectora_backend.dependencies import engine, get_current_user
 from lectora_backend.repositories.blob_repository import BlobRepository
@@ -71,3 +71,4 @@ app.include_router(storage.router, prefix="/storage", tags=["storage"], dependen
 app.include_router(generate_to.router, prefix="/documents", tags=["documents"], dependencies=_auth)
 app.include_router(settings_routes.router, prefix="/settings", tags=["settings"], dependencies=_auth)
 app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"], dependencies=_auth)
+app.include_router(costing.router, prefix="/costing", tags=["costing"], dependencies=_auth)

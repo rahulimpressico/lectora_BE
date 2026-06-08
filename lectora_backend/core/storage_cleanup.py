@@ -141,7 +141,24 @@ def _resolve_local_artifact(path: str) -> Path:
     return target
 
 
-def delete_storage_file(path: str, source: Literal["artifacts", "uploads"]) -> None:
+def _course_generation_artifacts_container_name() -> str:
+    from lectora_backend.config import settings
+
+    return settings.course_generation_artifacts_container_name
+
+
+def _generated_courses_container_name() -> str:
+    from lectora_backend.config import settings
+
+    return settings.generated_courses_container_name
+
+
+def delete_storage_file(
+    path: str,
+    source: Literal[
+        "artifacts", "uploads", "course-generation-artifacts", "generated-courses"
+    ],
+) -> None:
     """Delete one file from Azure Blob and/or local storage."""
     clean = path.strip().lstrip("/")
     if not clean or ".." in clean:
@@ -152,7 +169,31 @@ def delete_storage_file(path: str, source: Literal["artifacts", "uploads"]) -> N
 
     removed = False
 
-    if source == "uploads":
+    if source == "course-generation-artifacts":
+        if _azure_configured():
+            from lectora_backend.repositories.blob_repository import BlobRepository
+
+            repo = BlobRepository(container_name=_course_generation_artifacts_container_name())
+            if repo.exists(clean):
+                repo.delete_blob(clean)
+                removed = True
+    elif source == "generated-courses":
+        if _azure_configured():
+            from lectora_backend.repositories.blob_repository import BlobRepository
+
+            repo = BlobRepository(container_name=_generated_courses_container_name())
+            if repo.exists(clean):
+                repo.delete_blob(clean)
+                removed = True
+        try:
+            target = _resolve_local_artifact(path)
+            if target.is_file():
+                target.unlink(missing_ok=True)
+                removed = True
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+    elif source == "uploads":
         blob_path = _strip_upload_blob_roots(path)
         if _azure_configured():
             from lectora_backend.repositories.blob_repository import BlobRepository
@@ -193,7 +234,12 @@ def delete_storage_file(path: str, source: Literal["artifacts", "uploads"]) -> N
         )
 
 
-def delete_storage_folder(folder_path: str, source: Literal["artifacts", "uploads"]) -> int:
+def delete_storage_folder(
+    folder_path: str,
+    source: Literal[
+        "artifacts", "uploads", "course-generation-artifacts", "generated-courses"
+    ],
+) -> int:
     """Delete all blobs/files under a folder prefix. Returns items removed."""
     clean = folder_path.strip().lstrip("/").rstrip("/")
     if not clean or ".." in clean:
@@ -204,7 +250,33 @@ def delete_storage_folder(folder_path: str, source: Literal["artifacts", "upload
 
     removed = 0
 
-    if source == "uploads":
+    if source == "course-generation-artifacts":
+        prefix = clean if clean.endswith("/") else f"{clean}/"
+        if _azure_configured():
+            from lectora_backend.repositories.blob_repository import BlobRepository
+
+            removed += BlobRepository(
+                container_name=_course_generation_artifacts_container_name()
+            ).delete_blobs_by_prefix(prefix)
+    elif source == "generated-courses":
+        prefix = clean if clean.endswith("/") else f"{clean}/"
+        if _azure_configured():
+            from lectora_backend.repositories.blob_repository import BlobRepository
+
+            removed += BlobRepository(
+                container_name=_generated_courses_container_name()
+            ).delete_blobs_by_prefix(prefix)
+        try:
+            target = _resolve_local_artifact(folder_path)
+            if target.is_dir():
+                import shutil
+
+                shutil.rmtree(target, ignore_errors=True)
+                removed += 1
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+    elif source == "uploads":
         prefix = clean if clean.endswith("/") else f"{clean}/"
         blob_prefix = _strip_upload_blob_roots(prefix)
         if _azure_configured():

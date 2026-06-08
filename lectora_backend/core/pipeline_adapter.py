@@ -359,6 +359,23 @@ class PipelineAdapter:
                 artifact_refs[key] = {
                     "blobPath": self._upload_file(local_path, blob_path)}
                 logger.info("Uploaded artifact %s → %s", key, blob_path)
+                if key == "generatedStudyGuide":
+                    from lectora_backend.config import settings
+
+                    generated_repo = BlobRepository(
+                        container_name=settings.generated_courses_container_name,
+                    )
+                    content_type, _ = mimetypes.guess_type(str(local_path))
+                    generated_repo.upload_file(
+                        local_path=str(local_path),
+                        blob_path=blob_path,
+                        content_type=content_type,
+                    )
+                    logger.info(
+                        "Uploaded generatedStudyGuide → %s/%s",
+                        settings.generated_courses_container_name,
+                        blob_path,
+                    )
             else:
                 logger.warning("Artifact %s not found at %s — skipping", key, local_path)
 

@@ -73,7 +73,9 @@ class BrowseResponse(BaseModel):
 class DeleteStorageFilesRequest(BaseModel):
     paths: list[str] = Field(default_factory=list, max_length=100)
     folder_paths: list[str] = Field(default_factory=list, alias="folderPaths", max_length=50)
-    source: Literal["artifacts", "uploads"] = "uploads"
+    source: Literal[
+        "artifacts", "uploads", "course-generation-artifacts", "generated-courses"
+    ] = "uploads"
 
     model_config = {"populate_by_name": True}
 
@@ -106,6 +108,24 @@ def _main_container_name() -> str:
     from lectora_backend.config import settings  # type: ignore[attr-defined]
 
     return getattr(settings, "blob_container_name", None) or "regedlectoraaistorage"
+
+
+def _course_generation_artifacts_container_name() -> str:
+    from lectora_backend.config import settings  # type: ignore[attr-defined]
+
+    return (
+        getattr(settings, "course_generation_artifacts_container_name", None)
+        or "course-generation-artifacts"
+    )
+
+
+def _generated_courses_container_name() -> str:
+    from lectora_backend.config import settings  # type: ignore[attr-defined]
+
+    return (
+        getattr(settings, "generated_courses_container_name", None)
+        or "generated-courses"
+    )
 
 
 def _uploads_container_display_name() -> str:
@@ -279,28 +299,67 @@ def _azure_browse_container(
     )
 
 
+def _local_artifact_path_candidates(relative_path: str) -> list[str]:
+    """Map Azure blob paths to possible local dev paths (flat vs output/ layout)."""
+    from lectora_backend.core.course_storage import strip_legacy_outputs_prefix
+
+    clean = strip_legacy_outputs_prefix(relative_path.strip().lstrip("/"))
+    if not clean:
+        return []
+    candidates = [clean]
+    if "/output/" in clean:
+        candidates.append(clean.replace("/output/", "/"))
+    if "/state/pipeline_shared_state.json" in clean:
+        candidates.append(clean.replace("/state/pipeline_shared_state.json", "/shared_state.json"))
+    if clean.endswith("/state/shared_state.json"):
+        candidates.append(clean.replace("/state/shared_state.json", "/shared_state.json"))
+    # Preserve order, drop duplicates.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in candidates:
+        if item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
 def _resolve_local_file(source: Literal["artifacts", "uploads"], relative_path: str) -> Path:
     clean = relative_path.strip().lstrip("/")
     if source == "uploads":
         base = _UPLOAD_ROOT.resolve()
         rel = _local_uploaded_documents_relative(clean)
-    else:
-        from lectora_backend.core.course_storage import strip_legacy_outputs_prefix
+        target = (base / rel).resolve() if rel else base.resolve()
+        if not target.is_relative_to(base):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid path")
+        if not target.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+        return target
 
-        rel = strip_legacy_outputs_prefix(clean)
-        if rel and (_LOCAL_COURSES_DIR / rel).exists():
+    rel_candidates = _local_artifact_path_candidates(clean)
+    if not rel_candidates:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+    for rel in rel_candidates:
+        if (_LOCAL_COURSES_DIR / rel).is_file():
             base = _LOCAL_COURSES_DIR.resolve()
-        elif (_LOCAL_COURSES_DIR / rel).exists() or not (_LOCAL_LEGACY_DIR / rel).exists():
-            base = _LOCAL_COURSES_DIR.resolve()
-        else:
+        elif (_LOCAL_LEGACY_DIR / rel).is_file():
             base = _LOCAL_LEGACY_DIR.resolve()
+        else:
+            continue
+        target = (base / rel).resolve()
+        if target.is_relative_to(base) and target.is_file():
+            return target
 
-    target = (base / rel).resolve() if rel else base.resolve()
+    # Default base for the not-found error path.
+    rel = rel_candidates[0]
+    if (_LOCAL_COURSES_DIR / rel).exists() or not (_LOCAL_LEGACY_DIR / rel).exists():
+        base = _LOCAL_COURSES_DIR.resolve()
+    else:
+        base = _LOCAL_LEGACY_DIR.resolve()
+    target = (base / rel).resolve()
     if not target.is_relative_to(base):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid path")
-    if not target.is_file():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
-    return target
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 
 
 def _local_browse_at(base: Path, relative_prefix: str) -> BrowseResponse:
@@ -453,6 +512,36 @@ def _try_azure_file(blob_path: str) -> tuple[bytes, str] | None:
         raise
 
 
+def _try_azure_course_generation_artifact(blob_path: str) -> tuple[bytes, str] | None:
+    """Return file bytes from the production pipeline artifacts container."""
+    if not _azure_configured():
+        return None
+    try:
+        return _download_azure_blob_from_repo(
+            BlobRepository(container_name=_course_generation_artifacts_container_name()),
+            blob_path.strip().lstrip("/"),
+        )
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            return None
+        raise
+
+
+def _try_azure_generated_courses_file(blob_path: str) -> tuple[bytes, str] | None:
+    """Return file bytes from the generated-courses deliverables container."""
+    if not _azure_configured():
+        return None
+    try:
+        return _download_azure_blob_from_repo(
+            BlobRepository(container_name=_generated_courses_container_name()),
+            blob_path.strip().lstrip("/"),
+        )
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            return None
+        raise
+
+
 def _try_azure_upload_file(blob_path: str) -> tuple[bytes, str] | None:
     """Return file bytes from the dedicated uploaded-documents container."""
     if not _azure_configured():
@@ -562,6 +651,73 @@ async def browse_uploaded_documents(
     return _filter_upload_entries(_local_browse_artifacts(prefix))
 
 
+_GENERATED_COURSES_EXTS: frozenset[str] = frozenset({".docx", ".doc", ".pdf"})
+_PIPELINE_ARTIFACT_EXCLUDE_EXTS: frozenset[str] = frozenset({".docx", ".doc"})
+
+
+def _filter_generated_courses(response: BrowseResponse) -> BrowseResponse:
+    """Keep only folder entries and DOCX/PDF files for the Generated Courses view.
+
+    This provides logical separation: Generated Courses shows final deliverables
+    while Pipeline Artifacts shows all intermediate JSON/log/state files.
+    """
+    kept = [
+        e for e in response.entries
+        if e.entryType == "folder"
+        or (e.extension or "").lower() in _GENERATED_COURSES_EXTS
+    ]
+    return BrowseResponse(
+        prefix=response.prefix,
+        entries=kept,
+        totalFiles=sum(1 for e in kept if e.entryType == "file"),
+        totalFolders=sum(1 for e in kept if e.entryType == "folder"),
+        totalSize=sum(e.size or 0 for e in kept if e.entryType == "file"),
+        source=response.source,
+        containerName=response.container_name,
+    )
+
+
+_JSON_ARTIFACT_EXTS: frozenset[str] = frozenset({".json"})
+
+
+def _filter_json_artifacts(response: BrowseResponse) -> BrowseResponse:
+    """Keep folder entries and JSON files only (course-generation-artifacts view)."""
+    kept = [
+        e for e in response.entries
+        if e.entryType == "folder"
+        or (e.extension or "").lower() in _JSON_ARTIFACT_EXTS
+    ]
+    return BrowseResponse(
+        prefix=response.prefix,
+        entries=kept,
+        totalFiles=sum(1 for e in kept if e.entryType == "file"),
+        totalFolders=sum(1 for e in kept if e.entryType == "folder"),
+        totalSize=sum(e.size or 0 for e in kept if e.entryType == "file"),
+        source=response.source,
+        containerName=response.container_name,
+    )
+
+
+def _filter_pipeline_artifacts(response: BrowseResponse) -> BrowseResponse:
+    """Exclude final DOCX/DOC outputs from Pipeline Artifacts so they only appear
+    in Generated Courses.  JSON, logs, state files, and images remain visible.
+    """
+    kept = [
+        e for e in response.entries
+        if e.entryType == "folder"
+        or (e.extension or "").lower() not in _PIPELINE_ARTIFACT_EXCLUDE_EXTS
+    ]
+    return BrowseResponse(
+        prefix=response.prefix,
+        entries=kept,
+        totalFiles=sum(1 for e in kept if e.entryType == "file"),
+        totalFolders=sum(1 for e in kept if e.entryType == "folder"),
+        totalSize=sum(e.size or 0 for e in kept if e.entryType == "file"),
+        source=response.source,
+        containerName=response.container_name,
+    )
+
+
 @router.get("/categories/{category}/browse", response_model=BrowseResponse)
 async def browse_by_category(
     category: str,
@@ -570,10 +726,11 @@ async def browse_by_category(
     """Browse storage by named category.
 
     Categories:
-      source-documents    — uploaded source DOCX/PDF files (uploaded-documents container)
-      generated-courses   — final generated DOCX outputs (generated-courses container)
-      pipeline-artifacts  — all pipeline artifacts (main artifacts container)
-      test-data           — same as pipeline-artifacts (fallback)
+      source-documents              — uploaded source DOCX/PDF files (uploaded-documents container)
+      generated-courses             — final DOCX/PDF outputs (generated-courses container)
+      pipeline-artifacts            — JSON logs + dev pipeline files (regedlectoraaistorage container)
+      course-generation-artifacts   — per-course pipeline JSON (course-generation-artifacts container)
+      test-data                     — same as pipeline-artifacts (fallback)
     """
     if category == "source-documents":
         if _azure_configured():
@@ -592,51 +749,132 @@ async def browse_by_category(
         return local
 
     if category == "generated-courses":
-        # The pipeline (PipelineAdapter) saves all artifacts — including the final
-        # study_guide.docx — to the MAIN artifacts container (blob_container_name,
-        # default "regedlectoraaistorage") under {course_slug}/output/.
-        # The separate "generated-courses" container is only populated by the
-        # manual "Save to Azure" button in the course editor.
-        # For the Asset Library we browse the main container so that every
-        # pipeline-generated course is visible without requiring a manual save.
-        azure_prefix = _artifacts_browse_prefix(prefix)
+        azure_prefix = prefix.strip().lstrip("/")
+        azure_prefix = (
+            azure_prefix if not azure_prefix or azure_prefix.endswith("/") else f"{azure_prefix}/"
+        )
         if _azure_configured():
             try:
-                result = _azure_browse(azure_prefix)
-                result.container_name = _main_container_name()
-                if result.entries or prefix:
-                    return result
+                result = _azure_browse_container(
+                    BlobRepository(container_name=_generated_courses_container_name()),
+                    azure_prefix,
+                )
+                result.container_name = _generated_courses_container_name()
+                filtered = _filter_generated_courses(result)
+                if filtered.entries or prefix:
+                    return filtered
                 logger.info(
-                    "[storage/categories] generated-courses: empty at prefix=%r in main container.",
+                    "[storage/categories] generated-courses: empty at prefix=%r.",
                     azure_prefix,
                 )
             except Exception as exc:
-                logger.warning("[storage/categories] generated-courses Azure failed (%s), using local.", exc)
+                logger.warning(
+                    "[storage/categories] generated-courses Azure failed (%s), using local.",
+                    exc,
+                )
         local = _local_browse_artifacts(prefix)
-        local.container_name = f"{_main_container_name()} (local)"
-        return local
+        local.container_name = f"{_generated_courses_container_name()} (local)"
+        return _filter_generated_courses(local)
 
-    # pipeline-artifacts and test-data → main artifacts container
+    if category == "course-generation-artifacts":
+        azure_prefix = prefix.strip().lstrip("/")
+        azure_prefix = azure_prefix if not azure_prefix or azure_prefix.endswith("/") else f"{azure_prefix}/"
+        if _azure_configured():
+            try:
+                result = _azure_browse_container(
+                    BlobRepository(container_name=_course_generation_artifacts_container_name()),
+                    azure_prefix,
+                )
+                result.container_name = _course_generation_artifacts_container_name()
+                filtered = _filter_json_artifacts(result)
+                if filtered.entries or prefix:
+                    return filtered
+            except Exception as exc:
+                logger.warning(
+                    "[storage/categories] course-generation-artifacts Azure failed (%s).",
+                    exc,
+                )
+        return BrowseResponse(
+            prefix=azure_prefix,
+            entries=[],
+            totalFiles=0,
+            totalFolders=0,
+            totalSize=0,
+            source="azure",
+            container_name=_course_generation_artifacts_container_name(),
+        )
+
+    # pipeline-artifacts — JSON only from regedlectoraaistorage (live logs + dev pipeline).
     azure_prefix = _artifacts_browse_prefix(prefix)
     if _azure_configured():
         try:
             result = _azure_browse(azure_prefix)
-            if result.entries or prefix:
-                return result
+            result.container_name = _main_container_name()
+            filtered = _filter_json_artifacts(result)
+            if filtered.entries or prefix:
+                return filtered
         except Exception as exc:
-            logger.warning("[storage/categories] %s Azure failed (%s), using local.", category, exc)
-    return _local_browse_artifacts(prefix)
+            logger.warning(
+                "[storage/categories] %s regedlectoraaistorage failed (%s), trying local.",
+                category,
+                exc,
+            )
+    local = _local_browse_artifacts(prefix)
+    local.container_name = f"{_main_container_name()} (local)"
+    return _filter_json_artifacts(local)
 
 
 @router.get("/file", summary="Download or preview a file")
 async def get_storage_file(
     path: str = Query(..., description="Blob path from browse response"),
-    source: Literal["artifacts", "uploads"] = Query(
+    source: Literal[
+        "artifacts", "uploads", "course-generation-artifacts", "generated-courses"
+    ] = Query(
         default="artifacts",
-        description="artifacts = pipeline output; uploads = uploaded-documents/ in blob",
+        description=(
+            "artifacts = main pipeline container; "
+            "uploads = uploaded-documents; "
+            "course-generation-artifacts = production pipeline JSON container; "
+            "generated-courses = final DOCX/PDF deliverables"
+        ),
     ),
 ) -> Response:
     """Serve file bytes for in-browser preview (images, JSON, DOCX) or download."""
+    if source == "generated-courses":
+        blob_path = path.strip().lstrip("/")
+        azure_result = _try_azure_generated_courses_file(blob_path)
+        if azure_result is not None:
+            data, _ = azure_result
+            return _file_response_bytes(data, blob_path)
+        try:
+            target = _resolve_local_file("artifacts", path)
+            ext = target.suffix.lower()
+            media = _MIME.get(ext, "application/octet-stream")
+            return FileResponse(path=str(target), media_type=media, filename=target.name)
+        except HTTPException:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"File not found in {_generated_courses_container_name()}: {blob_path}",
+            ) from None
+
+    if source == "course-generation-artifacts":
+        blob_path = path.strip().lstrip("/")
+        azure_result = _try_azure_course_generation_artifact(blob_path)
+        if azure_result is not None:
+            data, _ = azure_result
+            return _file_response_bytes(data, blob_path)
+        # In-progress runs: logs JSON may exist locally before Azure sync completes.
+        try:
+            target = _resolve_local_file("artifacts", path)
+            ext = target.suffix.lower()
+            media = _MIME.get(ext, "application/octet-stream")
+            return FileResponse(path=str(target), media_type=media, filename=target.name)
+        except HTTPException:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"File not found in {_course_generation_artifacts_container_name()}: {blob_path}",
+            ) from None
+
     if source == "uploads":
         blob_path = _normalize_blob_path(path, source)
         azure_result = _try_azure_upload_file(blob_path)

@@ -60,12 +60,17 @@ class BlobLayout:
         )
 
 
-def build_blob_layout_for_course(course_title: str) -> BlobLayout:
-    """Layout rooted at ``{course_slug}/`` — reused when the slug already exists."""
+def build_blob_layout_for_course(course_title: str, job_id: str | None = None) -> BlobLayout:
+    """Layout rooted at ``{course_slug}/{job_id}/`` so each job run has an isolated folder.
+
+    Falls back to ``{course_slug}/`` when job_id is not provided (backward-compat
+    for callers that cannot supply a job_id, e.g. the local pipeline.py).
+    """
     if not course_title or not course_title.strip():
         raise ValueError("course_title is required to build a blob layout.")
     slug = sanitize_course_slug(course_title)
-    return BlobLayout(root=slug)
+    root = f"{slug}/{job_id}" if job_id else slug
+    return BlobLayout(root=root)
 
 
 def build_blob_layout_from_input_blob(

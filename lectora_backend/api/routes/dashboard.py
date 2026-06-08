@@ -4,10 +4,7 @@ GET /dashboard/summary
 All counts come from Azure — no local filesystem or in-memory store.
 
   coursesGenerated / completed
-      Study-guide blobs across Azure containers:
-        • generated-courses
-        • course-generation-artifacts
-        • regedlectoraaistorage (main/legacy)
+      Study-guide DOCX blobs in the ``generated-courses`` Azure container.
 
   inProgress
       PENDING + PROCESSING rows in the SQL ``jobs`` table (production queue/worker).
@@ -101,21 +98,9 @@ def _completed_from_azure() -> int:
             detail="Azure Blob Storage is not configured (AZURE_STORAGE_CONNECTION_STRING).",
         )
 
-    containers_to_scan = [
-        settings.generated_courses_container_name,
-        settings.course_generation_artifacts_container_name,
-        settings.blob_container_name,
-    ]
-    seen: set[str] = set()
-    unique_containers = [
-        c for c in containers_to_scan
-        if c and c.strip() and not (c in seen or seen.add(c))  # type: ignore[func-returns-value]
-    ]
-
-    total = sum(_count_study_guides_in_container(c) for c in unique_containers)
-    logger.debug(
-        "[dashboard] Azure completed=%d containers=%s", total, unique_containers
-    )
+    container = settings.generated_courses_container_name
+    total = _count_study_guides_in_container(container)
+    logger.debug("[dashboard] Azure completed=%d container=%s", total, container)
     return total
 
 

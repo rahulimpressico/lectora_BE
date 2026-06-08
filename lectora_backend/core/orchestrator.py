@@ -269,6 +269,15 @@ class Orchestrator:
                 state_blob_path=state_blob_path,
             )
 
+            from pathlib import Path
+            from lectora_backend.pipeline.shared_llm_config.tracer import set_run_context
+
+            state = prepared_inputs["state"]
+            course_title = (state.get("request") or {}).get("courseTitle") or ""
+            study_guide_path = str(prepared_inputs["studyGuidePath"])
+            doc_name = Path(study_guide_path).stem or course_title.replace(" ", "_")
+            set_run_context(job_id, doc_name)
+
             job_log.info("Inputs ready — beginning A0 → A1 → S1 gate cycles")
 
             # ── A0 → A1 → S1 gate ───────────────────────────────────────────

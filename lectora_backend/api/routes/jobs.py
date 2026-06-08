@@ -222,7 +222,7 @@ async def create_job(
     if not study_guide_blob_path or not study_guide_blob_path.strip():
         return _missing_input_response("studyGuide.blobPath is required.")
 
-    blob_layout = build_blob_layout_for_course(payload.course_title)
+    blob_layout = build_blob_layout_for_course(payload.course_title, job_id=job_id)
     course_slug = sanitize_course_slug(payload.course_title)
 
     repository = JobRepository(session)
@@ -354,6 +354,28 @@ async def get_job(
             status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
 
     return _map_job_detail(job)
+
+
+# ── Job lookup by course slug ──────────────────────────────────────────────────
+
+@router.get("/by-course-slug/{course_slug}")
+async def get_job_by_course_slug(
+    course_slug: str,
+    session: Session = Depends(get_db_session),
+) -> dict:
+    """Return the most recent job for a given course slug (used by Asset Library to open DOCX in editor)."""
+    repository = JobRepository(session)
+    job = repository.get_latest_job_by_course_slug(course_slug)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No job found for course slug '{course_slug}'.",
+        )
+    return {
+        "jobId": job.job_id,
+        "status": job.status.value,
+        "courseTitle": job.course_title,
+    }
 
 
 # ── Job deletion ───────────────────────────────────────────────────────────────

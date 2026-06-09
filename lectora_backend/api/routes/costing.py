@@ -2,31 +2,14 @@
 GET /costing/summary
 GET /costing/documents/{documentId}
 
-Data sources (in priority order):
-  1. Azure Cost Management API  — real Azure billing data for summary totals and
-     daily cost trends.  Requires AZURE_SUBSCRIPTION_ID + service-principal
-     credentials (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET).
-     Optional: AZURE_RESOURCE_GROUP to narrow the scope to a single resource group.
-
-  2. LLM trace files  — per-document and per-model breakdowns computed from
-     pipeline/logs/*/<agent>/llm_traces.jsonl written by tracer.py.
-     Used for document-level drill-down and token counts even when Azure Cost
-     Management returns data (because Azure billing is aggregated by resource,
-     not by course run).
-
-  3. Pure trace fallback  — when neither Azure Cost Management nor any trace
-     files are available, returns empty collections so the UI shows a "no data"
-     state instead of an error.
-
-Why both?
-  Azure Cost Management → actual billed USD amounts, daily trend, OpenAI service total.
-  LLM traces           → per-document attribution, per-model token usage, per-stage costs.
+All cost and token data comes from LLM trace files (``llm_traces.jsonl``) written
+by tracer.py — read from local ``pipeline/logs/`` and, when configured, synced
+Azure Blob artifacts. Returns empty collections when no traces exist.
 """
 from __future__ import annotations
 
 import json
 import logging
-import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -44,22 +27,28 @@ _LOGS_ROOT = (
     Path(__file__).resolve().parent.parent.parent / "pipeline" / "logs"
 )
 
-# ── Agent → stage key mapping ──────────────────────────────────────────────────
+# ── Agent → stage key mapping (names match model_registry + pipeline agents) ───
 _AGENT_TO_STAGE: dict[str, str] = {
-    "A0":             "to_generation",
+    "A0":             "a0_classification",
     "A0_TO":          "to_generation",
-    "A1":             "assessment_generation",
-    "S1":             "assessment_generation",
-    "SECTION_MAPPER": "metadata_generation",
-    "KC_PLANNER":     "metadata_generation",
+    "A1":             "outline_interpretation",
+    "S1":             "structure_review",
+    "SECTION_MAPPER": "section_mapping",
+    "KC_PLANNER":     "kc_planning",
     "A2":             "content_generation",
-    "S2":             "assessment_generation",
+    "S2":             "quality_assurance",
+    "EDITOR":         "course_editor",
 }
 _STAGE_NAMES: dict[str, str] = {
+    "a0_classification":     "Rule Classification",
     "to_generation":         "TO Generation",
+    "outline_interpretation": "Outline Interpretation",
+    "structure_review":      "Structure Review",
+    "section_mapping":       "Section Mapping",
+    "kc_planning":           "KC Planning",
     "content_generation":    "Content Generation",
-    "assessment_generation": "Assessment Generation",
-    "metadata_generation":   "Metadata Generation",
+    "quality_assurance":     "Quality Assurance",
+    "course_editor":         "Course Editor",
     "other":                 "Other Processing",
 }
 
@@ -88,12 +77,14 @@ class DocumentCost(BaseModel):
     documentId: str
     documentName: str
     documentType: str
+    runSummary: str
     status: str
     totalCost: float
     inputTokens: int
     outputTokens: int
     totalRequests: int
     modelsUsed: list[str]
+    agentsUsed: list[str] = []
     lastUpdated: str
     modelBreakdown: list[ModelUsage]
     stageBreakdown: list[StageBreakdown]
@@ -104,12 +95,6 @@ class CostingTrendPoint(BaseModel):
     cost: float
     inputTokens: int
     outputTokens: int
-
-
-class ServiceCostBreakdown(BaseModel):
-    serviceName: str
-    cost: float
-    sharePercent: float
 
 
 class AgentModelSummary(BaseModel):
@@ -141,26 +126,12 @@ class CostingSummary(BaseModel):
     modelSummary: list[ModelUsage]
     documents: list[DocumentCost]
     stageSummary: list[StageBreakdown] = []
-    serviceBreakdown: list[ServiceCostBreakdown] = []
     agentModelSummary: list[AgentModelSummary] = []
     traceTotalCost: float = 0.0
-    azureTotalCost: float = 0.0
     costChangePercent: float | None = None
     documentsChangePercent: float | None = None
-    dataSource: str  # "azure_cost_management" | "llm_traces" | "empty"
+    dataSource: str  # "llm_traces" | "empty"
     currency: str = "USD"
-    azureBillingConfigured: bool = False
-    azureBillingError: str | None = None
-    azureBillingSource: str | None = None  # service_principal | azure_cli | cache
-    azureBillingStale: bool = False
-    azureFetchedAt: str | None = None
-
-
-# Set by the most recent Azure Cost Management query attempt (for FE error display).
-_last_azure_billing_error: str | None = None
-
-_AZURE_CACHE_FILE = _LOGS_ROOT.parent / ".azure_cost_cache.json"
-_AZURE_CACHE_TTL_SECONDS = 30 * 60
 
 
 # ── LLM Trace helpers ──────────────────────────────────────────────────────────
@@ -173,14 +144,6 @@ _TRACE_ONLY_AGENT_META: dict[str, dict[str, Any]] = {
         "pipeline_step": 4,
     },
 }
-
-_OPENAI_SERVICES = {
-    "cognitive services",
-    "azure openai",
-    "azure openai service",
-    "foundry models",
-}
-
 
 def _doc_from_trace_path(path: Path) -> str | None:
     """Infer doc_name from logs/{doc_name}/{agent}/llm_traces.jsonl layout."""
@@ -227,6 +190,66 @@ def _format_document_name(doc_key: str) -> str:
     if doc_key.startswith("untagged_"):
         return doc_key.replace("untagged_", "Untagged ").replace("_", " ")
     return doc_key.replace("_", " ")
+
+
+def _agents_in_traces(traces: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(t.get("agent") or "").strip().upper()
+        for t in traces
+        if str(t.get("agent") or "").strip()
+    }
+
+
+def _infer_document_type(doc_key: str, agents: set[str]) -> str:
+    if doc_key.startswith("run_"):
+        return "Pipeline Run"
+    if doc_key.startswith("untagged_"):
+        return "Untagged Run"
+    if "A2" in agents:
+        return "Course Generation"
+    if agents <= {"A0", "A0_TO"}:
+        return "TO Generation"
+    if "A1" in agents:
+        return "Outline Processing"
+    if "EDITOR" in agents:
+        return "Course Editor"
+    return "Document Run"
+
+
+def _document_run_summary(doc_key: str, agents: set[str]) -> str:
+    if doc_key.startswith("run_"):
+        return (
+            "All LLM calls from one pipeline job, grouped by run ID. "
+            "Includes every traced agent that executed in that run."
+        )
+    if doc_key.startswith("untagged_"):
+        return "LLM calls that were not tagged with a course or document name in tracer.py."
+    if "A2" in agents:
+        parts = []
+        if "A0" in agents or "A0_TO" in agents:
+            parts.append("TO/classification")
+        if "A1" in agents:
+            parts.append("outline interpretation")
+        parts.append("lesson content generation")
+        if "EDITOR" in agents:
+            parts.append("in-app editor AI")
+        return (
+            f"Full course workflow for this document: {', then '.join(parts)}. "
+            "Cost is the sum of every traced LLM request for this slug."
+        )
+    if agents <= {"A0", "A0_TO"}:
+        return (
+            "Timed Outline or rule-classification work only — no A1 outline parsing "
+            "or A2 content generation in these traces."
+        )
+    if "A1" in agents:
+        return (
+            "Outline interpretation and course-structure work (A1). "
+            "No A2 lesson content generation in these traces."
+        )
+    if "EDITOR" in agents:
+        return "In-app course editor AI operations (rewrite, expand, tone, simplify)."
+    return "LLM usage grouped by the document slug recorded in tracer.py."
 
 
 def _enrich_trace_record(
@@ -368,20 +391,12 @@ def _build_documents(records: list[dict[str, Any]]) -> list[DocumentCost]:
         total_out  = sum(m["outputTokens"] for m in model_agg.values())
         total_req  = sum(m["totalRequests"] for m in model_agg.values())
 
-        doc_type = "Course" if not doc_name.startswith(("untagged_", "run_")) and doc_name != "unknown" else "Trace Run"
+        agents_used = _agents_in_traces(traces)
+        doc_type = _infer_document_type(doc_name, agents_used)
+        run_summary = _document_run_summary(doc_name, agents_used)
 
-        docs.append(DocumentCost(
-            documentId=doc_name,
-            documentName=_format_document_name(doc_name),
-            documentType=doc_type,
-            status="completed",
-            totalCost=round(total_cost, 6),
-            inputTokens=total_in,
-            outputTokens=total_out,
-            totalRequests=total_req,
-            modelsUsed=list(model_agg.keys()),
-            lastUpdated=last_ts or datetime.now(timezone.utc).isoformat(),
-            modelBreakdown=[
+        model_breakdown = sorted(
+            [
                 ModelUsage(
                     modelId=dep,
                     modelName=_deployment_label(dep),
@@ -392,7 +407,11 @@ def _build_documents(records: list[dict[str, Any]]) -> list[DocumentCost]:
                 )
                 for dep, v in model_agg.items()
             ],
-            stageBreakdown=[
+            key=lambda m: m.cost,
+            reverse=True,
+        )
+        stage_breakdown = sorted(
+            [
                 StageBreakdown(
                     stageKey=sk,
                     stageName=_STAGE_NAMES.get(sk, sk),
@@ -403,6 +422,25 @@ def _build_documents(records: list[dict[str, Any]]) -> list[DocumentCost]:
                 )
                 for sk, sv in stage_agg.items()
             ],
+            key=lambda s: s.cost,
+            reverse=True,
+        )
+
+        docs.append(DocumentCost(
+            documentId=doc_name,
+            documentName=_format_document_name(doc_name),
+            documentType=doc_type,
+            runSummary=run_summary,
+            status="completed",
+            totalCost=round(total_cost, 6),
+            inputTokens=total_in,
+            outputTokens=total_out,
+            totalRequests=total_req,
+            modelsUsed=[m.modelId for m in model_breakdown],
+            agentsUsed=sorted(agents_used),
+            lastUpdated=last_ts or datetime.now(timezone.utc).isoformat(),
+            modelBreakdown=model_breakdown,
+            stageBreakdown=stage_breakdown,
         ))
 
     return sorted(docs, key=lambda d: d.lastUpdated, reverse=True)
@@ -492,31 +530,6 @@ def _trace_period_metrics(
             previous_docs.add(doc_key)
 
     return current_cost, previous_cost, len(current_docs), len(previous_docs)
-
-
-def _trend_period_costs(
-    trend: list[CostingTrendPoint],
-    *,
-    period_days: int = 30,
-) -> tuple[float, float]:
-    """Sum daily trend costs for the latest vs prior 30-day windows."""
-    if not trend:
-        return 0.0, 0.0
-    now = datetime.now(timezone.utc)
-    current_start = (now - timedelta(days=period_days)).date()
-    previous_start = (now - timedelta(days=period_days * 2)).date()
-
-    current_cost = previous_cost = 0.0
-    for point in trend:
-        try:
-            point_date = datetime.strptime(point.date[:10], "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if point_date >= current_start:
-            current_cost += point.cost
-        elif previous_start <= point_date < current_start:
-            previous_cost += point.cost
-    return current_cost, previous_cost
 
 
 def _deployment_label(deployment_id: str) -> str:
@@ -677,489 +690,54 @@ def _trace_model_summary(records: list[dict[str, Any]]) -> list[ModelUsage]:
     )
 
 
-# ── Azure Cost Management helpers ──────────────────────────────────────────────
-
-def _get_service_principal_credential():
-    """Return a ClientSecretCredential using service-principal env vars."""
-    from azure.identity import ClientSecretCredential  # type: ignore[import]
-    from lectora_backend.config import settings
-
-    if not all([settings.azure_tenant_id, settings.azure_client_id, settings.azure_client_secret]):
-        return None
-    return ClientSecretCredential(
-        tenant_id=settings.azure_tenant_id,
-        client_id=settings.azure_client_id,
-        client_secret=settings.azure_client_secret,
-    )
-
-
-def _cost_management_credentials() -> list[tuple[str, object]]:
-    """
-    Credentials to try for Cost Management queries, in priority order.
-
-    1. Service principal (production)
-    2. Azure CLI session (local dev fallback when ``az login`` has access but SP does not)
-    """
-    creds: list[tuple[str, object]] = []
-    sp = _get_service_principal_credential()
-    if sp is not None:
-        creds.append(("service_principal", sp))
-    try:
-        from azure.identity import AzureCliCredential  # type: ignore[import]
-
-        creds.append(("azure_cli", AzureCliCredential()))
-    except Exception:
-        pass
-    return creds
-
-
-def _azure_billing_is_configured() -> bool:
-    from lectora_backend.config import settings
-
-    return bool(
-        settings.azure_subscription_id.strip()
-        and _cost_management_credentials()
-    )
-
-
-def _is_authorization_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return "authorizationfailed" in text or "does not have authorization" in text
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    return "429" in str(exc) or "too many requests" in str(exc).lower()
-
-
-def _find_column_index(columns: list[str], *candidates: str) -> int:
-    """Return index of the first matching column name (case-insensitive)."""
-    for cand in candidates:
-        if cand in columns:
-            return columns.index(cand)
-    for i, col in enumerate(columns):
-        if "costusd" in col or col in ("cost", "pretaxcost", "totalcost", "totalcostusd"):
-            return i
-    raise ValueError(f"Azure Cost Management: no cost column in {columns}")
-
-
-def _load_azure_cost_cache() -> dict[str, Any] | None:
-    if not _AZURE_CACHE_FILE.exists():
-        return None
-    try:
-        payload = json.loads(_AZURE_CACHE_FILE.read_text(encoding="utf-8"))
-        fetched_at = _parse_trace_timestamp(str(payload.get("fetched_at") or ""))
-        if fetched_at is None:
-            return None
-        age = (datetime.now(timezone.utc) - fetched_at).total_seconds()
-        if age > _AZURE_CACHE_TTL_SECONDS:
-            return None
-        return payload
-    except (OSError, json.JSONDecodeError, ValueError, TypeError):
-        return None
-
-
-def _load_stale_azure_cost_cache() -> dict[str, Any] | None:
-    """Return cache regardless of TTL — used when live API is rate-limited."""
-    if not _AZURE_CACHE_FILE.exists():
-        return None
-    try:
-        return json.loads(_AZURE_CACHE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def _save_azure_cost_cache(
-    *,
-    days: int,
-    source: str,
-    trend: list[CostingTrendPoint],
-    services: list[ServiceCostBreakdown],
-) -> None:
-    try:
-        _AZURE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _AZURE_CACHE_FILE.write_text(
-            json.dumps(
-                {
-                    "fetched_at": datetime.now(timezone.utc).isoformat(),
-                    "source": source,
-                    "days": days,
-                    "trend": [p.model_dump() for p in trend],
-                    "services": [s.model_dump() for s in services],
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        logger.debug("[costing] Failed to write Azure cost cache: %s", exc)
-
-
-def _cache_to_azure_result(
-    payload: dict[str, Any],
-    *,
-    stale: bool,
-) -> tuple[list[CostingTrendPoint], list[ServiceCostBreakdown], str, str | None]:
-    trend = [
-        CostingTrendPoint(**row)
-        for row in (payload.get("trend") or [])
-    ]
-    services = [
-        ServiceCostBreakdown(**row)
-        for row in (payload.get("services") or [])
-    ]
-    source = str(payload.get("source") or "cache")
-    fetched_at = str(payload.get("fetched_at") or "") or None
-    if stale:
-        source = f"{source}+cache"
-    return trend, services, source, fetched_at
-
-
-def _parse_cost_management_result(
-    result: object,
-) -> tuple[list[CostingTrendPoint], list[ServiceCostBreakdown]]:
-    columns = [c.name.lower() for c in (result.columns or [])]  # type: ignore[attr-defined]
-    if not columns:
-        raise ValueError("Azure Cost Management returned no columns")
-
-    cost_idx = _find_column_index(
-        columns, "costusd", "totalcostusd", "cost", "pretaxcost", "totalcost",
-    )
-    try:
-        date_idx = _find_column_index(
-            columns, "usagedate", "date", "billingperiodstartdate",
-        )
-    except ValueError as exc:
-        raise ValueError(f"Azure Cost Management: no date column in {columns}") from exc
-
-    service_idx = columns.index("servicename") if "servicename" in columns else None
-
-    daily_cost: dict[str, float] = defaultdict(float)
-    service_cost: dict[str, float] = defaultdict(float)
-    for row in (result.rows or []):  # type: ignore[attr-defined]
-        service_label = "Azure OpenAI"
-        if service_idx is not None:
-            service_name = str(row[service_idx]).strip()
-            if service_name.lower() not in _OPENAI_SERVICES:
-                continue
-            service_label = service_name
-        raw_date = str(row[date_idx])
-        if len(raw_date) == 8 and raw_date.isdigit():
-            date_str = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
-        else:
-            date_str = raw_date[:10]
-        amount = float(row[cost_idx])
-        daily_cost[date_str] += amount
-        service_cost[service_label] += amount
-
-    trend = [
-        CostingTrendPoint(
-            date=d,
-            cost=round(c, 6),
-            inputTokens=0,
-            outputTokens=0,
-        )
-        for d, c in sorted(daily_cost.items())
-    ]
-    service_total = sum(service_cost.values())
-    services = [
-        ServiceCostBreakdown(
-            serviceName=name,
-            cost=round(cost, 6),
-            sharePercent=round((cost / service_total) * 100, 1) if service_total else 0.0,
-        )
-        for name, cost in sorted(service_cost.items(), key=lambda item: -item[1])
-    ]
-    return trend, services
-
-
-class _AzureCostResult(BaseModel):
-    trend: list[CostingTrendPoint]
-    services: list[ServiceCostBreakdown]
-    source: str
-    fetched_at: str | None = None
-    stale: bool = False
-
-
-def _query_azure_costs(days: int = 30) -> _AzureCostResult | None:
-    """
-    Query Azure Cost Management for daily OpenAI spend over the last `days` days.
-
-    Uses a 30-minute file cache and falls back to stale cache on 429 rate limits.
-    Credential order: azure_cli first (local dev), then service principal (production).
-    """
-    global _last_azure_billing_error
-    _last_azure_billing_error = None
-
-    cached = _load_azure_cost_cache()
-    if cached and int(cached.get("days") or 0) >= days:
-        trend, services, source, fetched_at = _cache_to_azure_result(cached, stale=False)
-        if trend:
-            logger.info("[costing] Azure Cost Management cache hit (%d days)", days)
-            return _AzureCostResult(
-                trend=trend, services=services, source=source, fetched_at=fetched_at,
-            )
-
-    try:
-        from azure.mgmt.costmanagement import CostManagementClient  # type: ignore[import]
-        from azure.mgmt.costmanagement.models import (  # type: ignore[import]
-            QueryDefinition,
-            QueryTimePeriod,
-            QueryDataset,
-            QueryAggregation,
-            QueryGrouping,
-        )
-    except ImportError:
-        logger.warning(
-            "[costing] azure-mgmt-costmanagement not installed. "
-            "Run: pip install azure-mgmt-costmanagement azure-identity"
-        )
-        return _fallback_stale_azure_cache(days)
-
-    from lectora_backend.config import settings
-
-    subscription_id = settings.azure_subscription_id.strip()
-    if not subscription_id:
-        logger.debug("[costing] AZURE_SUBSCRIPTION_ID not set — skipping Cost Management query")
-        return _fallback_stale_azure_cache(days)
-
-    credentials = _cost_management_credentials()
-    # Prefer CLI in local dev — service principal often lacks Cost Management Reader.
-    credentials = sorted(credentials, key=lambda item: 0 if item[0] == "azure_cli" else 1)
-    if not credentials:
-        logger.debug("[costing] No Azure credentials available for Cost Management")
-        return _fallback_stale_azure_cache(days)
-
-    resource_group = settings.azure_resource_group.strip()
-    scope = (
-        f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}"
-        if resource_group
-        else f"/subscriptions/{subscription_id}"
-    )
-
-    end_dt = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    start_dt = end_dt - timedelta(days=days)
-
-    query = QueryDefinition(
-        type="ActualCost",
-        timeframe="Custom",
-        time_period=QueryTimePeriod(from_property=start_dt, to=end_dt),
-        dataset=QueryDataset(
-            granularity="Daily",
-            aggregation={
-                "totalCostUsd": QueryAggregation(name="CostUSD", function="Sum"),
-            },
-            grouping=[
-                QueryGrouping(type="Dimension", name="ServiceName"),
-            ],
-        ),
-    )
-
-    errors: list[str] = []
-    saw_rate_limit = False
-    for label, credential in credentials:
-        max_attempts = 4 if label == "azure_cli" else 2
-        for attempt in range(max_attempts):
-            try:
-                client = CostManagementClient(
-                    credential=credential, subscription_id=subscription_id,
-                )
-                result = client.query.usage(scope=scope, parameters=query)
-                trend, services = _parse_cost_management_result(result)
-                fetched_at = datetime.now(timezone.utc).isoformat()
-                _save_azure_cost_cache(
-                    days=days, source=label, trend=trend, services=services,
-                )
-                logger.info(
-                    "[costing] Azure Cost Management OK via %s (%d days, %d USD points, %d services)",
-                    label,
-                    days,
-                    len(trend),
-                    len(services),
-                )
-                return _AzureCostResult(
-                    trend=trend,
-                    services=services,
-                    source=label,
-                    fetched_at=fetched_at,
-                )
-            except Exception as exc:
-                err_text = str(exc).strip() or type(exc).__name__
-                if _is_rate_limit_error(exc):
-                    saw_rate_limit = True
-                    if attempt < max_attempts - 1:
-                        time.sleep(min(30, 5 * (2 ** attempt)))
-                        continue
-                msg = f"{label}: {err_text}"
-                errors.append(msg)
-                if _is_authorization_error(exc):
-                    logger.debug("[costing] Cost Management auth failed for %s", label)
-                    break
-                logger.warning(
-                    "[costing] Azure Cost Management query failed (%s): %s", label, err_text,
-                )
-                break
-
-    stale = _fallback_stale_azure_cache(days)
-    if stale is not None:
-        if saw_rate_limit:
-            _last_azure_billing_error = (
-                "Azure Cost Management rate-limited (429) — showing cached billing data. "
-                "Refresh again in a few minutes."
-            )
-        return stale
-
-    _last_azure_billing_error = errors[-1] if errors else "Azure Cost Management query failed"
-    return None
-
-
-def _fallback_stale_azure_cache(days: int) -> _AzureCostResult | None:
-    payload = _load_stale_azure_cost_cache()
-    if not payload:
-        return None
-    trend, services, source, fetched_at = _cache_to_azure_result(payload, stale=True)
-    if not trend:
-        return None
-    logger.info("[costing] Using stale Azure cost cache (%d trend points)", len(trend))
-    return _AzureCostResult(
-        trend=trend, services=services, source=source, fetched_at=fetched_at, stale=True,
-    )
-
-
-def _query_azure_total(days: int = 30) -> float | None:
-    """Return total Azure OpenAI spend for the last `days` days, or None."""
-    result = _query_azure_costs(days=days)
-    if result is None:
-        return None
-    return round(sum(p.cost for p in result.trend), 6)
-
-
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @router.get("/summary", response_model=CostingSummary)
 async def get_costing_summary() -> CostingSummary:
-    """
-    Aggregated cost and token usage.
-
-    Summary totals and trend come from Azure Cost Management when configured;
-    per-document and per-model details always come from LLM trace files.
-    """
-    # ── LLM traces (always read — used for per-doc / per-model) ───────────────
-    records   = _read_traces()
+    """Aggregated cost and token usage from LLM trace files."""
+    records = _read_traces()
     documents = _build_documents(records)
-    trace_trend  = _trace_trend(records)
+    trace_trend = _trace_trend(records)
     model_summary = _trace_model_summary(records)
     stage_summary = _build_stage_summary(records)
     agent_model_summary = _build_agent_model_summary(records)
 
     trace_total_cost = round(sum(d.totalCost for d in documents), 6)
-    total_in  = sum(d.inputTokens  for d in documents)
+    total_in = sum(d.inputTokens for d in documents)
     total_out = sum(d.outputTokens for d in documents)
     n_docs = len(documents)
 
-    # ── Azure Cost Management (cached; 60-day window for period comparisons) ───
-    azure_result = _query_azure_costs(days=60)
-    data_source = "llm_traces"
-    azure_billing_ok = azure_result is not None
-    service_breakdown: list[ServiceCostBreakdown] = []
-    azure_total = 0.0
-    azure_billing_source: str | None = None
-    azure_billing_stale = False
-    azure_fetched_at: str | None = None
-
-    if azure_billing_ok:
-        azure_60 = azure_result.trend
-        azure_services_60 = azure_result.services
-        azure_billing_source = azure_result.source
-        azure_billing_stale = azure_result.stale
-        azure_fetched_at = azure_result.fetched_at
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).date()
-        azure_trend_30 = [
-            p for p in azure_60
-            if datetime.strptime(p.date[:10], "%Y-%m-%d").date() >= cutoff
-        ]
-        trace_by_date = {p.date: p for p in trace_trend}
-        merged_trend = [
-            CostingTrendPoint(
-                date=p.date,
-                cost=p.cost,
-                inputTokens=trace_by_date.get(p.date, p).inputTokens,
-                outputTokens=trace_by_date.get(p.date, p).outputTokens,
-            )
-            for p in azure_trend_30
-        ]
-        azure_total = round(sum(p.cost for p in azure_trend_30), 6)
-        azure_total_60 = sum(p.cost for p in azure_60)
-        if azure_total_60 > 0 and azure_services_60:
-            scale = azure_total / azure_total_60
-            scaled = [
-                (s.serviceName, s.cost * scale)
-                for s in azure_services_60
-            ]
-            scaled_total = sum(cost for _, cost in scaled)
-            service_breakdown = [
-                ServiceCostBreakdown(
-                    serviceName=name,
-                    cost=round(cost, 6),
-                    sharePercent=round((cost / scaled_total) * 100, 1) if scaled_total else 0.0,
-                )
-                for name, cost in scaled
-            ]
-        real_total = azure_total if azure_total > 0 else trace_total_cost
-        data_source = "azure_cost_management"
-        trend = merged_trend
-        cur_cost, prev_cost = _trend_period_costs(azure_60)
-        cost_change = _percent_change(cur_cost, prev_cost)
-    else:
-        real_total = trace_total_cost
-        trend = trace_trend
-        cur_cost, prev_cost, _, _ = _trace_period_metrics(records)
-        cost_change = _percent_change(cur_cost, prev_cost)
-
-    avg_cost = round(real_total / n_docs, 6) if n_docs else 0.0
-    monthly_est = round(real_total, 2)
-
-    _, _, cur_docs, prev_docs = _trace_period_metrics(records)
+    cur_cost, prev_cost, cur_docs, prev_docs = _trace_period_metrics(records)
+    cost_change = _percent_change(cur_cost, prev_cost)
     documents_change = _percent_change(float(cur_docs), float(prev_docs))
 
-    azure_configured = _azure_billing_is_configured()
-    if not azure_billing_ok and not trend and not documents and real_total == 0:
-        data_source = "empty"
+    data_source = "llm_traces" if (trace_trend or documents or trace_total_cost > 0) else "empty"
+    avg_cost = round(trace_total_cost / n_docs, 6) if n_docs else 0.0
 
     return CostingSummary(
-        totalCost=round(real_total, 6),
+        totalCost=trace_total_cost,
         totalInputTokens=total_in,
         totalOutputTokens=total_out,
         totalDocumentsProcessed=n_docs,
         averageCostPerDocument=avg_cost,
-        estimatedMonthlyCost=monthly_est,
-        costTrend=trend,
+        estimatedMonthlyCost=round(trace_total_cost, 2),
+        costTrend=trace_trend,
         modelSummary=model_summary,
         documents=documents,
         stageSummary=stage_summary,
-        serviceBreakdown=service_breakdown,
         agentModelSummary=agent_model_summary,
         traceTotalCost=trace_total_cost,
-        azureTotalCost=azure_total,
         costChangePercent=cost_change,
         documentsChangePercent=documents_change,
         dataSource=data_source,
         currency="USD",
-        azureBillingConfigured=azure_configured,
-        azureBillingError=(
-            _last_azure_billing_error
-            if azure_configured and not azure_billing_ok
-            else (_last_azure_billing_error if azure_billing_stale else None)
-        ),
-        azureBillingSource=azure_billing_source,
-        azureBillingStale=azure_billing_stale,
-        azureFetchedAt=azure_fetched_at,
     )
 
 
 @router.get("/documents/{document_id}", response_model=DocumentCost)
 async def get_document_cost(document_id: str) -> DocumentCost:
     """Per-document cost breakdown from LLM traces."""
-    records   = _read_traces()
+    records = _read_traces()
     documents = _build_documents(records)
 
     for doc in documents:

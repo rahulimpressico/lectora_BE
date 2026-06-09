@@ -6,16 +6,35 @@ from fastapi import Depends
 from fastapi.security import OAuth2AuthorizationCodeBearer
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool, StaticPool
 
 from lectora_backend.api.middleware.auth import EntraTokenValidator
 from lectora_backend.config import settings
 
+# ── Database engine ────────────────────────────────────────────────────────────
 
-connect_args = {"check_same_thread": False} if settings.database_url.startswith(
-    "sqlite") else {}
+if settings.database_url.startswith("sqlite"):
+    # SQLite: use NullPool so each session gets its own connection.
+    # StaticPool (a single shared connection) causes "database is locked" errors
+    # when the API and worker process both write concurrently.
+    engine = create_engine(
+        settings.database_url,
+        echo=False,
+        connect_args={"check_same_thread": False},
+        poolclass=NullPool,
+    )
+else:
+    # Production databases (Postgres / Azure SQL): configure a bounded pool so
+    # we never exhaust server-side connections under concurrent load.
+    engine = create_engine(
+        settings.database_url,
+        echo=False,
+        pool_size=10,       # resident connections kept open
+        max_overflow=20,    # burst headroom on top of pool_size
+        pool_timeout=30,    # seconds to wait for a free connection
+        pool_pre_ping=True, # discard stale connections before handing them out
+    )
 
-engine = create_engine(settings.database_url, echo=False,
-                       connect_args=connect_args)
 SessionLocal = sessionmaker(
     bind=engine,
     autoflush=False,
@@ -31,6 +50,8 @@ def get_db_session() -> Generator[Session, None, None]:
     finally:
         db.close()
 
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
 
 oauth2_scheme = OAuth2AuthorizationCodeBearer(
     authorizationUrl=(

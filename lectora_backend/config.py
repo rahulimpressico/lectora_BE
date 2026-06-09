@@ -59,13 +59,6 @@ class Settings(BaseSettings):
     # Container used by the production pipeline adapter for all job artifacts.
     course_generation_artifacts_container_name: str = "course-generation-artifacts"
 
-    # Azure Cost Management — needed for /costing/summary real billing data
-    # Set to the subscription ID that hosts your Azure OpenAI resource.
-    azure_subscription_id: str = ""
-    # Optional: limit cost query to a specific resource group (e.g. "my-rg").
-    # Leave empty to query the entire subscription.
-    azure_resource_group: str = ""
-
     # Langfuse
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""

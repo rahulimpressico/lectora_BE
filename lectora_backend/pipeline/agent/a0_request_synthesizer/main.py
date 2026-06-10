@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -62,6 +63,35 @@ from lectora_backend.pipeline.shared_utils.learning_objectives import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Generic single-word titles that are too vague to use as a course title.
+_GENERIC_TITLES: frozenset[str] = frozenset({
+    "", "course", "untitled", "document", "module", "lesson", "training",
+    "presentation", "content", "material", "study", "guide",
+})
+
+
+def _clean_title_list(titles: list[str]) -> list[str]:
+    """Deduplicate and normalise a list of candidate course titles.
+
+    Steps:
+    1. Strip whitespace from every entry.
+    2. Remove empty strings.
+    3. Remove entries whose entire lowercased value is in ``_GENERIC_TITLES``
+       (single-word placeholders that carry no meaningful information).
+    4. Deduplicate while preserving first-seen order.
+
+    Returns the cleaned list; may be empty if all titles were generic.
+    """
+    seen: dict[str, None] = {}
+    for raw in titles:
+        t = raw.strip()
+        if not t:
+            continue
+        if t.lower() in _GENERIC_TITLES:
+            continue
+        seen[t] = None
+    return list(seen)
 
 
 def _build_heading_map_from_heading_tree(
@@ -115,6 +145,7 @@ class A0RequestSynthesizer:
         duration_hours: Optional[int] = None,
         difficulty_level: Optional[str] = None,
         calculated_word_count: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
     ):
         paths: list[str] = [str(p) for p in (docx_paths or []) if p]
         pdfs: list[str] = [str(p) for p in (pdf_paths or []) if p]
@@ -161,12 +192,51 @@ class A0RequestSynthesizer:
                 int(calculated_word_count) if calculated_word_count is not None else None
             )
 
+        self.cancel_event: Optional[threading.Event] = cancel_event
+
     def _emit_step(self, message: str, *, level: str = "info", stage: str = "A0") -> None:
         if self.step_logger:
             self.step_logger(level, message, stage)
 
+    def _check_cancelled(self) -> None:
+        """Raise RuntimeError('Cancelled') if the cancel event has been set."""
+        if self.cancel_event and self.cancel_event.is_set():
+            raise RuntimeError("Cancelled")
+
+    def _resolve_trace_doc_name(self) -> str:
+        """Filesystem-safe doc stem used for LLM trace attribution (costing)."""
+        if self.course_output_slug:
+            return self.course_output_slug
+        if len(self.docx_paths) == 1:
+            return Path(self.docx_paths[0]).stem
+        if len(self.pdf_paths) == 1 and not self.docx_paths:
+            return Path(self.pdf_paths[0]).stem
+        return f"multi_{self.run_id}"
+
+    def _ensure_trace_context(self) -> None:
+        """Tag LLM traces with doc_name/run_id when the API layer did not set them."""
+        from lectora_backend.pipeline.shared_llm_config.tracer import (
+            get_doc_name,
+            get_run_id,
+            set_doc_name,
+            set_run_context,
+            set_run_id,
+        )
+
+        doc_name = self._resolve_trace_doc_name()
+        has_doc = bool((get_doc_name() or "").strip())
+        has_run = bool((get_run_id() or "").strip())
+        if not has_doc and not has_run:
+            set_run_context(self.run_id, doc_name)
+        elif not has_doc:
+            set_doc_name(doc_name)
+        elif not has_run:
+            set_run_id(self.run_id)
+
     def run(self) -> A0Result:
         """Execute the full A0 pipeline and return a typed A0Result."""
+
+        self._ensure_trace_context()
 
         has_pdf_text = bool(self.extra_text_contents)
         self._emit_step("Loading source documents and extracting structure…")
@@ -406,6 +476,7 @@ class A0RequestSynthesizer:
         )
         logger.info("[EXTRACT] ══════════════════════════════════════════════════════════")
 
+        self._check_cancelled()
         self._emit_step("Extracting source images and preparing prompts…")
         logger.info("[A0] Extracting images...")
         if self.course_output_slug:
@@ -459,14 +530,14 @@ class A0RequestSynthesizer:
         logger.info("[A0] Extracted %s images -> %s", len(images), images_dir)
 
         # ── Build multi-doc title list for classification (extract from each source) ─
-        _classify_all_titles: list[str] = []
+        _raw_titles: list[str] = []
         if parser:
             for _dp in self.docx_paths:
                 try:
                     _ip = CourseDocParser(docx_paths=[str(_dp)])
                     _t = _ip.extract_title()
                     if _t and _t.strip():
-                        _classify_all_titles.append(_t.strip())
+                        _raw_titles.append(_t.strip())
                 except Exception:
                     pass
         if pdf_parser:
@@ -475,12 +546,30 @@ class A0RequestSynthesizer:
                     _ip2 = PDFSourceParser([str(_pp)])
                     _t = _ip2.extract_title()
                     if _t and _t.strip():
-                        _classify_all_titles.append(_t.strip())
+                        _raw_titles.append(_t.strip())
                 except Exception:
                     pass
+        if not _raw_titles and title:
+            _raw_titles = [title]
+
+        # Deduplicate and remove generic placeholders so the LLM receives only
+        # meaningful, distinct titles.
+        _classify_all_titles = _clean_title_list(_raw_titles)
         if not _classify_all_titles and title:
+            # Fallback: even if title looks generic, keep it so the prompt isn't empty.
             _classify_all_titles = [title]
-        logger.info("[A0] Classification titles from all docs: %s", _classify_all_titles)
+        logger.info(
+            "[A0] Classification titles (cleaned, %d of %d raw): %s",
+            len(_classify_all_titles),
+            len(_raw_titles),
+            _classify_all_titles,
+        )
+
+        # If the primary title extracted earlier was generic or empty, promote
+        # the first deduplicated title to avoid sending a placeholder to the LLM.
+        if (not title or title.lower() in _GENERIC_TITLES) and _classify_all_titles:
+            title = _classify_all_titles[0]
+            logger.info("[A0] Primary title upgraded to: %r", title)
 
         # ── Build richer classification content sample (larger than default 3000 chars) ─
         _classify_parts: list[str] = []
@@ -494,6 +583,7 @@ class A0RequestSynthesizer:
                 _classify_parts.append(_s)
         _rich_classification_sample = "\n\n".join(_classify_parts) or classification_sample
 
+        self._check_cancelled()
         hints_arg = None
         t_llm = time.perf_counter()
         self._emit_step("Running rule-family classification and TO generation…")
@@ -630,6 +720,7 @@ class A0RequestSynthesizer:
                                 _all_doc_titles.append(_t)
                         except Exception:
                             pass
+                    self._check_cancelled()
                     return generate_to_with_llm(
                         _title,
                         _objectives,
@@ -654,6 +745,7 @@ class A0RequestSynthesizer:
             llm_result = classify_future.result()
             llm_to_outline_result = to_future.result()
 
+        self._check_cancelled()
         logger.info(
             "[A0] Parallel LLM calls finished in %.1fs",
             time.perf_counter() - t_llm,

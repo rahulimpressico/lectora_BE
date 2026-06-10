@@ -374,11 +374,11 @@ def generate_to_with_llm(
     Returns:
         Parsed ``llm_to_outline`` dict.
     """
-    if custom_system_prompt:
-        # User-supplied free-text override — use as-is and log it clearly.
-        system_prompt = custom_system_prompt.strip()
-        prompt_source = "custom (user-supplied override)"
-    elif duration_hours is not None and calculated_word_count is not None:
+    # Always build the base prompt first (dynamic or static) so the JSON format
+    # instructions and schema are always present.  custom_system_prompt is appended
+    # as supplemental guidance — it must never replace the format contract because
+    # the LLM would lose the required JSON schema and return a free-form response.
+    if duration_hours is not None and calculated_word_count is not None:
         # Standard UI-driven flow: duration + difficulty + optional audience all present.
         system_prompt = build_dynamic_to_prompt(
             duration_hours=duration_hours,
@@ -393,6 +393,19 @@ def generate_to_with_llm(
     else:
         system_prompt = GENERATE_TO_PROMPT
         prompt_source = "static (GENERATE_TO_PROMPT)"
+
+    if custom_system_prompt and custom_system_prompt.strip():
+        # Append user-supplied hints after the base prompt so the JSON schema
+        # constraints are preserved and the hints act as additional guidance only.
+        system_prompt = (
+            system_prompt
+            + "\n\n"
+            + "═══════════════════════════════════════════════════════════\n"
+            + "ADDITIONAL INSTRUCTIONS FROM USER\n"
+            + "═══════════════════════════════════════════════════════════\n"
+            + custom_system_prompt.strip()
+        )
+        prompt_source += " + custom hints"
     # ── Pre-build diagnostics ────────────────────────────────────────────────
     raw_indexed_words = len(indexed_content.split()) if indexed_content else 0
     toc_content_words = sum(
@@ -549,7 +562,7 @@ def classify_to_outline_with_llm(
             + validation_hints.strip()
         )
 
-    raw = chat(CLASSIFICATIONTO_OUTLINE_PROMPT, user_msg)
+    raw = chat_for_to(CLASSIFICATIONTO_OUTLINE_PROMPT, user_msg)
     logger.info(
         "[TO-CLASSIFY] LLM raw response (first 300 chars): %s",
         raw[:300].replace("\n", " "),

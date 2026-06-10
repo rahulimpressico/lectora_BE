@@ -29,9 +29,10 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse
@@ -68,6 +69,17 @@ from lectora_backend.pipeline.agent.a0_request_synthesizer.utils.outline_metrics
 )
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# ── Section-key constants shared by all outline-parsing helpers ───────────────
+# Defines the order in which keys are tried when locating the sections list in
+# an LLM-generated Training Outline JSON.  Listed most-specific first.
+_SECTION_KEYS: tuple[str, ...] = (
+    "sections", "lessons", "modules", "table_of_contents", "recommended_scope",
+)
+# Wrapper keys tried when sections are not found at the top level.
+_WRAPPER_KEYS: tuple[str, ...] = (
+    "outline", "course_outline", "timed_outline", "to", "result",
+)
 
 # ── Local upload storage (dev only) ──────────────────────────────────────────
 _UPLOAD_ROOT = Path(tempfile.gettempdir()) / "lectora_uploads"
@@ -127,7 +139,7 @@ def _clean_sections(sections: list[dict]) -> list[dict]:
     for i, s in enumerate(sections):
         subtopics = s.get("subtopics") or []
         subtopic_titles = [
-            t["title"] if isinstance(t, dict) else str(t)
+            t.get("title") or t.get("name") or str(t) if isinstance(t, dict) else str(t)
             for t in subtopics
         ]
         cleaned.append({
@@ -168,6 +180,116 @@ def _clean_rule_pack(pack: dict | None) -> dict:
     return {k: v for k, v in pack.items() if k not in _STRIP_FROM_RULES}
 
 
+def _unwrap_llm_outline(raw: dict) -> dict:
+    """Normalise saved JSON payloads to the inner llm_to_outline dict."""
+    if not raw:
+        return {}
+    inner = raw.get("llm_to_outline")
+    return inner if isinstance(inner, dict) else raw
+
+
+def _normalise_llm_outline(outline: dict) -> dict:
+    """Apply title-alias normalisation to a resolved outline dict.
+
+    Some models return *generated_course_title* instead of *course_title*.
+    This helper ensures downstream code always sees *course_title*.
+    """
+    if not outline.get("course_title") and outline.get("generated_course_title"):
+        outline = dict(outline)
+        outline["course_title"] = outline["generated_course_title"]
+    return outline
+
+
+def _pick_sections(outline: dict) -> tuple[list[dict], dict]:
+    """Try every known section key; also try one level of wrapper keys.
+
+    Returns *(sections_list, resolved_outline)* where *resolved_outline* is
+    the dict that actually contained the sections (may be a nested value).
+    Uses module-level ``_SECTION_KEYS`` and ``_WRAPPER_KEYS`` constants so
+    the key lists are defined exactly once.
+    """
+    # Fast path: sections at top level
+    for key in _SECTION_KEYS:
+        sections = outline.get(key)
+        if sections and isinstance(sections, list):
+            return sections, outline
+
+    # Slow path: sections nested under a wrapper key
+    for wk in _WRAPPER_KEYS:
+        inner = outline.get(wk)
+        if isinstance(inner, dict):
+            for key in _SECTION_KEYS:
+                sections = inner.get(key)
+                if sections and isinstance(sections, list):
+                    logger.debug(
+                        "[generate-to] Sections found under wrapper key '%s'.'%s'", wk, key
+                    )
+                    return sections, inner
+
+    return [], outline
+
+
+def _extract_outline_sections(llm_outline: dict) -> tuple[list[dict], dict, dict]:
+    """Return *(sections, totals, resolved_outline)* from heterogeneous TO JSON.
+
+    Delegates section-key discovery to :func:`_pick_sections` so the key list
+    is maintained in one place.
+    """
+    outline = _normalise_llm_outline(_unwrap_llm_outline(llm_outline))
+    sections, resolved = _pick_sections(outline)
+    totals: dict = resolved.get("totals") or {}
+    return sections, totals, resolved
+
+
+def build_fe_to_response_from_llm_outline(
+    llm_outline: dict,
+    *,
+    difficulty: str = "intermediate",
+    shared_state_path: str | None = None,
+    rule_family_key: str | None = None,
+) -> GenerateTOResponse:
+    """Build the FE TO panel payload from a saved llm_to_outline dict."""
+    sections, totals, outline = _extract_outline_sections(llm_outline)
+
+    family_key = rule_family_key or "insurance_ce"
+    if shared_state_path and Path(shared_state_path).is_file():
+        try:
+            with open(shared_state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+            request_spec = state.get("request_spec") or {}
+            rule_cls = request_spec.get("rule_classification") or {}
+            family_display = rule_cls.get("family") or ""
+            if family_display:
+                family_key = _find_rule_family_key(family_display)
+            difficulty = (state.get("course_difficulty") or difficulty).strip().lower()
+        except Exception:
+            pass
+
+    resolved_pack = resolve_rule_pack(family_key, difficulty)
+    rules = _clean_rule_pack(resolved_pack)
+
+    cleaned_sections = _clean_sections(sections)
+    course_totals = compute_course_totals(cleaned_sections, difficulty=difficulty)
+
+    to: dict[str, Any] = {
+        "course_name": outline.get("course_title") or "Untitled Course",
+        "rule_family": family_key,
+        "difficulty": difficulty,
+        "difficulty_factor": get_difficulty_factor(difficulty),
+        "audience": outline.get("audience") or "",
+        "course_type": outline.get("course_type") or "",
+        "topic": outline.get("topic") or "",
+        "category": outline.get("category") or "",
+        "description": outline.get("description") or "",
+        "total_word_count": course_totals["total_word_count"],
+        "total_minutes": course_totals["total_minutes"],
+        "total_credit_hours": course_totals["total_credit_hours"],
+        "learning_objectives": outline.get("learning_objectives") or [],
+        "sections": cleaned_sections,
+    }
+    return GenerateTOResponse(to=to, rules=rules, to_blob_path=None)
+
+
 def _build_generate_to_response(
     result: A0Result,
     difficulty: str,
@@ -198,8 +320,26 @@ def _build_generate_to_response(
             llm_outline = outline_payload.get("llm_to_outline") or {}
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("[generate-to] Could not read llm_to_outline: %s", exc)
+
+    # Normalise then extract sections using the shared helpers so the key list
+    # is defined exactly once (_SECTION_KEYS / _WRAPPER_KEYS constants).
+    llm_outline = _normalise_llm_outline(llm_outline)
+    sections, llm_outline = _pick_sections(llm_outline)
     totals: dict = llm_outline.get("totals") or {}
-    sections: list[dict] = llm_outline.get("sections") or []
+
+    if not sections:
+        top_keys = list(llm_outline.keys()) if llm_outline else []
+        logger.error(
+            "[generate-to] No sections found in llm_outline after all unwrap attempts. "
+            "Top-level keys: %s",
+            top_keys,
+        )
+        raise ValueError(
+            f"TO generation produced no sections (tried all known wrapper keys). "
+            f"LLM outline top-level keys: {top_keys}. "
+            "The source document may lack recognizable structure, or the model "
+            "returned an unexpected response format."
+        )
 
     total_doc_word_count = _safe_int(
         getattr(spec, "total_doc_word_count", None) or totals.get("source_word_count")
@@ -400,6 +540,8 @@ def _make_a0_runner(
     duration_hours: int | None = None,
     difficulty_level: str | None = None,
     calculated_word_count: int | None = None,
+    audience: str | None = None,
+    cancel_event: threading.Event | None = None,
 ):
     """Build a callable that runs A0 on all source DOCX/PDF files with equal priority."""
     def _run_a0() -> A0Result:
@@ -411,12 +553,14 @@ def _make_a0_runner(
             extra_text_contents=extra_text_contents or [],
             custom_to_prompt=custom_to_prompt,
             course_type_hint=course_type_hint,
+            audience=audience,
             to_outline_doc_path=str(to_outline_doc_path) if to_outline_doc_path else None,
             course_output_slug=course_output_slug,
             step_logger=step_logger,
             duration_hours=duration_hours,
             difficulty_level=difficulty_level,
             calculated_word_count=calculated_word_count,
+            cancel_event=cancel_event,
         )
         return a0.run()
 
@@ -479,15 +623,22 @@ async def upload_document(
 
     folder = _parse_course_topic(course_topic)
 
+    _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
     try:
         content = await file.read()
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to read uploaded file: {exc}",
+            detail="Failed to read uploaded file — see server logs.",
         ) from exc
     finally:
         await file.close()
+
+    if len(content) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large. Maximum allowed upload size is 100 MB.",
+        )
 
     blob_path = _uploads_blob_path(folder, filename)
 
@@ -499,9 +650,10 @@ async def upload_document(
                 content_type=_CONTENT_TYPES.get(ext, "application/octet-stream"),
             )
         except Exception as exc:
+            logger.exception("[upload] Failed to upload to Azure Blob: blob_path=%s", blob_path)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to upload to Azure Blob: {exc}",
+                detail="Failed to upload file to storage — see server logs.",
             ) from exc
         logger.info("[upload] Azure blob %s (%d bytes)", blob_path, len(content))
         return UploadDocumentResponse(blob_path=blob_path, upload_folder=folder)
@@ -554,12 +706,9 @@ async def generate_to(
     blob_paths = body.effective_blob_paths
     difficulty = (body.difficulty or "intermediate").strip().lower()
     custom_to_prompt = (body.custom_to_prompt or "").strip() or None
+    # Audience flows as a dedicated parameter to A0 → build_dynamic_to_prompt,
+    # not as a text prefix injected into the custom prompt.
     audience = (body.audience or "").strip() or None
-    # Prepend audience context into the custom TO prompt so A0 calibrates content
-    # and learning objectives for the correct target learner profile.
-    if audience:
-        audience_prefix = f"TARGET AUDIENCE: {audience}\n\nWrite all section titles, content objectives, subtopics, and learning objectives specifically for this audience. Calibrate depth and examples accordingly.\n\n"
-        custom_to_prompt = (audience_prefix + (custom_to_prompt or "")).strip() or None
     course_type_hint = (body.course_type_hint or "").strip() or None
 
     # ── Dynamic TO flow params (new) ──────────────────────────────────────────
@@ -615,7 +764,7 @@ async def generate_to(
         wait,
     )
 
-    def _build_runner(step_logger=None):
+    def _build_runner(step_logger=None, cancel_event: threading.Event | None = None):
         return _make_a0_runner(
             all_docx,
             all_pdf,
@@ -628,9 +777,16 @@ async def generate_to(
             duration_hours=duration_hours,
             difficulty_level=difficulty_level,
             calculated_word_count=calculated_word_count,
+            audience=audience,
+            cancel_event=cancel_event,
         )
 
     if wait:
+        from lectora_backend.pipeline.shared_llm_config.tracer import set_run_context
+
+        sync_doc_name = all_docx[0].stem if all_docx else (all_pdf[0].stem if all_pdf else "")
+        set_run_context(f"sync-{sync_doc_name or 'to'}", sync_doc_name or "unknown")
+
         runner = _build_runner()
         try:
             result: A0Result = await asyncio.wait_for(
@@ -699,7 +855,7 @@ async def generate_to(
     def _step_logger(level: str, message: str, stage: str | None = None) -> None:
         store.append_log(job.job_id, level=level, message=message, stage=stage)
 
-    runner = _build_runner(step_logger=_step_logger)
+    runner = _build_runner(step_logger=_step_logger, cancel_event=reg.cancel_event)
 
     asyncio.create_task(
         run_a0_job_background(
@@ -728,6 +884,27 @@ async def generate_to(
     )
 
 
+@router.get(
+    "/generate-to/jobs",
+    summary="List all recent TO-generation jobs (newest first)",
+)
+async def list_generate_to_jobs() -> JSONResponse:
+    store = get_generate_to_job_store()
+    jobs = store.list_all()
+    return JSONResponse(content=[
+        {
+            "jobId": j.job_id,
+            "status": j.status.value,
+            "message": j.message,
+            "createdAt": j.created_at,
+            "finishedAt": j.finished_at,
+            "error": j.error,
+            "blobPaths": j.blob_paths,
+        }
+        for j in jobs
+    ])
+
+
 @router.post(
     "/generate-to/jobs/{job_id}/cancel",
     summary="Cancel an in-flight A0 generate-to job",
@@ -751,6 +928,65 @@ async def cancel_generate_to_job(job_id: str) -> JSONResponse:
     if handle:
         handle.cancel_event.set()
     return JSONResponse(content={"jobId": job_id, "status": "cancelled"})
+
+
+def _read_json_blob(path: str, source: Literal["uploads", "artifacts"]) -> dict:
+    """Load a JSON blob from local temp, pipeline/courses, or Azure."""
+    clean = path.strip().lstrip("/")
+    if source == "uploads":
+        rel = clean
+        if rel.startswith(f"{UPLOADED_DOCUMENTS_PREFIX}/"):
+            rel = rel[len(UPLOADED_DOCUMENTS_PREFIX) + 1 :]
+        local_path = _UPLOAD_ROOT / rel
+        if local_path.is_file():
+            return json.loads(local_path.read_text(encoding="utf-8"))
+        if _azure_storage_ready():
+            data = _uploads_blob_repo().download_bytes(rel)
+            return json.loads(data.decode("utf-8"))
+    else:
+        from lectora_backend.config import settings
+
+        if _azure_storage_ready():
+            try:
+                data = BlobRepository(
+                    container_name=settings.course_generation_artifacts_container_name,
+                ).download_bytes(clean)
+                return json.loads(data.decode("utf-8"))
+            except FileNotFoundError:
+                pass
+            try:
+                data = BlobRepository().download_bytes(clean)
+                return json.loads(data.decode("utf-8"))
+            except FileNotFoundError:
+                pass
+
+        from lectora_backend.api.routes.storage import _local_artifact_path_candidates
+
+        courses_dir = Path(__file__).resolve().parents[2] / "pipeline" / "courses"
+        legacy_dir = Path(__file__).resolve().parents[2] / "pipeline" / "shared_state"
+        for rel in _local_artifact_path_candidates(clean):
+            for base in (courses_dir, legacy_dir):
+                candidate = base / rel
+                if candidate.is_file():
+                    return json.loads(candidate.read_text(encoding="utf-8"))
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Training Outline file not found: {path}",
+    )
+
+
+@router.get(
+    "/load-to",
+    response_model=GenerateTOResponse,
+    response_model_by_alias=True,
+    summary="Load a saved Training Outline JSON for the TO review panel",
+)
+async def load_to_from_path(
+    path: str = Query(..., description="Blob path from upload or artifact browse"),
+    source: Literal["uploads", "artifacts"] = Query(default="uploads"),
+) -> GenerateTOResponse:
+    payload = _read_json_blob(path, source)
+    return build_fe_to_response_from_llm_outline(_unwrap_llm_outline(payload))
 
 
 @router.get(

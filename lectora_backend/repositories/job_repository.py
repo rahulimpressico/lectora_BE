@@ -70,6 +70,21 @@ class JobRepository:
         )
         return self.session.execute(stmt).scalar_one_or_none()
 
+    def get_latest_job_by_course_slug(self, course_slug: str) -> Job | None:
+        """Return the most recently updated job whose blob path starts with course_slug/."""
+        prefix = f"{course_slug}/"
+        stmt = (
+            select(Job)
+            .where(Job.shared_state_blob_path.like(f"{prefix}%"))
+            .order_by(Job.updated_at.desc())
+            .limit(1)
+            .options(
+                selectinload(Job.stage_progress),
+                selectinload(Job.retry_history),
+            )
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
     def record_retry(
         self,
         *,

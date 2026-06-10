@@ -109,12 +109,14 @@ def resolve_blob_to_local(blob_path: str) -> Path | None:
         logger.debug("[blob_resolver] local hit: %r → %s", blob_path, local)
         return local
 
-    # ── 3. Azure download → persist to local cache ────────────────────────────
+    # ── 3. Azure download → persist to local cache (atomic write to prevent TOCTOU) ─
     if _azure_ready():
         try:
             data = _uploads_repo().download_bytes(normalized)
             local.parent.mkdir(parents=True, exist_ok=True)
-            local.write_bytes(data)
+            tmp = local.with_suffix(local.suffix + ".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(local)  # atomic rename — readers always see a complete file
             logger.info(
                 "[blob_resolver] Azure→local: %r → %s (%d bytes)",
                 blob_path,

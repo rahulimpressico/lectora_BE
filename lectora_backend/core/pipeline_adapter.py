@@ -25,7 +25,7 @@ from lectora_backend.pipeline.agent.s1_validator.main import S1Validator
 from lectora_backend.pipeline.agent.s2_validator.main import S2Validator
 from lectora_backend.pipeline.agent.section_mapper.main import run as section_mapper_run
 from lectora_backend.pipeline.agent.kc_planner.main import run as kc_planner_run
-from lectora_backend.pipeline.models.validation import S1Status
+from lectora_backend.pipeline.models.validation import S1Status, S2Status
 from lectora_backend.models.constants import MAX_A2_S2_CYCLES
 from lectora_backend.repositories.blob_repository import BlobRepository
 
@@ -359,6 +359,23 @@ class PipelineAdapter:
                 artifact_refs[key] = {
                     "blobPath": self._upload_file(local_path, blob_path)}
                 logger.info("Uploaded artifact %s → %s", key, blob_path)
+                if key == "generatedStudyGuide":
+                    from lectora_backend.config import settings
+
+                    generated_repo = BlobRepository(
+                        container_name=settings.generated_courses_container_name,
+                    )
+                    content_type, _ = mimetypes.guess_type(str(local_path))
+                    generated_repo.upload_file(
+                        local_path=str(local_path),
+                        blob_path=blob_path,
+                        content_type=content_type,
+                    )
+                    logger.info(
+                        "Uploaded generatedStudyGuide → %s/%s",
+                        settings.generated_courses_container_name,
+                        blob_path,
+                    )
             else:
                 logger.warning("Artifact %s not found at %s — skipping", key, local_path)
 
@@ -449,18 +466,17 @@ class PipelineAdapter:
             .lower()
         )
 
-        # On the first gate cycle, prefer the user-reviewed TO override (written
-        # as a local JSON file) over the raw DOCX so the LLM call is skipped.
-        # Subsequent S1 retries (gate_attempt > 1) let A0 re-run fully so S1
-        # feedback can be incorporated.
+        # Always prefer the user-reviewed TO override (written as a local JSON
+        # file) across ALL gate cycles — user edits from the three-panel editor
+        # should be preserved on S1 retries, not discarded in favour of the raw
+        # DOCX on cycle 2+.
         effective_to_path: str | None = (
             str(timed_outline_path) if timed_outline_path else None
         )
-        if gate_attempt == 1:
-            to_override = backend_state.get("toOverride")
-            if to_override and isinstance(to_override, dict):
-                override_json = self._write_to_override_json(to_override, temp_dir)
-                effective_to_path = str(override_json)
+        to_override = backend_state.get("toOverride")
+        if to_override and isinstance(to_override, dict):
+            override_json = self._write_to_override_json(to_override, temp_dir)
+            effective_to_path = str(override_json)
 
         _sg_ext = study_guide_path.suffix.lower()
         _a0_docx_paths: list[str] = [] if _sg_ext == ".pdf" else [str(study_guide_path)]
@@ -480,6 +496,7 @@ class PipelineAdapter:
             "timedOutlinePath": str(timed_outline_path) if timed_outline_path else None,
             "a0": a0_result,
             "a0SharedStatePath": a0_result.shared_state_path,
+            "courseDifficulty": course_difficulty,
         }
 
     # ── A1 ─────────────────────────────────────────────────────────────────────
@@ -634,10 +651,20 @@ class PipelineAdapter:
         Iterates the issues list once, bucketed by severity, instead of the
         previous 3-pass approach.
         """
+        def _get(obj, attr, default=""):
+            """Defensive getter that handles both object attrs and dict keys."""
+            if isinstance(obj, dict):
+                return obj.get(attr, default)
+            return getattr(obj, attr, default)
+
         buckets: dict[str, list[str]] = defaultdict(list)
         for issue in report.issues or []:
-            line = f"  - [{issue.field}] {issue.message} (rule: {issue.rule_source})"
-            buckets[issue.severity].append(line)
+            field = _get(issue, "field", "?")
+            message = _get(issue, "message", str(issue))
+            rule_source = _get(issue, "rule_source", "?")
+            severity = _get(issue, "severity", "warning")
+            line = f"  - [{field}] {message} (rule: {rule_source})"
+            buckets[severity].append(line)
 
         sections = [
             ("Blockers (must fix):", "blocker"),
@@ -736,7 +763,7 @@ class PipelineAdapter:
                 s2_result.warnings,
             )
 
-            if s2_result.status not in ("blocked", "blocker"):
+            if s2_result.status not in (S2Status.blocked, S2Status.blocker):
                 logger.info("S2 passed — content cleared for DOCX rendering.")
                 break
 
@@ -748,7 +775,7 @@ class PipelineAdapter:
                 )
                 a2_feedback = self._format_s2_feedback(s2_result)
 
-        s2_hard_blocked = s2_result and s2_result.status in ("blocked", "blocker")
+        s2_hard_blocked = bool(s2_result) and s2_result.status in (S2Status.blocked, S2Status.blocker)
 
         # ── Render study_guide.docx (only when S2 passes) ─────────────────
         final_docx_path: str | None = None
@@ -825,6 +852,6 @@ class PipelineAdapter:
             "message": first_issue,
             "stage": "S1",
             "retryable": False,
-            "validationStatus": s1_result.status.value,
+            "validationStatus": getattr(s1_result.status, "value", str(s1_result.status)),
         }
         return json.dumps(payload)

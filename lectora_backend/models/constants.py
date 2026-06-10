@@ -8,12 +8,10 @@ PIPELINE_ORDER: list[PipelineStep] = [
     PipelineStep.A0,
     PipelineStep.A1,
     PipelineStep.S1,
+    PipelineStep.SECTION_MAPPER,
+    PipelineStep.KC_PLANNER,
     PipelineStep.A2,
-    PipelineStep.A3,
-    PipelineStep.A4,
-    PipelineStep.A5,
     PipelineStep.S2,
-    PipelineStep.A6,
 ]
 
 # Precomputed O(1) stage-position lookup — use instead of PIPELINE_ORDER.index()

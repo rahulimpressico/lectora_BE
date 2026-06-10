@@ -216,13 +216,13 @@ async def create_job(
             "[create_job] timedOutline not provided for job — pipeline will use Scenario C (algorithmic KC)."
         )
 
-    job_id = f"j-{uuid.uuid4().hex[:8]}"
+    job_id = f"j-{uuid.uuid4().hex}"
     actor = "system"
     study_guide_blob_path = payload.inputs.study_guide.blob_path
     if not study_guide_blob_path or not study_guide_blob_path.strip():
         return _missing_input_response("studyGuide.blobPath is required.")
 
-    blob_layout = build_blob_layout_for_course(payload.course_title)
+    blob_layout = build_blob_layout_for_course(payload.course_title, job_id=job_id)
     course_slug = sanitize_course_slug(payload.course_title)
 
     repository = JobRepository(session)
@@ -321,14 +321,15 @@ async def create_job(
     try:
         await get_queue_publisher().enqueue(job_id)
     except Exception as exc:
+        logger.exception("[create_job] Failed to enqueue job %s", job_id)
         repository.mark_job_failed(
             job_id=job_id,
             code="JOB_INITIALIZATION_FAILED",
-            message=f"Failed to enqueue job: {exc}",
+            message="Failed to enqueue job — see server logs.",
             retryable=True,
         )
         return _job_init_error_response(
-            f"Failed to enqueue job: {exc}",
+            "Failed to enqueue job — please retry.",
             True,
         )
 
@@ -353,6 +354,28 @@ async def get_job(
             status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
 
     return _map_job_detail(job)
+
+
+# ── Job lookup by course slug ──────────────────────────────────────────────────
+
+@router.get("/by-course-slug/{course_slug}")
+async def get_job_by_course_slug(
+    course_slug: str,
+    session: Session = Depends(get_db_session),
+) -> dict:
+    """Return the most recent job for a given course slug (used by Asset Library to open DOCX in editor)."""
+    repository = JobRepository(session)
+    job = repository.get_latest_job_by_course_slug(course_slug)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No job found for course slug '{course_slug}'.",
+        )
+    return {
+        "jobId": job.job_id,
+        "status": job.status.value,
+        "courseTitle": job.course_title,
+    }
 
 
 # ── Job deletion ───────────────────────────────────────────────────────────────
@@ -395,6 +418,20 @@ async def retry_job(
     session: Session = Depends(get_db_session),
 ) -> RetryResponse:
     repository = JobRepository(session)
+    job = repository.get_job(job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+
+    # Guard: only FAILED or CANCELLED jobs can be retried
+    if job.status not in (JobStatus.FAILED, JobStatus.CANCELLED):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job {job_id} is in status '{job.status.value}' and cannot be retried. "
+                   "Only FAILED or CANCELLED jobs are retryable.",
+        )
+
     job = repository.record_retry(
         job_id=job_id,
         from_stage=payload.from_stage,
@@ -412,12 +449,12 @@ async def retry_job(
         await get_queue_publisher().enqueue(job_id)
     except Exception as exc:
         logger.exception(
-            "[retry_job] Failed to enqueue retry for job %s: %s", job_id, exc
+            "[retry_job] Failed to enqueue retry for job %s", job_id
         )
         repository.update_job_status(job_id, JobStatus.FAILED)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to enqueue job for retry: {exc}",
+            detail="Failed to enqueue job for retry — see server logs.",
         ) from exc
 
     return RetryResponse(

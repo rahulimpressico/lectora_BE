@@ -1,7 +1,9 @@
 """Blob storage persistence for shared state and artifacts."""
+import threading
 import time
 
 from azure.core.exceptions import (
+    ResourceExistsError,
     ResourceNotFoundError,
     ServiceResponseError,
     ServiceResponseTimeoutError,
@@ -13,6 +15,24 @@ from lectora_backend.config import settings
 # Per-process cache of container names that have already been verified to exist.
 # Eliminates the Azure API round-trip on every BlobRepository instantiation.
 _verified_containers: set[str] = set()
+_verified_lock = threading.Lock()  # guards the TOCTOU check-and-add sequence
+
+_UPLOAD_RETRIES = 3
+_UPLOAD_RETRY_DELAY = 1.0
+
+
+def _upload_with_retry(upload_fn, *args, **kwargs) -> None:
+    """Retry an upload callable on transient Azure errors."""
+    last_exc: Exception | None = None
+    for attempt in range(1, _UPLOAD_RETRIES + 1):
+        try:
+            upload_fn(*args, **kwargs)
+            return
+        except (ServiceResponseTimeoutError, ServiceResponseError) as exc:
+            last_exc = exc
+            if attempt < _UPLOAD_RETRIES:
+                time.sleep(_UPLOAD_RETRY_DELAY * attempt)
+    raise last_exc  # type: ignore[misc]
 
 
 class BlobRepository:
@@ -34,14 +54,19 @@ class BlobRepository:
         )
 
         # Only check/create once per container name per process lifetime.
-        if self._container_name not in _verified_containers:
-            if not self._container_client.exists():
-                self._container_client.create_container()
-            _verified_containers.add(self._container_name)
+        # Lock prevents TOCTOU: two threads simultaneously seeing the container absent.
+        with _verified_lock:
+            if self._container_name not in _verified_containers:
+                if not self._container_client.exists():
+                    try:
+                        self._container_client.create_container()
+                    except ResourceExistsError:
+                        pass  # already created by another thread/process
+                _verified_containers.add(self._container_name)
 
     def upload_text(self, blob_path: str, content: str) -> None:
         blob_client = self._container_client.get_blob_client(blob_path)
-        blob_client.upload_blob(content, overwrite=True)
+        _upload_with_retry(blob_client.upload_blob, content, overwrite=True)
 
     def download_bytes(self, blob_path: str) -> bytes:
         blob_client = self._container_client.get_blob_client(blob_path)
@@ -81,21 +106,25 @@ class BlobRepository:
     ) -> None:
         blob_client = self._container_client.get_blob_client(blob_path)
         if content_type:
-            blob_client.upload_blob(
+            _upload_with_retry(
+                blob_client.upload_blob,
                 content,
                 overwrite=True,
                 content_settings=ContentSettings(content_type=content_type),
             )
         else:
-            blob_client.upload_blob(content, overwrite=True)
+            _upload_with_retry(blob_client.upload_blob, content, overwrite=True)
 
     def exists(self, blob_path: str) -> bool:
         return self._container_client.get_blob_client(blob_path).exists()
 
     def delete_blob(self, blob_path: str) -> None:
+        """Idempotent delete — silently ignores already-deleted blobs."""
         blob_client = self._container_client.get_blob_client(blob_path)
-        if blob_client.exists():
+        try:
             blob_client.delete_blob()
+        except ResourceNotFoundError:
+            pass  # already deleted — idempotent
 
     def list_blobs(self, prefix: str) -> list[str]:
         return [

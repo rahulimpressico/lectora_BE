@@ -1,4 +1,5 @@
 """Queue-driven orchestration for worker-side job handling."""
+import asyncio
 import json
 import logging
 import shutil
@@ -25,7 +26,7 @@ from lectora_backend.models.constants import MAX_S1_GATE_CYCLES
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGE_DELIVERIES = 3
-MAX_LOCK_RENEWAL_DURATION_SECONDS = 30 * 60
+MAX_LOCK_RENEWAL_DURATION_SECONDS = 120 * 60  # 2 hours — covers worst-case 3×S1 + 3×S2 cycles
 
 
 class JobNotFoundError(Exception):
@@ -148,7 +149,8 @@ class Orchestrator:
                 with self._lock_renewer:
                     while True:
                         logger.info("Polling queue %s for messages", self._queue_name)
-                        messages = receiver.receive_messages(
+                        messages = await asyncio.to_thread(
+                            receiver.receive_messages,
                             max_message_count=1,
                             max_wait_time=5,
                         )
@@ -183,7 +185,8 @@ class Orchestrator:
                                     str(message)[:500],
                                     exc,
                                 )
-                                receiver.dead_letter_message(
+                                await asyncio.to_thread(
+                                    receiver.dead_letter_message,
                                     message,
                                     reason="MalformedMessage",
                                     error_description=str(exc),
@@ -192,7 +195,8 @@ class Orchestrator:
                                 logger.warning(
                                     "Dead-lettering orphan message: %s", exc
                                 )
-                                receiver.dead_letter_message(
+                                await asyncio.to_thread(
+                                    receiver.dead_letter_message,
                                     message,
                                     reason="JobNotFound",
                                     error_description=str(exc),
@@ -207,15 +211,20 @@ class Orchestrator:
                                     exc,
                                 )
                                 if delivery_count >= MAX_MESSAGE_DELIVERIES:
-                                    receiver.dead_letter_message(
+                                    await asyncio.to_thread(
+                                        receiver.dead_letter_message,
                                         message,
                                         reason="ProcessingFailed",
                                         error_description=str(exc),
                                     )
                                 else:
-                                    receiver.abandon_message(message)
+                                    await asyncio.to_thread(
+                                        receiver.abandon_message, message
+                                    )
                             else:
-                                receiver.complete_message(message)
+                                await asyncio.to_thread(
+                                    receiver.complete_message, message
+                                )
 
     async def run_job(self, job_id: str, payload: dict) -> None:
         session = SessionLocal()
@@ -229,7 +238,27 @@ class Orchestrator:
                 raise JobNotFoundError(
                     f"Job {job_id} not found; dropping orphan message."
                 )
+            # Idempotency guard — skip redelivered messages for already-terminal jobs
+            if job.status in (JobStatus.COMPLETED, JobStatus.CANCELLED):
+                logger.info(
+                    "[orchestrator] Job %s already %s — skipping redelivered message",
+                    job_id,
+                    job.status.value,
+                )
+                return
+            if job.status == JobStatus.PROCESSING:
+                logger.warning(
+                    "[orchestrator] Job %s already PROCESSING — possible duplicate delivery, skipping",
+                    job_id,
+                )
+                return
             repository.update_job_status(job_id, JobStatus.PROCESSING)
+            # Re-check for cancellation that arrived between the status guard and PROCESSING write
+            session.commit()
+            job = repository.get_job(job_id)
+            if job and job.status == JobStatus.CANCELLED:
+                logger.info("[orchestrator] Job %s was cancelled — aborting pipeline start", job_id)
+                return
             state_blob_path = job.shared_state_blob_path
 
             job_log.info("Pipeline started — preparing document inputs")
@@ -239,6 +268,15 @@ class Orchestrator:
                 job_id,
                 state_blob_path=state_blob_path,
             )
+
+            from pathlib import Path
+            from lectora_backend.pipeline.shared_llm_config.tracer import set_run_context
+
+            state = prepared_inputs["state"]
+            course_title = (state.get("request") or {}).get("courseTitle") or ""
+            study_guide_path = str(prepared_inputs["studyGuidePath"])
+            doc_name = Path(study_guide_path).stem or course_title.replace(" ", "_")
+            set_run_context(job_id, doc_name)
 
             job_log.info("Inputs ready — beginning A0 → A1 → S1 gate cycles")
 
@@ -487,6 +525,7 @@ class Orchestrator:
                 state_blob_path=state_blob_path,
                 pipeline_shared_state_path=a0_ctx["a0SharedStatePath"],
                 study_guide_path=a0_ctx["studyGuidePath"],
+                course_difficulty=a0_ctx.get("courseDifficulty", "intermediate"),
             )
             state = self._state_manager.load(job_id, blob_path=state_blob_path)
             a2_completed_at = datetime.now(timezone.utc)
@@ -551,7 +590,22 @@ class Orchestrator:
             repository.update_job_status(job_id, JobStatus.COMPLETED)
             job_log.success("Course generation complete — pipeline finished successfully")
 
+        except JobNotFoundError:
+            raise  # Let listen() handle dead-lettering; do not mark as FAILED
+        except Exception as exc:
+            logger.exception("[orchestrator] run_job %s unhandled error: %s", job_id, exc)
+            try:
+                _repo = JobRepository(session)
+                _repo.update_job_status(job_id, JobStatus.FAILED)
+                session.commit()
+            except Exception:
+                pass
+            raise
         finally:
             if prepared_inputs is not None:
                 shutil.rmtree(Path(prepared_inputs["tempDir"]), ignore_errors=True)
+            try:
+                session.rollback()
+            except Exception:
+                pass
             session.close()

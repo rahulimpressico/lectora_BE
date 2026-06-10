@@ -87,6 +87,7 @@ def _strip_upload_blob_roots(path: str) -> str:
 
 def delete_course_output_tree(course_title: str) -> int:
     """Delete ``{slug}/`` from Azure and local pipeline course output."""
+    import os as _os
     slug = sanitize_course_slug(course_title)
     removed = 0
 
@@ -97,7 +98,13 @@ def delete_course_output_tree(course_title: str) -> int:
         removed += repo.delete_blobs_by_prefix(slug)
         removed += repo.delete_blobs_by_prefix(f"outputs/{slug}")
 
+    _courses_base = _PIPELINE_COURSES_DIR.resolve()
     local_dir = (_PIPELINE_COURSES_DIR / slug).resolve()
+    if not str(local_dir).startswith(str(_courses_base) + _os.sep):
+        logger.error(
+            "[storage_cleanup] Refusing to delete outside courses dir: %s", local_dir
+        )
+        return removed
     if local_dir.is_dir():
         shutil.rmtree(local_dir, ignore_errors=True)
         removed += 1
@@ -134,7 +141,24 @@ def _resolve_local_artifact(path: str) -> Path:
     return target
 
 
-def delete_storage_file(path: str, source: Literal["artifacts", "uploads"]) -> None:
+def _course_generation_artifacts_container_name() -> str:
+    from lectora_backend.config import settings
+
+    return settings.course_generation_artifacts_container_name
+
+
+def _generated_courses_container_name() -> str:
+    from lectora_backend.config import settings
+
+    return settings.generated_courses_container_name
+
+
+def delete_storage_file(
+    path: str,
+    source: Literal[
+        "artifacts", "uploads", "course-generation-artifacts", "generated-courses"
+    ],
+) -> None:
     """Delete one file from Azure Blob and/or local storage."""
     clean = path.strip().lstrip("/")
     if not clean or ".." in clean:
@@ -145,7 +169,31 @@ def delete_storage_file(path: str, source: Literal["artifacts", "uploads"]) -> N
 
     removed = False
 
-    if source == "uploads":
+    if source == "course-generation-artifacts":
+        if _azure_configured():
+            from lectora_backend.repositories.blob_repository import BlobRepository
+
+            repo = BlobRepository(container_name=_course_generation_artifacts_container_name())
+            if repo.exists(clean):
+                repo.delete_blob(clean)
+                removed = True
+    elif source == "generated-courses":
+        if _azure_configured():
+            from lectora_backend.repositories.blob_repository import BlobRepository
+
+            repo = BlobRepository(container_name=_generated_courses_container_name())
+            if repo.exists(clean):
+                repo.delete_blob(clean)
+                removed = True
+        try:
+            target = _resolve_local_artifact(path)
+            if target.is_file():
+                target.unlink(missing_ok=True)
+                removed = True
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+    elif source == "uploads":
         blob_path = _strip_upload_blob_roots(path)
         if _azure_configured():
             from lectora_backend.repositories.blob_repository import BlobRepository
@@ -186,7 +234,12 @@ def delete_storage_file(path: str, source: Literal["artifacts", "uploads"]) -> N
         )
 
 
-def delete_storage_folder(folder_path: str, source: Literal["artifacts", "uploads"]) -> int:
+def delete_storage_folder(
+    folder_path: str,
+    source: Literal[
+        "artifacts", "uploads", "course-generation-artifacts", "generated-courses"
+    ],
+) -> int:
     """Delete all blobs/files under a folder prefix. Returns items removed."""
     clean = folder_path.strip().lstrip("/").rstrip("/")
     if not clean or ".." in clean:
@@ -197,7 +250,33 @@ def delete_storage_folder(folder_path: str, source: Literal["artifacts", "upload
 
     removed = 0
 
-    if source == "uploads":
+    if source == "course-generation-artifacts":
+        prefix = clean if clean.endswith("/") else f"{clean}/"
+        if _azure_configured():
+            from lectora_backend.repositories.blob_repository import BlobRepository
+
+            removed += BlobRepository(
+                container_name=_course_generation_artifacts_container_name()
+            ).delete_blobs_by_prefix(prefix)
+    elif source == "generated-courses":
+        prefix = clean if clean.endswith("/") else f"{clean}/"
+        if _azure_configured():
+            from lectora_backend.repositories.blob_repository import BlobRepository
+
+            removed += BlobRepository(
+                container_name=_generated_courses_container_name()
+            ).delete_blobs_by_prefix(prefix)
+        try:
+            target = _resolve_local_artifact(folder_path)
+            if target.is_dir():
+                import shutil
+
+                shutil.rmtree(target, ignore_errors=True)
+                removed += 1
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+    elif source == "uploads":
         prefix = clean if clean.endswith("/") else f"{clean}/"
         blob_prefix = _strip_upload_blob_roots(prefix)
         if _azure_configured():
@@ -212,8 +291,8 @@ def delete_storage_folder(folder_path: str, source: Literal["artifacts", "upload
             removed += 1
             logger.info("[storage_cleanup] Removed upload folder %s", local_dir)
     else:
+        import os as _os
         rel = strip_legacy_outputs_prefix(clean).strip("/")
-        azure_prefix = f"{rel}/" if rel else ""
         if _azure_configured():
             from lectora_backend.repositories.blob_repository import BlobRepository
 
@@ -221,12 +300,18 @@ def delete_storage_folder(folder_path: str, source: Literal["artifacts", "upload
             removed += repo.delete_blobs_by_prefix(rel)
             if rel:
                 removed += repo.delete_blobs_by_prefix(f"outputs/{rel}")
-        local_dir = (_PIPELINE_COURSES_DIR / rel).resolve()
+        _courses_base = _PIPELINE_COURSES_DIR.resolve()
+        local_dir = (_PIPELINE_COURSES_DIR / rel).resolve() if rel else _courses_base
+        if str(local_dir) != str(_courses_base) and not str(local_dir).startswith(str(_courses_base) + _os.sep):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid folder path")
         if local_dir.is_dir():
             shutil.rmtree(local_dir, ignore_errors=True)
             removed += 1
-        legacy_dir = (_LEGACY_SHARED_STATE_DIR / rel).resolve()
-        if legacy_dir.is_dir():
+        _legacy_base = _LEGACY_SHARED_STATE_DIR.resolve()
+        legacy_dir = (_LEGACY_SHARED_STATE_DIR / rel).resolve() if rel else _legacy_base
+        if str(legacy_dir) != str(_legacy_base) and not str(legacy_dir).startswith(str(_legacy_base) + _os.sep):
+            pass  # silently skip invalid legacy path
+        elif legacy_dir.is_dir():
             shutil.rmtree(legacy_dir, ignore_errors=True)
             removed += 1
 

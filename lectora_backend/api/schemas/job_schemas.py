@@ -37,8 +37,8 @@ class JobInputs(CamelModel):
 
 
 class JobCreateRequest(CamelModel):
-    course_title: str = Field(..., description="Requested course title.")
-    course_type: str = Field(..., description="Requested course family.")
+    course_title: str = Field(..., min_length=1, max_length=200, description="Requested course title.")
+    course_type: str = Field(..., min_length=1, max_length=50, description="Requested course family.")
     inputs: JobInputs
     # Optional user-edited Training Outline JSON (from the three-panel TO editor).
     # When present the pipeline injects it into shared_state so A1 uses the

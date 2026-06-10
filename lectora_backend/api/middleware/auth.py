@@ -1,6 +1,7 @@
 """Microsoft Entra ID token validation helpers."""
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -17,8 +18,10 @@ JWKS_CACHE_TTL_SECONDS = 3600
 class EntraTokenValidator:
     def __init__(self) -> None:
         self._openid_config: dict[str, Any] | None = None
+        self._openid_config_loaded_at = 0.0
         self._jwks: dict[str, Any] | None = None
         self._jwks_loaded_at = 0.0
+        self._lock = threading.Lock()
 
     def _require_settings(self) -> None:
         missing = [
@@ -43,8 +46,12 @@ class EntraTokenValidator:
         return f"{self._authority()}/.well-known/openid-configuration"
 
     def _load_openid_config(self) -> dict[str, Any]:
-        if self._openid_config is not None:
-            return self._openid_config
+        now = time.time()
+        with self._lock:
+            if self._openid_config is not None and (
+                now - self._openid_config_loaded_at < JWKS_CACHE_TTL_SECONDS
+            ):
+                return self._openid_config
 
         try:
             response = requests.get(self._openid_config_url(), timeout=5)
@@ -52,16 +59,19 @@ class EntraTokenValidator:
         except requests.RequestException as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Unable to load Entra OpenID configuration: {exc}",
+                detail="Unable to load Entra OpenID configuration — see server logs.",
             ) from exc
 
-        self._openid_config = response.json()
+        with self._lock:
+            self._openid_config = response.json()
+            self._openid_config_loaded_at = now
         return self._openid_config
 
     def _load_jwks(self) -> dict[str, Any]:
         now = time.time()
-        if self._jwks is not None and now - self._jwks_loaded_at < JWKS_CACHE_TTL_SECONDS:
-            return self._jwks
+        with self._lock:
+            if self._jwks is not None and now - self._jwks_loaded_at < JWKS_CACHE_TTL_SECONDS:
+                return self._jwks
 
         openid_config = self._load_openid_config()
         jwks_uri = openid_config.get("jwks_uri")
@@ -77,11 +87,12 @@ class EntraTokenValidator:
         except requests.RequestException as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Unable to load Entra signing keys: {exc}",
+                detail="Unable to load Entra signing keys — see server logs.",
             ) from exc
 
-        self._jwks = response.json()
-        self._jwks_loaded_at = now
+        with self._lock:
+            self._jwks = response.json()
+            self._jwks_loaded_at = now
         return self._jwks
 
     def _find_signing_key(self, token: str) -> dict[str, Any]:

@@ -55,6 +55,7 @@ class StorageEntry(BaseModel):
     entryType: Literal["folder", "file"]
     size: int | None = None
     lastModified: str | None = None
+    createdAt: str | None = None
     contentType: str | None = None
     fileCount: int | None = None
     extension: str | None = None
@@ -102,6 +103,14 @@ class DeleteStorageFilesResponse(BaseModel):
 
 def _iso(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+
+
+def _iso_ctime(path: Path) -> str | None:
+    """Return the inode-change time (best proxy for creation time on Linux)."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_ctime, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
 
 
 def _main_container_name() -> str:
@@ -237,8 +246,24 @@ def _azure_browse_container(
 ) -> BrowseResponse:
     container = repo._container_client  # noqa: SLF001
 
-    seen_folders: dict[str, int] = {}
-    direct_files: list[tuple[str, int | None, str | None]] = []
+    seen_folders: dict[str, dict[str, object]] = {}
+    direct_files: list[tuple[str, int | None, str | None, str | None]] = []
+
+    def _touch_folder(folder_path: str, lm: str | None, ca: str | None) -> None:
+        meta = seen_folders.setdefault(
+            folder_path,
+            {"count": 0, "lastModified": None, "createdAt": None},
+        )
+        meta["count"] = int(meta["count"]) + 1
+        if lm:
+            prev_lm = meta["lastModified"]
+            if prev_lm is None or str(lm) > str(prev_lm):
+                meta["lastModified"] = lm
+        effective_ca = ca or lm
+        if effective_ca:
+            prev_ca = meta["createdAt"]
+            if prev_ca is None or str(effective_ca) < str(prev_ca):
+                meta["createdAt"] = effective_ca
 
     for blob in container.list_blobs(name_starts_with=prefix):
         name = blob.name
@@ -253,25 +278,32 @@ def _azure_browse_container(
             if getattr(blob, "last_modified", None)
             else None
         )
+        ca = (
+            blob.creation_time.astimezone(timezone.utc).isoformat()
+            if getattr(blob, "creation_time", None)
+            else None
+        )
         size = int(blob.size) if getattr(blob, "size", None) is not None else None
         if len(parts) == 1:
             if not uploads_only or _is_upload_document(parts[0]):
-                direct_files.append((name, size, lm))
+                direct_files.append((name, size, lm, ca or lm))
         else:
             fp = prefix + parts[0] + "/"
-            seen_folders[fp] = seen_folders.get(fp, 0) + 1
+            _touch_folder(fp, lm, ca)
 
     entries: list[StorageEntry] = []
     total_size = 0
-    for fp, count in sorted(seen_folders.items()):
+    for fp, meta in sorted(seen_folders.items()):
         folder_name = fp.rstrip("/").rsplit("/", 1)[-1]
         entries.append(StorageEntry(
             name=folder_name,
             path=fp,
             entryType="folder",
-            fileCount=count,
+            fileCount=int(meta["count"]),
+            lastModified=meta["lastModified"],  # type: ignore[arg-type]
+            createdAt=meta["createdAt"],  # type: ignore[arg-type]
         ))
-    for bp, size, lm in sorted(direct_files, key=lambda x: x[0]):
+    for bp, size, lm, ca in sorted(direct_files, key=lambda x: x[0]):
         file_name = bp.rsplit("/", 1)[-1]
         ext = Path(file_name).suffix.lower()
         if size:
@@ -282,6 +314,7 @@ def _azure_browse_container(
             entryType="file",
             size=size,
             lastModified=lm,
+            createdAt=ca,
             contentType=_MIME.get(ext, "application/octet-stream"),
             extension=ext,
         ))
@@ -387,11 +420,14 @@ def _local_browse_at(base: Path, relative_prefix: str) -> BrowseResponse:
             fc = sum(1 for f in item.rglob("*") if f.is_file())
             sz = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
             total_size += sz
+            lm = _iso(item)
+            ca = _iso_ctime(item) or lm
             entries.append(StorageEntry(
                 name=item.name,
                 path=rel + "/",
                 entryType="folder",
-                lastModified=_iso(item),
+                lastModified=lm,
+                createdAt=ca,
                 fileCount=fc,
                 size=sz,
             ))
@@ -399,12 +435,14 @@ def _local_browse_at(base: Path, relative_prefix: str) -> BrowseResponse:
             stat = item.stat()
             ext = item.suffix.lower()
             total_size += stat.st_size
+            lm = _iso(item)
             entries.append(StorageEntry(
                 name=item.name,
                 path=rel,
                 entryType="file",
                 size=stat.st_size,
-                lastModified=_iso(item),
+                lastModified=lm,
+                createdAt=_iso_ctime(item) or lm,
                 contentType=_MIME.get(ext, "application/octet-stream"),
                 extension=ext,
             ))

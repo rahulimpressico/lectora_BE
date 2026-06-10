@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Literal
@@ -68,6 +69,17 @@ from lectora_backend.pipeline.agent.a0_request_synthesizer.utils.outline_metrics
 )
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# ── Section-key constants shared by all outline-parsing helpers ───────────────
+# Defines the order in which keys are tried when locating the sections list in
+# an LLM-generated Training Outline JSON.  Listed most-specific first.
+_SECTION_KEYS: tuple[str, ...] = (
+    "sections", "lessons", "modules", "table_of_contents", "recommended_scope",
+)
+# Wrapper keys tried when sections are not found at the top level.
+_WRAPPER_KEYS: tuple[str, ...] = (
+    "outline", "course_outline", "timed_outline", "to", "result",
+)
 
 # ── Local upload storage (dev only) ──────────────────────────────────────────
 _UPLOAD_ROOT = Path(tempfile.gettempdir()) / "lectora_uploads"
@@ -176,32 +188,57 @@ def _unwrap_llm_outline(raw: dict) -> dict:
     return inner if isinstance(inner, dict) else raw
 
 
+def _normalise_llm_outline(outline: dict) -> dict:
+    """Apply title-alias normalisation to a resolved outline dict.
+
+    Some models return *generated_course_title* instead of *course_title*.
+    This helper ensures downstream code always sees *course_title*.
+    """
+    if not outline.get("course_title") and outline.get("generated_course_title"):
+        outline = dict(outline)
+        outline["course_title"] = outline["generated_course_title"]
+    return outline
+
+
+def _pick_sections(outline: dict) -> tuple[list[dict], dict]:
+    """Try every known section key; also try one level of wrapper keys.
+
+    Returns *(sections_list, resolved_outline)* where *resolved_outline* is
+    the dict that actually contained the sections (may be a nested value).
+    Uses module-level ``_SECTION_KEYS`` and ``_WRAPPER_KEYS`` constants so
+    the key lists are defined exactly once.
+    """
+    # Fast path: sections at top level
+    for key in _SECTION_KEYS:
+        sections = outline.get(key)
+        if sections and isinstance(sections, list):
+            return sections, outline
+
+    # Slow path: sections nested under a wrapper key
+    for wk in _WRAPPER_KEYS:
+        inner = outline.get(wk)
+        if isinstance(inner, dict):
+            for key in _SECTION_KEYS:
+                sections = inner.get(key)
+                if sections and isinstance(sections, list):
+                    logger.debug(
+                        "[generate-to] Sections found under wrapper key '%s'.'%s'", wk, key
+                    )
+                    return sections, inner
+
+    return [], outline
+
+
 def _extract_outline_sections(llm_outline: dict) -> tuple[list[dict], dict, dict]:
-    """Return (sections, totals, unwrapped_outline) from heterogeneous TO JSON."""
-    outline = _unwrap_llm_outline(llm_outline)
-    totals: dict = outline.get("totals") or {}
-    sections: list[dict] = (
-        outline.get("sections")
-        or outline.get("lessons")
-        or outline.get("modules")
-        or outline.get("table_of_contents")
-        or []
-    )
-    if not sections:
-        for wrapper_key in ("outline", "course_outline", "timed_outline", "to", "result"):
-            inner = outline.get(wrapper_key)
-            if isinstance(inner, dict):
-                sections = (
-                    inner.get("sections")
-                    or inner.get("lessons")
-                    or inner.get("modules")
-                    or []
-                )
-                if sections:
-                    outline = inner
-                    totals = outline.get("totals") or {}
-                    break
-    return sections, totals, outline
+    """Return *(sections, totals, resolved_outline)* from heterogeneous TO JSON.
+
+    Delegates section-key discovery to :func:`_pick_sections` so the key list
+    is maintained in one place.
+    """
+    outline = _normalise_llm_outline(_unwrap_llm_outline(llm_outline))
+    sections, resolved = _pick_sections(outline)
+    totals: dict = resolved.get("totals") or {}
+    return sections, totals, resolved
 
 
 def build_fe_to_response_from_llm_outline(
@@ -284,38 +321,11 @@ def _build_generate_to_response(
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("[generate-to] Could not read llm_to_outline: %s", exc)
 
+    # Normalise then extract sections using the shared helpers so the key list
+    # is defined exactly once (_SECTION_KEYS / _WRAPPER_KEYS constants).
+    llm_outline = _normalise_llm_outline(llm_outline)
+    sections, llm_outline = _pick_sections(llm_outline)
     totals: dict = llm_outline.get("totals") or {}
-
-    # Try the canonical "sections" key first, then fall back to common
-    # alternative keys the LLM occasionally uses.
-    sections: list[dict] = (
-        llm_outline.get("sections")
-        or llm_outline.get("lessons")
-        or llm_outline.get("modules")
-        or llm_outline.get("table_of_contents")
-        or []
-    )
-
-    if not sections:
-        # If a single wrapper key wraps the whole outline (e.g. {"outline": {...}}),
-        # unwrap it and retry.
-        for _wrapper_key in ("outline", "course_outline", "timed_outline", "to", "result"):
-            _inner = llm_outline.get(_wrapper_key)
-            if isinstance(_inner, dict):
-                sections = (
-                    _inner.get("sections")
-                    or _inner.get("lessons")
-                    or _inner.get("modules")
-                    or []
-                )
-                if sections:
-                    llm_outline = _inner
-                    totals = llm_outline.get("totals") or {}
-                    logger.warning(
-                        "[generate-to] LLM outline was wrapped under key '%s' — unwrapped successfully.",
-                        _wrapper_key,
-                    )
-                    break
 
     if not sections:
         top_keys = list(llm_outline.keys()) if llm_outline else []
@@ -531,6 +541,7 @@ def _make_a0_runner(
     difficulty_level: str | None = None,
     calculated_word_count: int | None = None,
     audience: str | None = None,
+    cancel_event: threading.Event | None = None,
 ):
     """Build a callable that runs A0 on all source DOCX/PDF files with equal priority."""
     def _run_a0() -> A0Result:
@@ -549,6 +560,7 @@ def _make_a0_runner(
             duration_hours=duration_hours,
             difficulty_level=difficulty_level,
             calculated_word_count=calculated_word_count,
+            cancel_event=cancel_event,
         )
         return a0.run()
 
@@ -752,7 +764,7 @@ async def generate_to(
         wait,
     )
 
-    def _build_runner(step_logger=None):
+    def _build_runner(step_logger=None, cancel_event: threading.Event | None = None):
         return _make_a0_runner(
             all_docx,
             all_pdf,
@@ -766,9 +778,15 @@ async def generate_to(
             difficulty_level=difficulty_level,
             calculated_word_count=calculated_word_count,
             audience=audience,
+            cancel_event=cancel_event,
         )
 
     if wait:
+        from lectora_backend.pipeline.shared_llm_config.tracer import set_run_context
+
+        sync_doc_name = all_docx[0].stem if all_docx else (all_pdf[0].stem if all_pdf else "")
+        set_run_context(f"sync-{sync_doc_name or 'to'}", sync_doc_name or "unknown")
+
         runner = _build_runner()
         try:
             result: A0Result = await asyncio.wait_for(
@@ -837,7 +855,7 @@ async def generate_to(
     def _step_logger(level: str, message: str, stage: str | None = None) -> None:
         store.append_log(job.job_id, level=level, message=message, stage=stage)
 
-    runner = _build_runner(step_logger=_step_logger)
+    runner = _build_runner(step_logger=_step_logger, cancel_event=reg.cancel_event)
 
     asyncio.create_task(
         run_a0_job_background(
@@ -864,6 +882,27 @@ async def generate_to(
         status_code=status.HTTP_202_ACCEPTED,
         content=accepted.model_dump(by_alias=True),
     )
+
+
+@router.get(
+    "/generate-to/jobs",
+    summary="List all recent TO-generation jobs (newest first)",
+)
+async def list_generate_to_jobs() -> JSONResponse:
+    store = get_generate_to_job_store()
+    jobs = store.list_all()
+    return JSONResponse(content=[
+        {
+            "jobId": j.job_id,
+            "status": j.status.value,
+            "message": j.message,
+            "createdAt": j.created_at,
+            "finishedAt": j.finished_at,
+            "error": j.error,
+            "blobPaths": j.blob_paths,
+        }
+        for j in jobs
+    ])
 
 
 @router.post(

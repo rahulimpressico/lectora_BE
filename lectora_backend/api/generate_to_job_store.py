@@ -30,7 +30,7 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 # Limit parallel A0 runs — each loads a full DOCX + multiple LLM calls.
-_MAX_CONCURRENT = max(1, int(os.environ.get("A0_API_MAX_CONCURRENT", "2")))
+_MAX_CONCURRENT = max(1, int(os.environ.get("A0_API_MAX_CONCURRENT", "5")))
 _JOB_TTL_SEC = max(300, int(os.environ.get("A0_API_JOB_TTL_SEC", "3600")))
 
 # Disk cache for completed/failed job results — survives server restarts.
@@ -350,6 +350,12 @@ class GenerateTOJobStore:
                 if j.status == GenerateTOJobStatus.PROCESSING
             )
 
+    def list_all(self) -> list[GenerateTOJob]:
+        """Return all non-expired jobs sorted newest-first."""
+        with self._lock:
+            self._purge_expired_locked()
+            return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+
 
 _store = GenerateTOJobStore()
 
@@ -394,6 +400,22 @@ async def run_a0_job_background(
         message="Preparing A0 run and loading source documents…",
         stage="A0",
     )
+
+    # Attribute A0 / A0_TO traces to the source document so per-doc costing
+    # rolls TO generation into the same document as the later course pipeline.
+    try:
+        from pathlib import Path as _Path
+        from lectora_backend.pipeline.shared_llm_config.tracer import set_run_context
+
+        job = store.get(job_id)
+        doc_name = ""
+        if job and job.blob_paths:
+            doc_name = _Path(job.blob_paths[0]).stem
+        elif blob_path:
+            doc_name = _Path(blob_path).stem
+        set_run_context(job_id, doc_name or job_id[:8])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[generate-to] trace context setup skipped: %s", exc)
 
     def _runner_with_cancel() -> Any:
         if cancel_event and cancel_event.is_set():

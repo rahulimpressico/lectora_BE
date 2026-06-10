@@ -169,6 +169,33 @@ def _doc_from_blob_path(blob_name: str) -> str | None:
     return parts[0]
 
 
+def _canonical_doc_key(doc_key: str) -> str:
+    """Normalize doc keys so the same source file groups together in costing."""
+    return doc_key.strip().lower().replace(" ", "_")
+
+
+def _enrich_records_doc_names(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fill missing doc_name from sibling traces that share the same run_id."""
+    run_to_doc: dict[str, str] = {}
+    for record in records:
+        doc = (record.get("doc_name") or "").strip()
+        run_id = (record.get("run_id") or "").strip()
+        if doc and run_id:
+            run_to_doc[run_id] = doc
+
+    enriched: list[dict[str, Any]] = []
+    for record in records:
+        if (record.get("doc_name") or "").strip():
+            enriched.append(record)
+            continue
+        run_id = (record.get("run_id") or "").strip()
+        if run_id and run_id in run_to_doc:
+            enriched.append({**record, "doc_name": run_to_doc[run_id]})
+            continue
+        enriched.append(record)
+    return enriched
+
+
 def _trace_doc_key(record: dict[str, Any]) -> str:
     """Stable document key for grouping traces (doc_name → run_id → agent fallback)."""
     doc = (record.get("doc_name") or "").strip()
@@ -332,9 +359,12 @@ def _read_traces_from_azure() -> list[dict[str, Any]]:
 
 def _read_traces() -> list[dict[str, Any]]:
     """Merge local and Azure LLM trace files (deduped by timestamp + agent + doc)."""
+    raw_records = _enrich_records_doc_names(
+        _read_traces_from_local() + _read_traces_from_azure()
+    )
     seen: set[str] = set()
     merged: list[dict[str, Any]] = []
-    for record in _read_traces_from_local() + _read_traces_from_azure():
+    for record in raw_records:
         key = "|".join(
             [
                 str(record.get("timestamp") or ""),
@@ -352,10 +382,48 @@ def _read_traces() -> list[dict[str, Any]]:
     return merged
 
 
+def _merge_document_trace_groups(
+    by_doc: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    Merge trace groups that refer to the same source document under different keys.
+
+    Handles case/format drift (``Long_Term_Care`` vs ``long_term_care``) and rolls
+    TO-only runs (A0/A0_TO) into the matching full-course document when they share
+    the same canonical doc key.
+    """
+    canonical: dict[str, str] = {}
+    merged: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    # Prefer the doc key that already has full-pipeline agents (A1/A2).
+    def _rank(key: str, traces: list[dict[str, Any]]) -> tuple[int, int]:
+        agents = _agents_in_traces(traces)
+        full_pipeline = 2 if "A2" in agents else 1 if "A1" in agents else 0
+        return (full_pipeline, len(traces))
+
+    for doc_key, traces in by_doc.items():
+        canon = _canonical_doc_key(doc_key)
+        if canon not in canonical:
+            canonical[canon] = doc_key
+            merged[doc_key].extend(traces)
+            continue
+        existing_key = canonical[canon]
+        existing_traces = merged[existing_key]
+        if _rank(doc_key, traces) > _rank(existing_key, existing_traces):
+            merged[doc_key] = existing_traces + traces
+            del merged[existing_key]
+            canonical[canon] = doc_key
+        else:
+            merged[existing_key].extend(traces)
+
+    return dict(merged)
+
+
 def _build_documents(records: list[dict[str, Any]]) -> list[DocumentCost]:
     by_doc: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in records:
         by_doc[_trace_doc_key(r)].append(r)
+    by_doc = _merge_document_trace_groups(by_doc)
 
     docs: list[DocumentCost] = []
     for doc_name, traces in by_doc.items():

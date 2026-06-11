@@ -5,8 +5,9 @@ import math
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -642,12 +643,17 @@ def _state_to_course_content(
 @router.get("/{job_id}/course", response_model=CourseContentResponse)
 async def get_job_course_content(
     job_id: str,
+    course_slug: Annotated[str | None, Query(alias="courseSlug")] = None,
     session: Session = Depends(get_db_session),
 ) -> CourseContentResponse:
     """Return structured course content for the editor (COMPLETED jobs only)."""
     repository = JobRepository(session)
     job = repository.get_job(job_id)
     if job is None:
+        # Fallback for dev-generated jobs (hex UUID = created by local_course_job_store, never in SQL)
+        if '-' not in job_id:
+            from lectora_backend.api.routes.local_jobs import get_course_content as _local_get_course
+            return await _local_get_course(job_id, course_slug=course_slug)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
 
     if job.status != JobStatus.COMPLETED:

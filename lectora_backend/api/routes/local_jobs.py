@@ -27,9 +27,9 @@ import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -130,7 +130,7 @@ def _paragraphs_to_text(body_paragraphs: list[dict]) -> str:
 def _persist_section_text(job_id: str, section_id: str, new_content: str) -> None:
     """Persist plain-text content to shared_state for any section (special or regular)."""
     store = get_local_course_job_store()
-    job = store.get(job_id)
+    job = store.get(job_id) or _recover_job_from_disk(job_id)
     if not job or not job.shared_state_path:
         return
     with open(job.shared_state_path, encoding="utf-8") as fh:
@@ -153,6 +153,39 @@ def _persist_section_text(job_id: str, section_id: str, new_content: str) -> Non
         json.dump(shared_state, fh, indent=2, default=str)
 
 
+def _recover_job_from_disk(job_id: str):
+    """Find and register a completed job from filesystem when it's absent from the in-memory store.
+
+    This handles the common dev-server-restart case where the in-memory store is empty
+    but pipeline/courses/{slug}/{job_id}/ still exists on disk.
+    Returns the LocalCourseJob if found, or None.
+    """
+    # Job ID is always a path segment: pipeline/courses/{slug}/{job_id}/
+    for state_file in (
+        *_PIPELINE_COURSES_DIR.glob(f"*/{job_id}/shared_state.json"),
+        *_PIPELINE_COURSES_DIR.glob(f"*/{job_id}/state/shared_state.json"),
+    ):
+        if not state_file.is_file():
+            continue
+        try:
+            with open(state_file, encoding="utf-8") as fh:
+                state = json.load(fh)
+            artifact_dir = _artifact_dir_from_state_file(state_file)
+            docx_candidate = _resolve_study_guide_path(artifact_dir)
+            store = get_local_course_job_store()
+            return store.register_from_filesystem(
+                job_id=job_id,
+                course_title=_course_title_from_shared_state(state, artifact_dir.parent.name),
+                course_type=_course_type_from_shared_state(state),
+                shared_state_path=str(state_file),
+                study_guide_path=str(docx_candidate) if docx_candidate else None,
+                temp_dir=str(artifact_dir),
+            )
+        except Exception:
+            continue
+    return None
+
+
 def _regenerate_special_section_sync(job_id: str, section_id: str) -> str:
     """Regenerate Overview or Conclusion by re-running the same LLM call A2 used originally."""
     from lectora_backend.pipeline.agent.a2_content_generator.main import (
@@ -161,7 +194,7 @@ def _regenerate_special_section_sync(job_id: str, section_id: str) -> str:
     )
 
     store = get_local_course_job_store()
-    job = store.get(job_id)
+    job = store.get(job_id) or _recover_job_from_disk(job_id)
     if not job or not job.shared_state_path:
         raise ValueError(f"Job {job_id} not found or has no shared state")
 
@@ -346,7 +379,7 @@ def _regenerate_section_sync(job_id: str, section_id: str, current_content: str)
     from lectora_backend.pipeline.rule_pack_config.rule_packs import resolve_rule_pack
 
     store = get_local_course_job_store()
-    job = store.get(job_id)
+    job = store.get(job_id) or _recover_job_from_disk(job_id)
     if not job or not job.shared_state_path:
         raise ValueError(f"Job {job_id} not found or has no shared state")
 
@@ -1210,25 +1243,81 @@ def _find_shared_state_for_job_id(job_id: str) -> Path | None:
     return None
 
 
-def _load_shared_state_dict(job: "LocalCourseJob") -> dict | None:
-    """Load shared state — Azure course-generation-artifacts first, then local disk."""
+def _load_shared_state_dict(
+    job: "LocalCourseJob",
+    *,
+    course_slug: str | None = None,
+) -> dict | None:
+    """Load shared state — local disk first, then Azure (with cached blob root)."""
     from lectora_backend.core.azure_course_artifacts import (
         is_azure_artifacts_enabled,
         load_shared_state_for_job,
     )
-
-    if is_azure_artifacts_enabled():
-        azure_state = load_shared_state_for_job(job.job_id)
-        if azure_state:
-            return azure_state
 
     if job.shared_state_path and Path(job.shared_state_path).exists():
         try:
             with open(job.shared_state_path, encoding="utf-8") as fh:
                 return json.load(fh)
         except Exception:
-            return None
+            pass
+
+    if is_azure_artifacts_enabled():
+        azure_state = load_shared_state_for_job(
+            job.job_id,
+            blob_root=job.azure_blob_root,
+            course_slug=course_slug,
+        )
+        if azure_state:
+            return azure_state
+
     return None
+
+
+def _materialize_shared_state_to_disk(
+    job: "LocalCourseJob",
+    *,
+    course_slug: str | None = None,
+) -> Path:
+    """Return a local shared_state.json path, materializing from Azure when needed."""
+    if job.shared_state_path:
+        existing = Path(job.shared_state_path)
+        if existing.is_file():
+            return existing
+
+    shared_state = _load_shared_state_dict(job, course_slug=course_slug)
+    if not shared_state:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shared state not found — cannot build DOCX",
+        )
+
+    if job.temp_dir and Path(job.temp_dir).is_dir():
+        work_dir = Path(job.temp_dir)
+    else:
+        work_dir = Path(tempfile.mkdtemp(prefix=f"lectora_{job.job_id}_"))
+        get_local_course_job_store().set_temp_dir(job.job_id, str(work_dir))
+
+    state_path = work_dir / "shared_state.json"
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(shared_state, fh, indent=2, default=str)
+
+    store = get_local_course_job_store()
+    store.set_shared_state_path(job.job_id, str(state_path))
+    job.shared_state_path = str(state_path)
+    return state_path
+
+
+def _apply_course_title_to_shared_state(state_path: Path, title: str) -> None:
+    trimmed = title.strip()
+    if not trimmed:
+        return
+    with open(state_path, encoding="utf-8") as fh:
+        shared_state = json.load(fh)
+    a2_output: dict = shared_state.setdefault("agent_outputs", {}).setdefault("A2", {})
+    a2_output["course_title"] = trimmed
+    shared_state.setdefault("request", {})["courseTitle"] = trimmed
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(shared_state, fh, indent=2, default=str)
 
 
 def _load_llm_outline_for_job(job: "LocalCourseJob") -> dict | None:
@@ -1238,7 +1327,10 @@ def _load_llm_outline_for_job(job: "LocalCourseJob") -> dict | None:
     )
 
     if is_azure_artifacts_enabled():
-        outline = load_llm_outline_for_job(job.job_id)
+        outline = load_llm_outline_for_job(
+            job.job_id,
+            blob_root=job.azure_blob_root,
+        )
         if outline:
             return outline
 
@@ -1272,10 +1364,12 @@ def _load_llm_outline_from_dir(artifact_dir: Path) -> dict | None:
 def _resolve_job_from_azure(
     store: "LocalCourseJobStore",
     job_id: str,
+    *,
+    course_slug: str | None = None,
 ) -> "LocalCourseJob | None":
     """Reconstruct a COMPLETED job from Azure course-generation-artifacts."""
     from lectora_backend.core.azure_course_artifacts import (
-        find_job_artifact_root,
+        get_job_artifact_root,
         is_azure_artifacts_enabled,
         load_shared_state_for_job,
     )
@@ -1283,7 +1377,12 @@ def _resolve_job_from_azure(
     if not is_azure_artifacts_enabled():
         return None
 
-    raw_state = load_shared_state_for_job(job_id)
+    blob_root = get_job_artifact_root(job_id, course_slug=course_slug)
+    raw_state = load_shared_state_for_job(
+        job_id,
+        blob_root=blob_root,
+        course_slug=course_slug,
+    )
     if not raw_state:
         return None
 
@@ -1292,20 +1391,22 @@ def _resolve_job_from_azure(
         course_title=_course_title_from_shared_state(raw_state, ""),
         course_type=_course_type_from_shared_state(raw_state),
         shared_state_path=None,
-        azure_blob_root=find_job_artifact_root(job_id),
+        azure_blob_root=blob_root,
     )
 
 
 def _resolve_job_with_filesystem(
     store: "LocalCourseJobStore",
     job_id: str,
+    *,
+    course_slug: str | None = None,
 ) -> "LocalCourseJob | None":
     """Return in-memory job or reconstruct from Azure, then local disk."""
     job = store.get(job_id)
     if job:
         return job
 
-    job = _resolve_job_from_azure(store, job_id)
+    job = _resolve_job_from_azure(store, job_id, course_slug=course_slug)
     if job:
         return job
 
@@ -1523,9 +1624,12 @@ async def stream_job_events(job_id: str, request: Request) -> StreamingResponse:
     "/{job_id}/course",
     summary="Course content from completed job",
 )
-async def get_course_content(job_id: str) -> JSONResponse:
+async def get_course_content(
+    job_id: str,
+    course_slug: Annotated[str | None, Query(alias="courseSlug")] = None,
+) -> JSONResponse:
     store = get_local_course_job_store()
-    job = _resolve_job_with_filesystem(store, job_id)
+    job = _resolve_job_with_filesystem(store, job_id, course_slug=course_slug)
 
     if not job:
         raise HTTPException(
@@ -1533,13 +1637,13 @@ async def get_course_content(job_id: str) -> JSONResponse:
             detail=f"Unknown or expired jobId: {job_id}",
         )
 
-    if job.status != LocalJobStatus.COMPLETED:
+    if job.status == LocalJobStatus.PROCESSING:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Job is not completed (status: {job.status.value})",
+            detail="Job is still processing — please wait for it to complete.",
         )
 
-    shared_state = _load_shared_state_dict(job)
+    shared_state = _load_shared_state_dict(job, course_slug=course_slug)
     if not shared_state:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1732,19 +1836,16 @@ async def save_section_content(
     payload: SaveSectionPayload,
 ) -> JSONResponse:
     store = get_local_course_job_store()
-    job = store.get(job_id)
+    job = _resolve_job_with_filesystem(store, job_id)
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Unknown or expired jobId: {job_id}",
         )
-    if not job.shared_state_path or not Path(job.shared_state_path).exists():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Shared state not found",
-        )
 
-    with open(job.shared_state_path, encoding="utf-8") as fh:
+    state_path = _materialize_shared_state_to_disk(job)
+
+    with open(state_path, encoding="utf-8") as fh:
         shared_state = json.load(fh)
 
     a2_output: dict = shared_state.get("agent_outputs", {}).get("A2") or {}
@@ -1789,7 +1890,7 @@ async def save_section_content(
         a2_output["sections"] = sections
 
     shared_state["agent_outputs"]["A2"] = a2_output
-    with open(job.shared_state_path, "w", encoding="utf-8") as fh:
+    with open(state_path, "w", encoding="utf-8") as fh:
         json.dump(shared_state, fh, indent=2, default=str)
 
     return JSONResponse(content={"jobId": job_id, "sectionId": section_id, "status": "saved"})
@@ -2044,10 +2145,13 @@ async def list_artifacts(job_id: str) -> JSONResponse:
     "/{job_id}/artifacts/download",
     summary="Download the generated study guide docx (always rebuilt from latest shared state)",
 )
-async def download_artifact(job_id: str) -> FileResponse:
+async def download_artifact(
+    job_id: str,
+    course_slug: Annotated[str | None, Query(alias="courseSlug")] = None,
+) -> FileResponse:
     import asyncio
     store = get_local_course_job_store()
-    job = store.get(job_id)
+    job = _resolve_job_with_filesystem(store, job_id, course_slug=course_slug)
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2060,11 +2164,7 @@ async def download_artifact(job_id: str) -> FileResponse:
             detail=f"Job not completed (status: {job.status.value})",
         )
 
-    if not job.shared_state_path or not Path(job.shared_state_path).exists():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Shared state not found — cannot build DOCX",
-        )
+    state_path = _materialize_shared_state_to_disk(job, course_slug=course_slug)
 
     # Rebuild DOCX from latest shared_state so any FE edits / regenerated
     # sections are included. render_study_guide_from_state uses stored
@@ -2074,7 +2174,7 @@ async def download_artifact(job_id: str) -> FileResponse:
         docx_path = await loop.run_in_executor(
             None,
             render_study_guide_from_state,
-            job.shared_state_path,
+            str(state_path),
         )
         store.update_study_guide_path(job_id, docx_path)
     except Exception as exc:
@@ -2093,13 +2193,22 @@ async def download_artifact(job_id: str) -> FileResponse:
     )
 
 
+class SaveToAzurePayload(BaseModel):
+    course_title: str | None = Field(None, alias="courseTitle")
+    course_slug: str | None = Field(None, alias="courseSlug")
+
+    model_config = {"populate_by_name": True}
+
+
 @router.post(
     "/{job_id}/artifacts/save-to-azure",
     summary="Upload the generated DOCX to Azure Blob Storage",
 )
-async def save_artifact_to_azure(job_id: str) -> JSONResponse:
+async def save_artifact_to_azure(
+    job_id: str,
+    payload: SaveToAzurePayload | None = None,
+) -> JSONResponse:
     from lectora_backend.config import settings as _settings
-    from lectora_backend.repositories.blob_repository import BlobRepository
 
     if not _settings.is_azure_storage_configured():
         raise HTTPException(
@@ -2113,8 +2222,13 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
             },
         )
 
+    body = payload or SaveToAzurePayload()
     store = get_local_course_job_store()
-    job = store.get(job_id)
+    job = _resolve_job_with_filesystem(
+        store,
+        job_id,
+        course_slug=body.course_slug,
+    )
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2127,11 +2241,12 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
             detail=f"Job not completed (status: {job.status.value})",
         )
 
-    if not job.shared_state_path or not Path(job.shared_state_path).exists():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Shared state not found — cannot build DOCX",
-        )
+    state_path = _materialize_shared_state_to_disk(job, course_slug=body.course_slug)
+
+    if body.course_title and body.course_title.strip():
+        _apply_course_title_to_shared_state(state_path, body.course_title)
+        store.update_course_title(job_id, body.course_title.strip())
+        job.course_title = body.course_title.strip()
 
     # Rebuild DOCX from latest shared_state so any FE edits are included.
     try:
@@ -2139,7 +2254,7 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
         docx_path = await loop.run_in_executor(
             None,
             render_study_guide_from_state,
-            job.shared_state_path,
+            str(state_path),
         )
         store.update_study_guide_path(job_id, docx_path)
     except Exception as exc:
@@ -2155,7 +2270,7 @@ async def save_artifact_to_azure(job_id: str) -> JSONResponse:
     sync_result = sync_local_artifacts_to_azure(
         job_id=job_id,
         course_title=job.course_title,
-        shared_state_path=job.shared_state_path,
+        shared_state_path=str(state_path),
         study_guide_path=docx_path,
     )
     if sync_result.get("skipped"):

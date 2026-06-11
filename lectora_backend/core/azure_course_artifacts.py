@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from typing import Any
 
 from lectora_backend.repositories.blob_repository import BlobRepository
@@ -18,6 +19,10 @@ _SHARED_STATE_FILENAMES = (
     "pipeline_shared_state.json",
     "shared_state.json",
 )
+
+# job_id → artifact root prefix (ends with ``/``), populated after first resolve
+_JOB_ROOT_CACHE: dict[str, str] = {}
+_JOB_ROOT_CACHE_LOCK = threading.Lock()
 
 
 def is_azure_artifacts_enabled() -> bool:
@@ -36,6 +41,13 @@ def _repo() -> BlobRepository:
     return BlobRepository(container_name=artifacts_container_name())
 
 
+def _cache_job_root(job_id: str, root: str) -> str:
+    normalized = root if root.endswith("/") else f"{root}/"
+    with _JOB_ROOT_CACHE_LOCK:
+        _JOB_ROOT_CACHE[job_id] = normalized
+    return normalized
+
+
 def list_blobs(prefix: str = "") -> list[str]:
     if not is_azure_artifacts_enabled():
         return []
@@ -46,16 +58,92 @@ def list_blobs(prefix: str = "") -> list[str]:
         return []
 
 
+def _root_from_course_slug(job_id: str, course_slug: str) -> str | None:
+    """Try the known ``{course_slug}/{job_id}/`` layout (O(1) Azure check)."""
+    slug = course_slug.strip().strip("/")
+    if not slug:
+        return None
+    candidate = f"{slug}/{job_id}/"
+    if _repo().prefix_exists(candidate):
+        return _cache_job_root(job_id, candidate)
+    return None
+
+
+def _discover_job_root(job_id: str) -> str | None:
+    """Locate the artifact root for *job_id* without scanning the whole container."""
+    if not job_id:
+        return None
+
+    repo = _repo()
+
+    # Legacy production layout: {job_id}/{file_name}/...
+    legacy_prefix = f"{job_id}/"
+    if repo.prefix_exists(legacy_prefix):
+        return _cache_job_root(job_id, legacy_prefix)
+
+    # Current layout: {course_slug}/{job_id}/...
+    try:
+        for slug in repo.list_prefixes():
+            candidate = f"{slug}/{job_id}/"
+            if repo.prefix_exists(candidate):
+                return _cache_job_root(job_id, candidate)
+    except Exception as exc:
+        logger.warning("[azure_artifacts] prefix discovery failed for %s: %s", job_id, exc)
+
+    return None
+
+
+def get_job_artifact_root(
+    job_id: str,
+    *,
+    course_slug: str | None = None,
+) -> str | None:
+    """Return cached or discovered artifact root prefix (ends with ``/``)."""
+    if not job_id:
+        return None
+    with _JOB_ROOT_CACHE_LOCK:
+        cached = _JOB_ROOT_CACHE.get(job_id)
+    if cached:
+        return cached
+    if course_slug:
+        root = _root_from_course_slug(job_id, course_slug)
+        if root:
+            return root
+    return _discover_job_root(job_id)
+
+
 def find_blobs_for_job(job_id: str, *, ends_with: str) -> list[str]:
     """Return blob paths in the artifacts container that belong to *job_id*."""
     if not job_id:
         return []
+
+    root = get_job_artifact_root(job_id)
+    if root:
+        matches = [name for name in list_blobs(root) if name.endswith(ends_with)]
+        if matches:
+            return _rank_blob_matches(matches)
+
+    # Last resort for unusual layouts — full container scan (slow).
+    logger.debug("[azure_artifacts] falling back to full scan for job %s", job_id)
     matches = [
         name
         for name in list_blobs()
         if job_id in name and name.endswith(ends_with)
     ]
-    return _rank_blob_matches(matches)
+    ranked = _rank_blob_matches(matches)
+    if ranked:
+        first = ranked[0]
+        if "/state/" in first:
+            root = first.split("/state/", 1)[0] + "/"
+        elif "/output/" in first:
+            root = first.split("/output/", 1)[0] + "/"
+        elif "/" in first:
+            root = first.rsplit("/", 1)[0] + "/"
+        else:
+            root = ""
+        if root:
+            _cache_job_root(job_id, root)
+    return ranked
 
 
 def _rank_blob_matches(paths: list[str]) -> list[str]:
@@ -75,14 +163,7 @@ def _rank_blob_matches(paths: list[str]) -> list[str]:
 
 def find_job_artifact_root(job_id: str) -> str | None:
     """Return the directory prefix for a job's artifacts (ends with ``/``)."""
-    for blob in find_blobs_for_job(job_id, ends_with=".json"):
-        if "/state/" in blob:
-            return blob.split("/state/", 1)[0] + "/"
-        if "/output/" in blob:
-            return blob.split("/output/", 1)[0] + "/"
-        if "/" in blob:
-            return blob.rsplit("/", 1)[0] + "/"
-    return None
+    return get_job_artifact_root(job_id)
 
 
 def download_json_blob(blob_path: str) -> dict[str, Any] | None:
@@ -97,7 +178,35 @@ def download_json_blob(blob_path: str) -> dict[str, Any] | None:
         return None
 
 
-def load_json_for_job(job_id: str, filename: str) -> dict[str, Any] | None:
+def _blob_path_candidates(root: str, filename: str) -> list[str]:
+    root = root if root.endswith("/") else f"{root}/"
+    return [
+        f"{root}state/{filename}",
+        f"{root}output/{filename}",
+        f"{root}{filename}",
+    ]
+
+
+def load_json_for_job(
+    job_id: str,
+    filename: str,
+    *,
+    blob_root: str | None = None,
+) -> dict[str, Any] | None:
+    root = blob_root or get_job_artifact_root(job_id)
+    if root:
+        for blob_path in _blob_path_candidates(root, filename):
+            data = download_json_blob(blob_path)
+            if data is not None:
+                return data
+        matches = [
+            name for name in list_blobs(root) if name.endswith(f"/{filename}") or name.endswith(filename)
+        ]
+        for blob_path in _rank_blob_matches(matches):
+            data = download_json_blob(blob_path)
+            if data is not None:
+                return data
+
     for blob_path in find_blobs_for_job(job_id, ends_with=filename):
         data = download_json_blob(blob_path)
         if data is not None:
@@ -105,16 +214,33 @@ def load_json_for_job(job_id: str, filename: str) -> dict[str, Any] | None:
     return None
 
 
-def load_shared_state_for_job(job_id: str) -> dict[str, Any] | None:
+def load_shared_state_for_job(
+    job_id: str,
+    *,
+    blob_root: str | None = None,
+    course_slug: str | None = None,
+) -> dict[str, Any] | None:
+    root = blob_root or get_job_artifact_root(job_id, course_slug=course_slug)
+    if root:
+        for filename in _SHARED_STATE_FILENAMES:
+            for blob_path in _blob_path_candidates(root, filename):
+                data = download_json_blob(blob_path)
+                if data is not None:
+                    return data
+
     for filename in _SHARED_STATE_FILENAMES:
-        data = load_json_for_job(job_id, filename)
+        data = load_json_for_job(job_id, filename, blob_root=blob_root)
         if data is not None:
             return data
     return None
 
 
-def load_llm_outline_for_job(job_id: str) -> dict[str, Any] | None:
-    payload = load_json_for_job(job_id, "llm_to_outline.json")
+def load_llm_outline_for_job(
+    job_id: str,
+    *,
+    blob_root: str | None = None,
+) -> dict[str, Any] | None:
+    payload = load_json_for_job(job_id, "llm_to_outline.json", blob_root=blob_root)
     if not payload:
         return None
     inner = payload.get("llm_to_outline")
@@ -124,7 +250,12 @@ def load_llm_outline_for_job(job_id: str) -> dict[str, Any] | None:
 def list_json_artifacts_for_job(job_id: str) -> list[dict[str, Any]]:
     """Manifest of JSON blobs for a job (for GET /jobs/{id}/artifacts)."""
     items: list[dict[str, Any]] = []
-    for blob_path in find_blobs_for_job(job_id, ends_with=".json"):
+    root = get_job_artifact_root(job_id)
+    if root:
+        blob_paths = [name for name in list_blobs(root) if name.endswith(".json")]
+    else:
+        blob_paths = find_blobs_for_job(job_id, ends_with=".json")
+    for blob_path in blob_paths:
         name = blob_path.rsplit("/", 1)[-1]
         items.append({"name": name, "path": blob_path, "source": "azure"})
     return items

@@ -336,6 +336,21 @@ class LocalCourseJobStore:
             if job:
                 job.study_guide_path = path
 
+    def set_shared_state_path(self, job_id: str, path: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.shared_state_path = path
+
+    def update_course_title(self, job_id: str, title: str) -> None:
+        from datetime import datetime, timezone
+
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.course_title = title
+                job.updated_at = datetime.now(timezone.utc).isoformat()
+
     def set_azure_blob_root(self, job_id: str, root: str) -> None:
         with self._lock:
             job = self._jobs.get(job_id)

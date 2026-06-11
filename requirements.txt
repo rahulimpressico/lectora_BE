@@ -11,7 +11,6 @@ pyodbc==5.1.0
 azure-storage-blob==12.20.0
 azure-servicebus==7.14.2
 azure-identity>=1.15.0
-azure-mgmt-costmanagement>=4.0.0
 openai>=1.30.0
 python-dotenv>=1.0.0
 python-docx>=1.1.0

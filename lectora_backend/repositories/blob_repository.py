@@ -132,6 +132,23 @@ class BlobRepository:
             for blob in self._container_client.list_blobs(name_starts_with=prefix)
         ]
 
+    def list_prefixes(self, prefix: str = "") -> list[str]:
+        """Return virtual directory names one level below *prefix*."""
+        normalized = prefix.strip().lstrip("/")
+        start = f"{normalized}/" if normalized else ""
+        prefixes: list[str] = []
+        for item in self._container_client.walk_blobs(
+            name_starts_with=start,
+            delimiter="/",
+        ):
+            name = getattr(item, "name", None)
+            if not name or not name.endswith("/"):
+                continue
+            rel = name[len(start) :].strip("/")
+            if rel and "/" not in rel:
+                prefixes.append(rel)
+        return prefixes
+
     def delete_blobs_by_prefix(self, prefix: str) -> int:
         """Delete all blobs whose names start with *prefix*.
 

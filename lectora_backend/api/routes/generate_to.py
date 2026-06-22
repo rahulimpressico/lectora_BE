@@ -43,21 +43,26 @@ from lectora_backend.api.generate_to_job_store import (
 )
 from lectora_backend.core.job_registry import register_generate_to
 from lectora_backend.api.schemas.generate_to_schemas import (
+    GenerateLearningObjectivesRequest,
+    GenerateLearningObjectivesResponse,
     GenerateTOJobAccepted,
     GenerateTOJobPollResponse,
     GenerateTORequest,
     GenerateTOResponse,
+    SuggestOutlineStructureRequest,
+    SuggestOutlineStructureResponse,
     UploadDocumentResponse,
 )
 from lectora_backend.pipeline.agent.a0_request_synthesizer.main import (
     A0RequestSynthesizer,
 )
 from lectora_backend.pipeline.models import A0Result
-from lectora_backend.core.blob_layout import _sanitize_segment
+from lectora_backend.core.blob_layout import sanitize_segment
 from lectora_backend.core.course_storage import (
     course_folder_from_blob_path,
 )
 from lectora_backend.core.blob_paths import UPLOADED_DOCUMENTS_PREFIX
+from lectora_backend.core.storage_cleanup import strip_upload_blob_roots as _strip_upload_blob_roots
 from lectora_backend.repositories.blob_repository import BlobRepository
 from lectora_backend.pipeline.rule_pack_config.rule_packs import (
     RULE_PACKS,
@@ -425,7 +430,7 @@ def _parse_course_topic(course_topic: str) -> str:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Course topic must include at least one letter or number.",
         )
-    folder = _sanitize_segment(raw)
+    folder = sanitize_segment(raw)
     if len(folder) < 2:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -445,15 +450,6 @@ def _uploads_container_name() -> str:
 
 def _uploads_blob_repo() -> BlobRepository:
     return BlobRepository(container_name=_uploads_container_name())
-
-
-def _strip_upload_blob_roots(path: str) -> str:
-    clean = path.strip().lstrip("/")
-    if clean.startswith(f"{UPLOADED_DOCUMENTS_PREFIX}/"):
-        return clean[len(UPLOADED_DOCUMENTS_PREFIX) + 1 :]
-    if clean == UPLOADED_DOCUMENTS_PREFIX:
-        return ""
-    return clean
 
 
 def _uploads_blob_path(folder: str, filename: str) -> str:
@@ -565,6 +561,25 @@ def _make_a0_runner(
         return a0.run()
 
     return _run_a0
+
+
+def _build_explicit_context(body: "GenerateTORequest") -> str | None:
+    """Assemble a structured context block from explicit wizard fields.
+
+    This is prepended to ``custom_to_prompt`` so A0 sees well-formatted,
+    unambiguous parameters regardless of what the FE composite prompt contains.
+    Returns ``None`` when no structured fields are set.
+    """
+    parts: list[str] = []
+    if body.learning_objectives:
+        lo_text = "\n".join(f"- {o}" for o in body.learning_objectives)
+        parts.append(f"Learning Objectives:\n{lo_text}")
+    if body.preferred_chapters is not None:
+        parts.append(f"Preferred number of chapters/sections: {body.preferred_chapters}")
+    if body.lesson_style:
+        style_label = "Short, focused sections" if body.lesson_style == "short" else "Detailed, comprehensive chapters"
+        parts.append(f"Lesson style: {style_label}")
+    return "\n\n".join(parts) if parts else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -706,6 +721,10 @@ async def generate_to(
     blob_paths = body.effective_blob_paths
     difficulty = (body.difficulty or "intermediate").strip().lower()
     custom_to_prompt = (body.custom_to_prompt or "").strip() or None
+    # Prepend any explicit wizard fields so A0 sees structured parameters first.
+    explicit_ctx = _build_explicit_context(body)
+    if explicit_ctx:
+        custom_to_prompt = "\n\n".join(filter(None, [explicit_ctx, custom_to_prompt]))
     # Audience flows as a dedicated parameter to A0 → build_dynamic_to_prompt,
     # not as a text prefix injected into the custom prompt.
     audience = (body.audience or "").strip() or None
@@ -715,6 +734,27 @@ async def generate_to(
     duration_hours: int | None = body.duration_hours
     difficulty_level: str | None = (body.difficulty_level or "").strip().lower() or None
     calculated_word_count: int | None = body.calculated_word_count
+
+    # Log the exact values received from the frontend before any transformation.
+    logger.debug(
+        "[generate-to] RAW request payload: difficulty=%r | difficulty_level=%r | "
+        "duration_hours=%r | calculated_word_count=%r | audience=%r | "
+        "course_type_hint=%r | learning_objectives_count=%d | "
+        "preferred_chapters=%r | lesson_style=%r | "
+        "blob_paths_count=%d | has_custom_prompt=%s | has_to_doc=%s",
+        body.difficulty,
+        body.difficulty_level,
+        body.duration_hours,
+        body.calculated_word_count,
+        (body.audience or "")[:80] or None,
+        body.course_type_hint,
+        len(body.learning_objectives) if body.learning_objectives else 0,
+        body.preferred_chapters,
+        body.lesson_style,
+        len(blob_paths),
+        bool(body.custom_to_prompt),
+        bool(body.to_doc_blob_path),
+    )
 
     # When the dynamic flow is active, sync the difficulty string so A0 uses it
     # correctly for rule pack + metrics even if the old `difficulty` field
@@ -987,6 +1027,230 @@ async def load_to_from_path(
 ) -> GenerateTOResponse:
     payload = _read_json_blob(path, source)
     return build_fe_to_response_from_llm_outline(_unwrap_llm_outline(payload))
+
+
+@router.post(
+    "/generate-learning-objectives",
+    response_model=GenerateLearningObjectivesResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_200_OK,
+    summary="AI-generate measurable learning objectives from course details",
+)
+async def generate_learning_objectives(
+    body: GenerateLearningObjectivesRequest,
+) -> GenerateLearningObjectivesResponse:
+    """Use the LLM to produce role-based, outcome-driven learning objectives.
+
+    Accepts any combination of course metadata; the richer the input the more
+    targeted the objectives. Source material blob paths are accepted but not
+    read inline — the LLM infers from the metadata alone.
+    """
+    from lectora_backend.pipeline.shared_llm_config.llm import LLMConfig, chat as llm_chat
+    from lectora_backend.pipeline.shared_llm_config.model_registry import get_deployment
+
+    config = LLMConfig(
+        deployment=get_deployment("A0_TO"),
+        max_tokens=2048,
+        response_format={"type": "json_object"},
+    )
+
+    system_prompt = """\
+You are an expert instructional designer specialising in corporate and regulatory \
+training courses. Your task is to generate clear, measurable learning objectives \
+that follow best-practice instructional design.
+
+═══════════════════════════════════════════════════════════
+LEARNING OBJECTIVE RULES (CRITICAL)
+═══════════════════════════════════════════════════════════
+CONSTRAINT 1 — Count: write exactly 4–6 objectives. Never fewer, never more.
+  More than 6 dilutes focus; fewer than 4 fails to cover the course scope.
+
+CONSTRAINT 2 — Bloom's verb required.
+  Every objective MUST begin with a measurable action verb from Bloom's Taxonomy:
+    Remember:   define, list, recall, identify, name
+    Understand: explain, describe, summarize, classify, differentiate
+    Apply:      apply, use, demonstrate, calculate, solve
+    Analyze:    analyze, compare, distinguish, examine, break down
+    Evaluate:   evaluate, justify, recommend, assess, critique
+    Create:     design, develop, construct, formulate, propose
+
+  BANNED verbs — these are NOT measurable:
+    understand, know, learn, be aware of, appreciate, recognize the importance of,
+    gain familiarity with, be introduced to, study
+
+CONSTRAINT 3 — No undefined acronyms.
+  Any acronym used in an objective MUST be written out in full on first use.
+  Wrong:  "Explain ERISA requirements"
+  Right:  "Explain the Employee Retirement Income Security Act (ERISA) requirements
+           for employer-sponsored benefit plans"
+
+CONSTRAINT 4 — Learner tasks, not content topics.
+  An objective describes what the LEARNER will DO after completing the course —
+  not what topics the course COVERS.
+
+  Wrong (content-focused):
+    "Understand ERISA"
+    "Understand HIPAA"
+
+  Right (learner-focused):
+    "Differentiate health plan types — including HMO, PPO, and high-deductible
+     plans — and evaluate their suitability for different workforce needs"
+    "Apply compliance requirements under major federal benefit laws to common
+     employer plan design and administration decisions"
+
+CONSTRAINT 5 — Consolidate regulations into task-based objectives.
+  Do NOT write one objective per regulation or acronym.
+  Group multiple related regulations under a single job-relevant task:
+    "Apply federal compliance obligations — including ERISA, HIPAA, ACA, COBRA,
+     and FMLA — to real-world employer plan management scenarios"
+
+VALIDATION STEP — required before finalising each objective:
+  1. Does it start with a Bloom's Taxonomy verb?
+  2. Does it describe what the learner will DO, not what the course covers?
+  3. Are all acronyms spelled out on first use?
+  4. Is the total count between 4 and 6?
+  If ANY answer is "No" — rewrite the objective.
+
+Return a JSON object with this exact structure:
+{"learning_objectives": ["objective 1", "objective 2", ...]}\
+"""
+
+    input_parts: list[str] = []
+    if body.course_title:
+        input_parts.append(f"Course title: {body.course_title}")
+    if body.course_description:
+        input_parts.append(f"Course description: {body.course_description}")
+    if body.course_type:
+        input_parts.append(f"Course type: {body.course_type}")
+    if body.course_duration:
+        input_parts.append(f"Course duration: {body.course_duration}")
+    if body.target_audience:
+        input_parts.append(f"Target audience: {body.target_audience}")
+    if body.skill_level:
+        input_parts.append(f"Difficulty level: {body.skill_level}")
+    if body.desired_outcomes:
+        input_parts.append(f"Desired outcomes: {body.desired_outcomes}")
+    if body.certification_focus:
+        input_parts.append(f"Certification/compliance focus: {body.certification_focus}")
+    if body.additional_instructions:
+        input_parts.append(f"Additional instructions: {body.additional_instructions}")
+
+    user_msg = (
+        "\n".join(input_parts)
+        or "Generate general learning objectives for this training course."
+    )
+
+    try:
+        raw = await asyncio.to_thread(
+            llm_chat, system_prompt, user_msg, config, "LO_GEN"
+        )
+        data = json.loads(raw)
+        objectives: list[str] = data.get("learning_objectives") or []
+        if not isinstance(objectives, list):
+            objectives = []
+        objectives = [str(o).strip() for o in objectives if o]
+        logger.info("[generate-learning-objectives] Generated %d objectives", len(objectives))
+        return GenerateLearningObjectivesResponse(learning_objectives=objectives)
+    except json.JSONDecodeError as exc:
+        logger.warning("[generate-learning-objectives] JSON parse error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="LLM returned malformed JSON. Please try again.",
+        ) from exc
+    except Exception as exc:
+        logger.exception("[generate-learning-objectives] LLM call failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate objectives: {exc}",
+        ) from exc
+
+
+@router.post(
+    "/suggest-outline-structure",
+    response_model=SuggestOutlineStructureResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_200_OK,
+    summary="AI-suggest chapter count and lesson style for the course outline",
+)
+async def suggest_outline_structure(
+    body: SuggestOutlineStructureRequest,
+) -> SuggestOutlineStructureResponse:
+    """Analyse course metadata and learning objectives to recommend an outline structure.
+
+    Returns a suggested chapter count, lesson style, and brief reasoning so the
+    learner can review before triggering full TO generation.
+    """
+    from lectora_backend.pipeline.shared_llm_config.llm import LLMConfig, chat as llm_chat
+    from lectora_backend.pipeline.shared_llm_config.model_registry import get_deployment
+
+    config = LLMConfig(
+        deployment=get_deployment("A0_TO"),
+        max_tokens=512,
+        response_format={"type": "json_object"},
+    )
+
+    system_prompt = (
+        "You are an expert instructional designer. Analyse the provided course details "
+        "and recommend an optimal outline structure.\n\n"
+        "Return a JSON object with this exact structure:\n"
+        '{"preferred_chapters": <integer 4-16>, '
+        '"lesson_style": "<short|detailed>", '
+        '"reasoning": "<one sentence explaining the recommendation>"}'
+        "\n\n"
+        "Use 'short' when topics are discrete and self-contained; 'detailed' when "
+        "each section requires deep explanation or procedural steps."
+    )
+
+    input_parts: list[str] = []
+    if body.course_title:
+        input_parts.append(f"Course title: {body.course_title}")
+    if body.course_description:
+        input_parts.append(f"Description: {body.course_description}")
+    if body.course_type:
+        input_parts.append(f"Course type: {body.course_type}")
+    if body.target_audience:
+        input_parts.append(f"Target audience: {body.target_audience}")
+    if body.skill_level:
+        input_parts.append(f"Skill level: {body.skill_level}")
+    if body.learning_objectives:
+        lo_text = "\n".join(f"- {o}" for o in body.learning_objectives[:8])
+        input_parts.append(f"Learning objectives:\n{lo_text}")
+
+    user_msg = (
+        "\n".join(input_parts)
+        or "Recommend a structure for a standard training course."
+    )
+
+    try:
+        raw = await asyncio.to_thread(
+            llm_chat, system_prompt, user_msg, config, "SUGGEST_STRUCTURE"
+        )
+        data = json.loads(raw)
+        preferred_chapters = max(4, min(16, int(data.get("preferred_chapters") or 6)))
+        lesson_style = str(data.get("lesson_style") or "short").strip().lower()
+        if lesson_style not in ("short", "detailed"):
+            lesson_style = "short"
+        reasoning = str(data.get("reasoning") or "").strip()
+        logger.info(
+            "[suggest-outline-structure] chapters=%d style=%s", preferred_chapters, lesson_style
+        )
+        return SuggestOutlineStructureResponse(
+            preferred_chapters=preferred_chapters,
+            lesson_style=lesson_style,
+            reasoning=reasoning,
+        )
+    except json.JSONDecodeError as exc:
+        logger.warning("[suggest-outline-structure] JSON parse error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="LLM returned malformed JSON. Please try again.",
+        ) from exc
+    except Exception as exc:
+        logger.exception("[suggest-outline-structure] LLM call failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to suggest structure: {exc}",
+        ) from exc
 
 
 @router.get(

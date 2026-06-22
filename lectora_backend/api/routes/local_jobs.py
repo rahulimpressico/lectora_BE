@@ -91,6 +91,9 @@ from lectora_backend.pipeline.agent.a2_content_generator.main import (
     A2ContentGenerator,
     render_study_guide_from_state,
 )
+from lectora_backend.pipeline.agent.a2_content_generator.step_04_render_docx.utils.doc_formatter import (
+    _inject_missing_lesson_parent_sections,
+)
 from lectora_backend.pipeline.agent.kc_planner.main import run as kc_planner_run
 from lectora_backend.pipeline.agent.s1_validator.main import S1Validator
 from lectora_backend.pipeline.agent.s2_validator.main import S2Validator
@@ -358,6 +361,7 @@ def _simplify_section_sync(job_id: str, section_id: str, current_content: str) -
     return new_content
 
 
+
 def _regenerate_section_sync(job_id: str, section_id: str, current_content: str) -> str:
     """
     Regenerate a single section's content via LLM and persist to shared_state.
@@ -505,15 +509,22 @@ class JobInputs(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class SourceFileSpecPayload(BaseModel):
+    blob_path: str = Field(alias="blobPath")
+    extract_hint: str | None = Field(default=None, alias="extractHint")
+    importance: str | None = Field(default=None, alias="importance")
+
+    model_config = {"populate_by_name": True}
+
+
 class CreateJobPayload(BaseModel):
     course_title: str = Field(alias="courseTitle")
     course_type: str = Field(alias="courseType")
     difficulty: str = Field(default="intermediate")
     inputs: JobInputs
     to_override: dict[str, Any] | None = Field(default=None, alias="toOverride")
-    # All source file blob paths (local file paths in dev) used to generate the TO.
-    # When provided, A2 builds a chunk index from these files for topic-wise retrieval.
-    source_file_paths: list[str] | None = Field(default=None, alias="sourceFilePaths")
+    # Per-file source specs (blob path + optional extract hint + importance).
+    source_file_specs: list[SourceFileSpecPayload] | None = Field(default=None, alias="sourceFileSpecs")
     # Target audience — drives prompt calibration in A2 content generation.
     audience: str = Field(default="", alias="audience")
     # Optional special instructions provided by the user before course generation.
@@ -582,6 +593,16 @@ def _persist_source_file_paths(shared_state_path: str, paths: list[str]) -> None
     with open(p, encoding="utf-8") as fh:
         state = json.load(fh)
     state["source_file_paths"] = paths
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, default=str)
+
+
+def _persist_source_file_specs(shared_state_path: str, specs: list[dict]) -> None:
+    """Store per-file source specs (extract_hint, importance) in shared_state for A2."""
+    p = Path(shared_state_path)
+    with open(p, encoding="utf-8") as fh:
+        state = json.load(fh)
+    state["source_file_specs"] = specs
     with open(p, "w", encoding="utf-8") as fh:
         json.dump(state, fh, indent=2, default=str)
 
@@ -659,6 +680,7 @@ def _run_pipeline_sync(
     source_file_paths: list[str] | None = None,
     audience: str = "",
     special_instructions: str | None = None,
+    source_file_specs: list[dict] | None = None,
 ) -> tuple[str | None, str | None]:
     """Execute the full pipeline synchronously.  Returns (shared_state_path, study_guide_docx_path)."""
     store = get_local_course_job_store()
@@ -671,6 +693,7 @@ def _run_pipeline_sync(
         return _run_pipeline_inner(
             job_id, study_guide_path, timed_outline_path, to_override, difficulty,
             temp_input_dir, source_file_paths, audience, special_instructions,
+            source_file_specs=source_file_specs,
         )
     finally:
         # Ephemeral input dir is tiny (user_edited_to.json only); clean up always.
@@ -687,6 +710,7 @@ def _run_pipeline_inner(
     source_file_paths: list[str] | None = None,
     audience: str = "",
     special_instructions: str | None = None,
+    source_file_specs: list[dict] | None = None,
 ) -> tuple[str | None, str | None]:
     """Inner pipeline body, called from _run_pipeline_sync after temp dir setup."""
     store = get_local_course_job_store()
@@ -762,6 +786,9 @@ def _run_pipeline_inner(
         # index for topic-wise retrieval across all uploaded source files.
         if source_file_paths:
             _persist_source_file_paths(shared_state_path, source_file_paths)
+        # Persist per-file specs (extract_hint, importance) for A2 prompt guidance.
+        if source_file_specs:
+            _persist_source_file_specs(shared_state_path, source_file_specs)
         # Persist audience so A2 can calibrate content for the correct learner profile.
         if audience:
             _persist_audience(shared_state_path, audience)
@@ -916,6 +943,7 @@ async def _run_pipeline_background(
     source_file_paths: list[str] | None = None,
     audience: str = "",
     special_instructions: str | None = None,
+    source_file_specs: list[dict] | None = None,
 ) -> None:
     store = get_local_course_job_store()
     store.update_status(job_id, LocalJobStatus.PROCESSING)
@@ -925,7 +953,9 @@ async def _run_pipeline_background(
     def _sync() -> tuple[str | None, str | None]:
         return _run_pipeline_sync(
             job_id, study_guide_path, timed_outline_path, to_override, difficulty,
-            source_file_paths, audience, special_instructions)
+            source_file_paths, audience, special_instructions,
+            source_file_specs=source_file_specs,
+        )
 
     try:
         shared_state_path, study_guide_docx = await asyncio.to_thread(_sync)
@@ -1052,29 +1082,41 @@ async def create_job(payload: CreateJobPayload) -> JSONResponse:
         difficulty=difficulty,
     )
 
-    # ── Resolve source file paths (best-effort, non-fatal) ───────────────────
+    # ── Resolve source file specs (best-effort, non-fatal) ───────────────────
     # Missing source files only affect multi-file chunk retrieval in A2.
-    # Silently drop paths that cannot be resolved so a single stale path does
-    # not block the whole job.
+    # Silently drop specs whose paths cannot be resolved so a single stale path
+    # does not block the whole job.
     source_file_paths: list[str] | None = None
-    if payload.source_file_paths:
+    source_file_specs: list[dict] | None = None
+    raw_blob_paths: list[str] = []
+    if payload.source_file_specs:
         from lectora_backend.core.blob_resolver import resolve_blob_to_local
-        resolved_sources: list[str] = []
-        for p in payload.source_file_paths:
-            r = resolve_blob_to_local(p)
+        resolved_paths: list[str] = []
+        resolved_specs: list[dict] = []
+        for spec in payload.source_file_specs:
+            r = resolve_blob_to_local(spec.blob_path)
             if r is not None:
-                resolved_sources.append(str(r))
+                local_path = str(r)
+                resolved_paths.append(local_path)
+                resolved_specs.append({
+                    "blob_path": spec.blob_path,
+                    "local_path": local_path,
+                    "extract_hint": spec.extract_hint or "",
+                    "importance": spec.importance or "medium",
+                })
+                raw_blob_paths.append(spec.blob_path)
             else:
-                logger.warning("[create_job] Source file not found (skipped): %r", p)
-        if resolved_sources:
-            source_file_paths = resolved_sources
+                logger.warning("[create_job] Source file not found (skipped): %r", spec.blob_path)
+        if resolved_paths:
+            source_file_paths = resolved_paths
+            source_file_specs = resolved_specs
 
     course_slug = sanitize_course_slug(payload.course_title)
     register_local_pipeline(
         job.job_id,
         course_title=payload.course_title,
         course_slug=course_slug,
-        blob_paths=payload.source_file_paths or [payload.inputs.study_guide.blob_path],
+        blob_paths=raw_blob_paths or [payload.inputs.study_guide.blob_path],
     )
 
     asyncio.create_task(
@@ -1087,6 +1129,7 @@ async def create_job(payload: CreateJobPayload) -> JSONResponse:
             source_file_paths=source_file_paths,
             audience=payload.audience,
             special_instructions=payload.special_instructions,
+            source_file_specs=source_file_specs,
         )
     )
 
@@ -1663,7 +1706,33 @@ async def get_course_content(
             detail="No generated sections found — ensure the pipeline completed successfully",
         )
 
+    # ── Ensure every lesson has a visible L1 parent heading ──────────────────────
+    # A2 only creates an is_parent_overview L1 section when the lesson is large
+    # enough to warrant one; smaller lessons emit L2 subtopics only.  Without
+    # this step the tree assembler would nest those subtopics at the root level
+    # (no parent to adopt them), producing a flat list with no L1 groupings.
+    generated_sections = _inject_missing_lesson_parent_sections(generated_sections)
+
     paragraphs_to_text = _paragraphs_to_text
+
+    # ── Internal field names that must never appear as visible section titles ──────
+    # These strings are JSON key names used internally by A2; they surface as
+    # section headings when the LLM echoes a template key instead of real text.
+    _INTERNAL_FIELD_NAMES: frozenset[str] = frozenset({
+        "outline_lesson", "heading", "body_paragraphs", "section_id",
+        "is_parent_overview", "word_count", "status", "level",
+    })
+
+    def _clean_title(raw_heading: str | None, outline_lesson: str | None, fallback: str) -> str:
+        """Return a human-readable title, never an internal field name."""
+        t = (raw_heading or "").strip()
+        if not t or t.lower() in _INTERNAL_FIELD_NAMES:
+            # Fall back to the lesson title if it's different and looks like real text
+            lesson = (outline_lesson or "").strip()
+            if lesson and lesson.lower() not in _INTERNAL_FIELD_NAMES:
+                return lesson
+            return fallback
+        return t
 
     # ── Pull course-level metadata from shared_state (A0 extracted inputs) ───────
     extracted = shared_state.get("extracted_inputs", {})
@@ -1697,7 +1766,11 @@ async def get_course_content(
 
         flat.append({
             "id": sec.get("section_id") or f"sec_{i + 1}",
-            "title": sec.get("heading") or f"Section {i + 1}",
+            "title": _clean_title(
+                sec.get("heading"),
+                sec.get("outline_lesson"),
+                f"Section {i + 1}",
+            ),
             "level": level,
             "sectionType": "content",
             "content": content_text,
@@ -2196,8 +2269,42 @@ async def download_artifact(
 class SaveToAzurePayload(BaseModel):
     course_title: str | None = Field(None, alias="courseTitle")
     course_slug: str | None = Field(None, alias="courseSlug")
+    section_order: list[str] | None = Field(None, alias="sectionOrder")
 
     model_config = {"populate_by_name": True}
+
+
+def _apply_section_order_to_shared_state(
+    state_path: "Path", section_order: list[str]
+) -> None:
+    """Reorder A2 sections in shared_state.json to match the given ID list.
+
+    Only IDs that exist in a2_output['sections'] are considered. Special
+    frontend-only sections (course-overview, etc.) are silently skipped since
+    they don't live in the A2 sections array.
+    """
+    with open(state_path, encoding="utf-8") as fh:
+        shared_state = json.load(fh)
+
+    a2_output: dict = shared_state.get("agent_outputs", {}).get("A2", {})
+    sections: list[dict] = a2_output.get("sections") or []
+    if not sections or not section_order:
+        return
+
+    by_id = {s.get("section_id"): s for s in sections if s.get("section_id")}
+    if not by_id:
+        return
+
+    # Build reordered list from provided IDs, preserving only known A2 sections
+    reordered = [by_id[sid] for sid in section_order if sid in by_id]
+    # Append any A2 sections that were not present in section_order (safety net)
+    ordered_set = set(section_order)
+    remaining = [s for s in sections if s.get("section_id") not in ordered_set]
+    reordered.extend(remaining)
+
+    shared_state["agent_outputs"]["A2"]["sections"] = reordered
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(shared_state, fh, indent=2, default=str)
 
 
 @router.post(
@@ -2247,6 +2354,9 @@ async def save_artifact_to_azure(
         _apply_course_title_to_shared_state(state_path, body.course_title)
         store.update_course_title(job_id, body.course_title.strip())
         job.course_title = body.course_title.strip()
+
+    if body.section_order:
+        _apply_section_order_to_shared_state(state_path, body.section_order)
 
     # Rebuild DOCX from latest shared_state so any FE edits are included.
     try:

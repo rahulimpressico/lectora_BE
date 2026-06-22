@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
 
 from lectora_backend.core.blob_paths import UPLOADED_DOCUMENTS_PREFIX
+from lectora_backend.core.storage_cleanup import strip_upload_blob_roots as _strip_upload_blob_roots
 from lectora_backend.repositories.blob_repository import BlobRepository
 
 logger = logging.getLogger(__name__)
@@ -160,16 +161,6 @@ def _uploads_container_name() -> str:
 
 def _uploads_blob_repo() -> BlobRepository:
     return BlobRepository(container_name=_uploads_container_name())
-
-
-def _strip_upload_blob_roots(path: str) -> str:
-    """Strip optional ``uploaded-documents/`` prefix; blobs live as ``{topic}/{file}``."""
-    clean = path.strip().lstrip("/")
-    if clean.startswith(f"{UPLOADED_DOCUMENTS_PREFIX}/"):
-        return clean[len(UPLOADED_DOCUMENTS_PREFIX) + 1 :]
-    if clean == UPLOADED_DOCUMENTS_PREFIX:
-        return ""
-    return clean
 
 
 def _relative_upload_prefix(relative: str) -> str:

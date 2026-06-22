@@ -104,6 +104,22 @@ class GenerateTORequest(BaseModel):
         ),
     )
 
+    learning_objectives: list[str] = Field(
+        default_factory=list,
+        alias="learningObjectives",
+        description="Explicit learning objectives from the wizard; merged into the A0 prompt context.",
+    )
+    preferred_chapters: int | None = Field(
+        default=None,
+        alias="preferredChapters",
+        description="User-preferred number of course chapters/sections.",
+    )
+    lesson_style: str | None = Field(
+        default=None,
+        alias="lessonStyle",
+        description="Lesson style preference: 'short' (compact) or 'detailed' (comprehensive).",
+    )
+
     model_config = {"populate_by_name": True}
 
     @model_validator(mode="after")
@@ -158,4 +174,44 @@ class GenerateTOJobPollResponse(BaseModel):
     to_blob_path: str | None = Field(default=None, alias="toBlobPath")
     logs: list[dict[str, Any]] = Field(default_factory=list)
 
+    model_config = {"populate_by_name": True}
+
+
+class GenerateLearningObjectivesRequest(BaseModel):
+    """Body for POST /documents/generate-learning-objectives."""
+    source_materials: list[str] = Field(default_factory=list, alias="sourceMaterials")
+    course_title: str = Field(default="", alias="courseTitle")
+    course_description: str = Field(default="", alias="courseDescription")
+    course_type: str = Field(default="", alias="courseType")
+    course_duration: str = Field(default="", alias="courseDuration")
+    target_audience: str = Field(default="", alias="targetAudience")
+    skill_level: str = Field(default="", alias="skillLevel")
+    desired_outcomes: str = Field(default="", alias="desiredOutcomes")
+    certification_focus: str = Field(default="", alias="certificationFocus")
+    additional_instructions: str = Field(default="", alias="additionalInstructions")
+    model_config = {"populate_by_name": True}
+
+
+class GenerateLearningObjectivesResponse(BaseModel):
+    """Response from POST /documents/generate-learning-objectives."""
+    learning_objectives: list[str] = Field(alias="learningObjectives")
+    model_config = {"populate_by_name": True}
+
+
+class SuggestOutlineStructureRequest(BaseModel):
+    """Body for POST /documents/suggest-outline-structure."""
+    course_title: str = Field(default="", alias="courseTitle")
+    course_description: str = Field(default="", alias="courseDescription")
+    course_type: str = Field(default="", alias="courseType")
+    target_audience: str = Field(default="", alias="targetAudience")
+    skill_level: str = Field(default="", alias="skillLevel")
+    learning_objectives: list[str] = Field(default_factory=list, alias="learningObjectives")
+    model_config = {"populate_by_name": True}
+
+
+class SuggestOutlineStructureResponse(BaseModel):
+    """Response from POST /documents/suggest-outline-structure."""
+    preferred_chapters: int = Field(alias="preferredChapters")
+    lesson_style: str = Field(alias="lessonStyle")
+    reasoning: str = Field(default="", alias="reasoning")
     model_config = {"populate_by_name": True}

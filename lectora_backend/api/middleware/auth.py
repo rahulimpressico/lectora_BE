@@ -144,11 +144,3 @@ class EntraTokenValidator:
             ) from exc
 
         return claims
-
-
-def actor_from_claims(claims: dict[str, Any]) -> str:
-    for key in ("preferred_username", "upn", "email", "name", "oid", "sub"):
-        value = claims.get(key)
-        if value:
-            return str(value)
-    return "unknown"

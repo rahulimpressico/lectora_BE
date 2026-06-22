@@ -6,9 +6,13 @@ from dataclasses import dataclass
 from lectora_backend.core.course_storage import sanitize_course_slug
 
 
-def _sanitize_segment(value: str) -> str:
-    """Backward-compatible alias."""
+def sanitize_segment(value: str) -> str:
+    """Sanitize a single path segment using the course-slug rules."""
     return sanitize_course_slug(value)
+
+
+# Backward-compatible alias kept for any existing callers.
+_sanitize_segment = sanitize_segment
 
 
 @dataclass(frozen=True)

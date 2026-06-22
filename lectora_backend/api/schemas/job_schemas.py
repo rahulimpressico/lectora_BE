@@ -2,26 +2,15 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
+from lectora_backend.api.schemas.base import CamelModel
 from lectora_backend.models.job_enums import (
     JobStatus,
     PipelineStep,
     StageStatus,
     ValidationOutcome,
 )
-
-
-def to_camel(value: str) -> str:
-    parts = value.split("_")
-    return parts[0] + "".join(part.capitalize() for part in parts[1:])
-
-
-class CamelModel(BaseModel):
-    model_config = ConfigDict(
-        alias_generator=to_camel,
-        populate_by_name=True,
-    )
 
 
 class JobInputReference(CamelModel):
@@ -36,6 +25,12 @@ class JobInputs(CamelModel):
     compliance_notes: JobInputReference | None = None
 
 
+class SourceFileSpec(CamelModel):
+    blob_path: str
+    extract_hint: str | None = None
+    importance: str | None = None  # 'high' | 'medium' | 'low'
+
+
 class JobCreateRequest(CamelModel):
     course_title: str = Field(..., min_length=1, max_length=200, description="Requested course title.")
     course_type: str = Field(..., min_length=1, max_length=50, description="Requested course family.")
@@ -44,10 +39,9 @@ class JobCreateRequest(CamelModel):
     # When present the pipeline injects it into shared_state so A1 uses the
     # user's version instead of re-generating from the original DOCX.
     to_override: dict[str, Any] | None = None
-    # All source blob paths (DOCX + PDF) uploaded during the generate-TO step.
-    # When provided, A2 downloads these files and uses topic-wise chunk retrieval
-    # to enrich each section's source context across all uploaded documents.
-    source_file_paths: list[str] | None = None
+    # Per-file source specs with blob path, extract hint, and importance level.
+    # Replaces the flat source_file_paths list — blob paths are derived from these.
+    source_file_specs: list[SourceFileSpec] | None = None
 
 
 class StageProgressResponse(CamelModel):

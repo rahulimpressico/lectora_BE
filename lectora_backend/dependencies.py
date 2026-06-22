@@ -6,7 +6,7 @@ from fastapi import Depends
 from fastapi.security import OAuth2AuthorizationCodeBearer
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import NullPool, StaticPool
+from sqlalchemy.pool import NullPool
 
 from lectora_backend.api.middleware.auth import EntraTokenValidator
 from lectora_backend.config import settings
@@ -15,7 +15,7 @@ from lectora_backend.config import settings
 
 if settings.database_url.startswith("sqlite"):
     # SQLite: use NullPool so each session gets its own connection.
-    # StaticPool (a single shared connection) causes "database is locked" errors
+    # A single shared connection (StaticPool) causes "database is locked" errors
     # when the API and worker process both write concurrently.
     engine = create_engine(
         settings.database_url,

@@ -74,7 +74,12 @@ def _uploads_container_name() -> str:
     )
 
 
-def _strip_upload_blob_roots(path: str) -> str:
+def strip_upload_blob_roots(path: str) -> str:
+    """Strip optional ``uploaded-documents/`` prefix from a blob path.
+
+    Blobs live as ``{topic}/{file}`` inside the uploads container; this helper
+    normalises both the bare container prefix and fully-qualified paths.
+    """
     from lectora_backend.core.blob_paths import UPLOADED_DOCUMENTS_PREFIX
 
     clean = path.strip().lstrip("/")
@@ -83,6 +88,10 @@ def _strip_upload_blob_roots(path: str) -> str:
     if clean == UPLOADED_DOCUMENTS_PREFIX:
         return ""
     return clean
+
+
+# Backward-compatible private alias.
+_strip_upload_blob_roots = strip_upload_blob_roots
 
 
 def delete_course_output_tree(course_title: str) -> int:

@@ -4,6 +4,7 @@ Multi-Agent Course Authoring Pipeline
 Flow:
   (A0 → A1 → S1) repeated up to MAX_A0_A1_S1_CYCLES if S1 is blocked
       → Section Mapper
+      → KC Planner
       → (A2 → S2) repeated up to MAX_A2_S2_CYCLES if S2 is blocked
       → study_guide.docx
 
@@ -31,7 +32,7 @@ from lectora_backend.core.logging_config import configure_logging
 
 configure_logging()
 
-from lectora_backend.pipeline.agent.a0_request_synthesizer import A0RequestSynthesizer
+from lectora_backend.pipeline.agent.a0_request_synthesizer.main import A0RequestSynthesizer
 from lectora_backend.pipeline.agent.a1_outline_interpreter import run as a1_run
 from lectora_backend.pipeline.agent.a2_content_generator import (
     A2ContentGenerator,
@@ -45,6 +46,7 @@ from lectora_backend.pipeline.models import (
     A0Result,
     A1Output,
     A2Output,
+    PipelineResult,
     S1ValidationReport,
     S2ValidationReport,  # noqa: F401 — used in type hints and _format helpers
 )
@@ -75,6 +77,22 @@ def _separator(label: str) -> None:
     logger.info("=" * 70)
 
 
+def _split_source_paths(paths: list[str]) -> tuple[list[str], list[str], str]:
+    """Split mixed .docx/.pdf paths for A0 and pick the primary study-guide path."""
+    docx_paths = [p for p in paths if Path(p).suffix.lower() != ".pdf"]
+    pdf_paths = [p for p in paths if Path(p).suffix.lower() == ".pdf"]
+    primary_path = docx_paths[0] if docx_paths else paths[0]
+    return docx_paths, pdf_paths, primary_path
+
+
+def _s1_blocks(status: S1Status) -> bool:
+    return status in (S1Status.blocked, S1Status.blocker)
+
+
+def _s2_blocks(status: S2Status) -> bool:
+    return status in (S2Status.blocked, S2Status.blocker)
+
+
 def _format_s1_feedback(report: S1ValidationReport) -> str:
     """Render S1 blockers and warnings as a compact text block for A1 retry."""
     lines: list[str] = []
@@ -86,12 +104,12 @@ def _format_s1_feedback(report: S1ValidationReport) -> str:
     return "\n".join(lines)
 
 
-def _persist_course_difficulty(shared_state_path: str, difficulty: str) -> None:
-    """Write ``course_difficulty`` into shared_state.json for downstream agents."""
+def _persist_shared_state_fields(shared_state_path: str, updates: dict[str, object]) -> None:
+    """Merge ``updates`` into shared_state.json for downstream agents."""
     path = Path(shared_state_path).expanduser().resolve()
     with open(path, encoding="utf-8") as f:
         state = json.load(f)
-    state["course_difficulty"] = difficulty.strip().lower()
+    state.update(updates)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, default=str)
 
@@ -123,6 +141,31 @@ def _format_s2_feedback(report: S2ValidationReport) -> str:
     return "\n".join(lines)
 
 
+def _build_result(
+    *,
+    run_id: str,
+    shared_state_path: str,
+    a0: A0Result,
+    a1: A1Output | None = None,
+    s1: S1ValidationReport | None = None,
+    sections_mapped: int | None = None,
+    a2: A2Output | None = None,
+    s2: S2ValidationReport | None = None,
+    study_guide_path: str | None = None,
+) -> PipelineResult:
+    return PipelineResult(
+        run_id=run_id,
+        shared_state_path=shared_state_path,
+        a0=a0,
+        a1=a1,
+        s1=s1,
+        sections_mapped=sections_mapped,
+        a2=a2,
+        s2=s2,
+        study_guide_path=study_guide_path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -135,13 +178,15 @@ def run_pipeline(
     *,
     docx_path: str | None = None,
     extra_docx_paths: list[str] | None = None,
-) -> None:
+    audience: str = "",
+    special_instructions: str | None = None,
+) -> PipelineResult:
     """
     Run the full multi-agent pipeline for one or more source documents.
 
     Args:
-        docx_paths:          All source .docx paths (equal priority). Legacy: pass
-            ``docx_path`` + optional ``extra_docx_paths`` instead.
+        docx_paths:          All source .docx / .pdf paths (equal priority). Legacy:
+            pass ``docx_path`` + optional ``extra_docx_paths`` instead.
         to_outline_doc_path: Path to the Timed Outline .docx.
             - Scenario 1 (provided): TO is used as the course structure.
             - Scenario 2 (omitted): A0 generates a complete TO from the source
@@ -149,6 +194,8 @@ def run_pipeline(
               S1 in this scenario.
         course_difficulty:   ``basic``, ``intermediate``, or ``advanced`` — merged into
             the Insurance CE rule pack (default ``intermediate``).
+        audience:            Optional learner profile persisted for A2 prompt calibration.
+        special_instructions: Optional free-text instructions injected into A2 prompts.
     """
     course_difficulty = (course_difficulty or "intermediate").strip().lower()
     paths: list[str] = [str(p) for p in (docx_paths or []) if p]
@@ -156,10 +203,12 @@ def run_pipeline(
         paths = [str(docx_path)]
         paths.extend(str(p) for p in (extra_docx_paths or []) if p)
     if not paths:
-        raise ValueError("At least one docx path is required")
+        raise ValueError("At least one source path (.docx or .pdf) is required")
+
+    a0_docx_paths, a0_pdf_paths, primary_path = _split_source_paths(paths)
 
     start = datetime.now(timezone.utc)
-    set_doc_name(Path(paths[0]).stem)
+    set_doc_name(Path(primary_path).stem)
 
     _separator("PIPELINE START")
     for i, p in enumerate(paths, 1):
@@ -186,13 +235,22 @@ def run_pipeline(
 
         _separator(f"A0 — Request Synthesizer (cycle {cycle})")
         a0 = A0RequestSynthesizer(
-            docx_paths=paths,
+            docx_paths=a0_docx_paths,
+            pdf_paths=a0_pdf_paths,
             output_dir=SHARED_STATE_DIR,
             to_outline_doc_path=to_outline_doc_path,
             course_difficulty=course_difficulty,
+            audience=audience or None,
         ).run()
-        shared_state_path = a0.output_files.shared_state
-        _persist_course_difficulty(shared_state_path, course_difficulty)
+        shared_state_path = a0.shared_state_path
+        state_updates: dict[str, object] = {"course_difficulty": course_difficulty}
+        if len(paths) > 1:
+            state_updates["source_file_paths"] = paths
+        if audience.strip():
+            state_updates["course_audience"] = audience.strip()
+        if special_instructions and special_instructions.strip():
+            state_updates["special_instructions"] = special_instructions.strip()
+        _persist_shared_state_fields(shared_state_path, state_updates)
         run_id = a0.request_spec.run_id
         set_run_id(run_id)
         logger.info("Run ID    : %s", run_id)
@@ -201,7 +259,7 @@ def run_pipeline(
         _separator(f"A1 — Timed Outline Interpreter (cycle {cycle})")
         a1_final = a1_run(
             shared_state_path=shared_state_path,
-            docx_path=paths[0],
+            docx_path=primary_path,
             feedback=feedback,
         )
 
@@ -221,7 +279,7 @@ def run_pipeline(
         logger.info("Blockers  : %s", s1_result.blockers)
         logger.info("Warnings  : %s", s1_result.warnings)
 
-        if s1_result.status not in (S1Status.blocked, S1Status.blocker):
+        if not _s1_blocks(s1_result.status):
             logger.info("S1 passed — advancing to Section Mapper.")
             break
 
@@ -231,14 +289,32 @@ def run_pipeline(
             "attempt": cycle,
         }
 
-    if not s1_result or s1_result.status in (S1Status.blocked, S1Status.blocker):
+    assert a0 is not None
+    if a1_final is None or a1_final.status != "complete":
+        logger.error("Pipeline stopped: A1 did not complete.")
+        return _build_result(
+            run_id=run_id,
+            shared_state_path=shared_state_path,
+            a0=a0,
+            a1=a1_final,
+            s1=s1_result,
+        )
+
+    if not s1_result or _s1_blocks(s1_result.status):
         logger.error("Pipeline stopped: max retries reached; S1 still blocked.")
-        return
+        return _build_result(
+            run_id=run_id,
+            shared_state_path=shared_state_path,
+            a0=a0,
+            a1=a1_final,
+            s1=s1_result,
+        )
 
     # ── Section Mapper ─────────────────────────────────────────────────────
     _separator("Section Mapper — TO outline → course_spec grouping")
     sm_result = section_mapper_run(shared_state_path=shared_state_path)
-    logger.info("Sections mapped: %s", len(sm_result.get("enriched_sections", [])))
+    sections_mapped = len(sm_result.get("enriched_sections", []))
+    logger.info("Sections mapped: %s", sections_mapped)
 
     # ── KC Planner ─────────────────────────────────────────────────────────
     _separator("KC Planner — determining Knowledge Check placement")
@@ -259,11 +335,11 @@ def run_pipeline(
         _separator(f"A2 — Content Generator (cycle {cycle})")
         a2 = A2ContentGenerator(
             shared_state_path=shared_state_path,
-            docx_path=paths[0],
+            docx_path=primary_path,
             render_docx=False,
             feedback=a2_feedback,
             course_difficulty=course_difficulty,
-            source_file_paths=paths,  # pass all source files for BM25 chunk retrieval
+            source_file_paths=paths,
         ).run()
         logger.info("A2 status : %s", a2.status)
         logger.info("Generated : %s", a2.stats.generated)
@@ -277,7 +353,7 @@ def run_pipeline(
         logger.info("Blockers  : %s", s2_result.blockers)
         logger.info("Warnings  : %s", s2_result.warnings)
 
-        if s2_result.status not in (S2Status.blocked, S2Status.blocker):
+        if not _s2_blocks(s2_result.status):
             logger.info("S2 passed — content cleared for DOCX rendering.")
             break
 
@@ -289,7 +365,7 @@ def run_pipeline(
         a2_feedback = _format_s2_feedback(s2_result)
 
     # ── S2 hard stop ───────────────────────────────────────────────────────
-    if not s2_result or s2_result.status in (S2Status.blocked, S2Status.blocker):
+    if not s2_result or _s2_blocks(s2_result.status):
         logger.error(
             "Pipeline stopped: S2 still blocked after %s cycle(s); "
             "study_guide.docx will NOT be built.",
@@ -297,11 +373,20 @@ def run_pipeline(
         )
         _separator("SUMMARY")
         logger.info("Run ID : %s", run_id)
-        logger.info("A1     : %s", a1_final.status if a1_final else "n/a")
+        logger.info("A1     : %s", a1_final.status)
         logger.info("A2     : %s", a2.status if a2 else "n/a")
         logger.info("S2     : %s", s2_result.status if s2_result else "n/a")
         logger.info("Output : %s/", SHARED_STATE_DIR)
-        return
+        return _build_result(
+            run_id=run_id,
+            shared_state_path=shared_state_path,
+            a0=a0,
+            a1=a1_final,
+            s1=s1_result,
+            sections_mapped=sections_mapped,
+            a2=a2,
+            s2=s2_result,
+        )
 
     # ── Render study_guide.docx ────────────────────────────────────────────
     _separator("Rendering study_guide.docx (S2 passed)")
@@ -310,11 +395,23 @@ def run_pipeline(
 
     _separator("SUMMARY")
     logger.info("Run ID : %s", run_id)
-    logger.info("A1     : %s", a1_final.status if a1_final else "n/a")
+    logger.info("A1     : %s", a1_final.status)
     logger.info("A2     : %s", a2.status if a2 else "n/a")
     logger.info("S2     : %s", s2_result.status)
     logger.info("DOCX   : %s", docx_final)
     logger.info("Output : %s/", SHARED_STATE_DIR)
+
+    return _build_result(
+        run_id=run_id,
+        shared_state_path=shared_state_path,
+        a0=a0,
+        a1=a1_final,
+        s1=s1_result,
+        sections_mapped=sections_mapped,
+        a2=a2,
+        s2=s2_result,
+        study_guide_path=docx_final,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -70,12 +70,12 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173,"
         "http://localhost:3000,"
         "http://localhost:8080,"
-        "https://nimble-cendol-69a81c.netlify.app"
+        "https://course-generation.netlify.app"
     )
 
-    # Extra origins matched by regex — restrict to specific Netlify site slug
-    # to prevent any arbitrary Netlify subdomain from getting credentialed access.
-    cors_origin_regex: str = r"https://nimble-cendol-69a81c(--[a-z0-9-]+)?\.netlify\.app"
+    # Extra origins matched by regex — covers the production Netlify site and
+    # any branch/preview deploys (course-generation--<branch>.netlify.app).
+    cors_origin_regex: str = r"https://course-generation(--[a-z0-9-]+)?\.netlify\.app"
 
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

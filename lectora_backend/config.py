@@ -70,7 +70,7 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173,"
         "http://localhost:3000,"
         "http://localhost:8080,"
-        "http://course-generation.netlify.app,"
+        "https://course-generation.netlify.app"
     )
 
     # Extra origins matched by regex — restrict to specific Netlify site slug

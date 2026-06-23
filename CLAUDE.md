@@ -47,9 +47,16 @@ alembic current                                   # show current revision
 alembic revision --autogenerate -m "description"  # create migration after model changes
 ```
 
-### Integration smoke test (requires API + worker running)
+### Tests
 ```bash
-python -m pytest lectora_backend/tests/integration/test_job_flow_smoke.py -v
+# Unit tests (no running server needed)
+python3 -m pytest lectora_backend/tests/unit/ -v
+
+# Single unit test file
+python3 -m pytest lectora_backend/tests/unit/test_azure_course_artifacts.py -v
+
+# Integration smoke test (requires API + worker running)
+python3 -m pytest lectora_backend/tests/integration/test_job_flow_smoke.py -v
 ```
 
 ## Architecture Overview
@@ -61,9 +68,13 @@ This system has two execution modes that share the same pipeline agents:
 
 - **`lectora_backend/main.py`** — FastAPI app; validates env vars, DB, Blob, and Service Bus on startup
 - **`lectora_backend/worker.py`** — Worker; listens on Service Bus queue
-- **`lectora_backend/core/orchestrator.py`** — Worker message loop + gate retry logic (`MAX_S1_GATE_CYCLES = 3`); renews Service Bus lock (30 min max)
-- **`lectora_backend/core/pipeline_adapter.py`** — Bridge that translates backend shared state into pipeline agent calls and merges outputs back
+- **`lectora_backend/core/orchestrator.py`** — Worker message loop + gate retry logic (`MAX_A0_A1_S1_CYCLES = 3`, `MAX_A2_S2_CYCLES = 3`); renews Service Bus lock (30 min max)
+- **`lectora_backend/core/pipeline_adapter.py`** — Bridge that translates backend shared state into pipeline agent calls and merges outputs back; triggers `local_artifact_sync` after completion
 - **`lectora_backend/core/state_manager.py`** — Reads/writes `shared_state.json` to Azure Blob
+- **`lectora_backend/core/blob_layout.py`** — Builds deterministic blob prefix `{courseSlug}/{jobId}/`
+- **`lectora_backend/core/azure_course_artifacts.py`** — Read/resolve pipeline artifacts from Azure `course-generation-artifacts` container; job APIs and Asset Library use this in preference to local files when Azure is configured
+- **`lectora_backend/core/local_artifact_sync.py`** — Upload local dev-mode pipeline outputs to Azure Blob, mirroring the production blob layout
+- **`lectora_backend/core/pipeline_run_log.py`** — Persist in-memory pipeline job logs to `logs/pipeline_run_log.json` on disk (and optionally Azure)
 - **`lectora_backend/repositories/`** — SQL CRUD (`job_repository.py`) and Blob Storage wrapper (`blob_repository.py`)
 
 ### Mode 2: Local dev (`dev_app` + in-memory store)
@@ -87,27 +98,32 @@ Each agent lives in `lectora_backend/pipeline/agent/<name>/main.py` and follows 
 
 ```
 agent/<name>/
-  main.py          ← agent entry point
-  config/llm.py    ← model name, temperature, token limits
-  utils/           ← pure helper functions (no LLM calls)
-  prompt/          ← LLM prompt strings (modify here to tune behavior)
+  main.py            ← shim re-exporting from orchestrator/ (do not add logic here)
+  orchestrator/      ← actual entry point (synthesizer.py for A0, graph.py for A1)
+  step_0N_<name>/    ← isolated step modules; each has utils/ and constants/ subdirs
+  shared/            ← TypedDict state models, shared helpers, constants
+  config/llm.py      ← model name, temperature, token limits
+  utils/             ← backward-compat re-exports only; do not add new logic here
+  prompt/            ← legacy prompt strings (A2 still uses this; A0/A1 moved prompts to step_0N/constants/)
 ```
+
+**A0** and **A1** have been refactored to this step-based structure. **A2** has placeholder `step_0N_*` directories but the active implementation is still in `utils/` — do not treat its step dirs as functional yet.
 
 | Agent | Role |
 |-------|------|
-| **A0** (`a0_request_synthesizer`) | Extracts metadata from primary document (DOCX or PDF), sends timed-outline to LLM for outline extraction, classifies rule family, extracts images; also chunks all source files for downstream retrieval |
-| **A1** (`a1_outline_interpreter`) | LangGraph `StateGraph`; parses document structure, maps images, enriches via LLM, builds `course_spec.json` |
+| **A0** (`a0_request_synthesizer`) | Two scenarios: (1) TO provided — parses TO doc via LLM for outline extraction; (2) No TO — extracts structured content from source files (headings + para indices for DOCX, TOC for PDF) and generates TO via LLM. Also classifies rule family, extracts images, chunks all source files. Entry: `orchestrator/synthesizer.py`. Steps: `step_01_document_parsing` → `step_02_classification` → `step_03_to_processing` → `step_04_post_processing`. |
+| **A1** (`a1_outline_interpreter`) | LangGraph `StateGraph` with 8 sequential nodes and conditional routing edges; typed `A1State` (TypedDict in `shared/models/state.py`) flows through: load_state → parse_document → validate → map_images → enrich → build_spec → detect_issues → persist. Entry: `orchestrator/graph.py`. |
 | **S1** (`s1_validator`) | Quality gate on A0+A1 outputs; blockers trigger full A0→A1→S1 retry |
 | **Section Mapper** (`section_mapper`) | Groups `course_spec` sections under L1 chapters, maps to TO lessons; produces `enriched_sections.json` |
 | **KC Planner** (`kc_planner`) | Determines Knowledge Check placement via 3 auto-selected scenarios; mutates `has_knowledge_check` flags on subtopics in `enriched_sections`; outputs `kc_plan.json` |
-| **A2** (`a2_content_generator`) | One LLM call per lesson (all subtopics batched); retrieves relevant chunks from source files via BM25-style keyword scoring; renders final styled `.docx` |
+| **A2** (`a2_content_generator`) | One LLM call per lesson (all subtopics batched); retrieves relevant source chunks via BM25-style keyword scoring; also generates a course description and conclusion section; renders final styled `.docx` |
 | **S2** (`s2_validator`) | Quality gate on generated content; blockers trigger A2 regeneration with feedback |
 
 Shared KC regex patterns (`is_kc_title()`, etc.) live in `pipeline/shared_utils/kc_patterns.py`.
 
 #### Multi-file source support
 
-A0 accepts multiple source files (DOCX + PDF) via the `source_file_paths` field on `POST /jobs`. `a0/utils/chunker.py` splits each file at heading boundaries (~400 words/chunk, 50-word overlap) and stores chunks in shared state. A2 calls `retrieve_chunks_for_topic()` (BM25-style keyword overlap, no vector DB) to pull relevant context per lesson. PDF parsing uses `a0/utils/pdf_extractor.py`; DOCX parsing uses `python-docx`.
+A0 accepts multiple source files (DOCX + PDF) via the `source_file_paths` field on `POST /jobs`. `a0/step_01_document_parsing/utils/chunker.py` splits each file at heading boundaries (~400 words/chunk, 50-word overlap) and stores chunks in shared state. A2 calls `retrieve_chunks_for_topic()` (BM25-style keyword overlap, no vector DB) to pull relevant context per lesson. PDF parsing uses `a0/step_01_document_parsing/utils/pdf_parser.py`; DOCX parsing uses `python-docx`.
 
 #### KC Planner Scenarios (auto-selected)
 
@@ -154,8 +170,15 @@ Returns `202 Accepted` with `{ "jobId": "..." }`. In production, blobs must alre
 **Document upload + TO generation endpoints** (both `main.py` and `dev_app.py`):
 
 - `POST /documents/upload` — upload a DOCX, PDF, or pre-built JSON timed-outline file; returns the blob path. JSON files skip LLM outline generation in A0.
-- `POST /documents/generate-to` — run A0 asynchronously (default) or synchronously (`wait=true`); returns `{ jobId }` for async, full result for sync.
-- `GET /documents/generate-to/jobs/{jobId}` — poll async A0 result; status: `pending | running | completed | failed`.
+- `POST /documents/generate-to` — run A0 to produce a structured Timed Outline. Async by default (returns `{ jobId, pollUrl }`); pass `wait=true` for sync. Body (`GenerateTORequest`):
+  - `blobPaths` — list of uploaded source blob paths (legacy `blobPath` also accepted)
+  - `difficulty` — `"basic"` / `"intermediate"` / `"advanced"` (default: `"intermediate"`)
+  - `toDocBlobPath` — optional pre-uploaded TO doc; A0 parses it instead of generating
+  - `customToPrompt` — optional system prompt override for TO generation
+  - `courseTypeHint` — optional domain hint to focus topic selection
+  - `audience` — optional target audience string; calibrates TO generation and A2 writing
+  - `durationHours` + `calculatedWordCount` — **dynamic flow**: A0 skips TOC extraction and sends raw file content with a duration-based prompt; frontend computes `calculatedWordCount = (durationHours × 9000) / difficultyMultiplier`
+- `GET /documents/generate-to/jobs/{jobId}` — poll async A0 result; status: `processing | completed | failed | cancelled`. Completed result includes `to`, `rules`, and `toBlobPath` (pass as `timedOutline` in `POST /jobs` to reuse the TO).
 
 **Settings endpoints** (both `main.py` and `dev_app.py`):
 
@@ -174,20 +197,20 @@ Schemas live in `lectora_backend/api/schemas/`.
 
 ### Storage Layout
 
-Artifacts are organized by **course slug** (sanitized title), not job ID:
+Artifacts are organized by **course slug + job ID** (`{courseSlug}/{jobId}/`), giving each run an isolated folder:
 
 ```
-{courseSlug}/         ← e.g. Long_Term_Care/
-  doc/                ← original input .docx/.pdf files
-  output/             ← pipeline artifacts (JSON + final .docx)
-  images/             ← extracted image binaries
-  logs/               ← stage completion logs
-  state/              ← shared_state.json
+{courseSlug}/{jobId}/   ← e.g. Long_Term_Care/abc123/
+  doc/                  ← original input .docx/.pdf files
+  output/               ← pipeline artifacts (JSON + final .docx)
+  images/               ← extracted image binaries
+  logs/                 ← stage logs + pipeline_run_log.json
+  state/                ← shared_state.json + pipeline_shared_state.json
 ```
 
-`core/course_storage.py` manages slug generation (`sanitize_course_slug()`), path construction, and backward compatibility with legacy `outputs/` segments. In dev mode this maps to `pipeline/courses/{courseSlug}/`; in production it maps to the Azure Blob container prefix.
+`core/blob_layout.py` (`build_blob_layout_for_course()`) builds this layout; falls back to `{courseSlug}/` when no `job_id` is provided. `core/course_storage.py` manages slug generation (`sanitize_course_slug()`) and backward compatibility. In dev mode maps to `pipeline/courses/{courseSlug}/{jobId}/`; in production maps to the Azure Blob container prefix.
 
-Source documents uploaded by the frontend are stored in a separate `uploaded-documents` container/prefix. `core/blob_resolver.py` resolves paths from either container to local disk, caching Azure downloads to avoid re-fetches.
+Source documents uploaded by the frontend are stored in a separate `uploaded-documents` container/prefix. `core/blob_resolver.py` resolves paths from either container to local disk, caching Azure downloads to avoid re-fetches. `core/azure_course_artifacts.py` resolves artifact paths from Azure when `AZURE_ARTIFACTS_ENABLED=true`.
 
 ### Database Schema
 
@@ -232,11 +255,22 @@ Default deployments:
 | Agent ID | Default deployment | Role |
 |----------|--------------------|------|
 | `A0` | `o3` | Rule family classification (reasoning model) |
-| `A0_TO` | `gpt-5.4` | Timed-outline extraction (large context window) |
+| `A0_TO` | `gpt-5.4-mini` | Timed-outline extraction |
 | `A1` | `gpt-5.4-mini` | Section enrichment |
-| `A2` | `gpt-5.4` | Content generation |
+| `A2` | `gpt-5.4-mini` | Content generation |
 
 Overrides are written to `pipeline/shared_llm_config/model_overrides.json` and survive server restarts. The settings API (`PUT /settings/models`) is the intended way to change them; direct file edits also work.
+
+### NAIC CE Credit Hour Metrics
+
+`pipeline/agent/a0_request_synthesizer/step_04_post_processing/utils/outline_metrics.py` enriches `llm_to_outline` sections with timing fields derived from NAIC CE standards:
+
+- **180 words = 1 reading minute**
+- **50 minutes = 1 base CE credit hour** (9,000 words = 1 credit hour)
+- Difficulty multipliers: `basic 1.00×`, `intermediate 1.25×`, `advanced 1.50×`
+- NAIC rounding rule: fractional part ≥ 0.50 rounds up; < 0.50 rounds down
+
+`enrich_section_metrics(sections, difficulty)` fills in missing `word_count`, `minutes`, or `credit_hour` by deriving the other two from whichever field is present. `compute_course_totals(sections, difficulty)` returns aggregate totals. Both are called by the generate-to route to prepare the TO payload for the UI.
 
 ### Key Design Rules
 - **Parser owns structure** in A1: sections, word counts, KCs come from python-docx parsing. LLM only enriches (adds subtopics, LO mappings).

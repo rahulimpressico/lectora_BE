@@ -627,6 +627,16 @@ def _persist_special_instructions(shared_state_path: str, instructions: str) -> 
         json.dump(state, fh, indent=2, default=str)
 
 
+def _persist_course_title(shared_state_path: str, title: str) -> None:
+    """Store user-provided course title in shared_state so A2 uses it verbatim."""
+    p = Path(shared_state_path)
+    with open(p, encoding="utf-8") as fh:
+        state = json.load(fh)
+    state["course_title"] = title.strip()
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, default=str)
+
+
 def _sync_legacy_shared_state_dir(course_slug: str) -> None:
     """Mirror ``pipeline/courses/{slug}`` into legacy ``pipeline/shared_state/{slug}``."""
     if not course_slug:
@@ -795,6 +805,10 @@ def _run_pipeline_inner(
         # Persist special instructions so A2 can inject them into generation prompts.
         if special_instructions:
             _persist_special_instructions(shared_state_path, special_instructions)
+        # Persist user-provided course title so A2 never substitutes the LLM-extracted one.
+        _job_title = (store.get(job_id) or _job_rec)
+        if _job_title and _job_title.course_title:
+            _persist_course_title(shared_state_path, _job_title.course_title)
         _sync_legacy_shared_state_dir(job_output_slug)
         log("success", "Document analyzed — course structure and rule family identified", "A0")
         store.complete_stage(job_id, "A0", "PASS")
@@ -1174,13 +1188,21 @@ def _resolve_study_guide_path(artifact_dir: Path) -> Path | None:
 
 
 def _course_title_from_shared_state(state: dict, course_slug: str) -> str:
+    # TO outline's course_title is the authoritative human-readable title.
+    # course_metadata.title can be a section heading (e.g. "3.0 What long-term care…")
+    # when A1 incorrectly lifts it from the document's first section, so it goes last.
+    to_outline = state.get("llm_to_outline_classification") or {}
+    to_course_title = (to_outline.get("course_title") or to_outline.get("course_name") or "").strip()
+    a2_course_title = ((state.get("agent_outputs") or {}).get("A2") or {}).get("course_title") or ""
     request_spec = state.get("request_spec") or {}
     course_metadata = request_spec.get("course_metadata") or {}
     return (
-        course_metadata.get("title")
-        or state.get("extracted_inputs", {}).get("title")
-        or state.get("request", {}).get("courseTitle")
-        or course_slug.replace("_", " ")
+        to_course_title                                        # TO outline title (authoritative)
+        or state.get("course_title")                          # job-request title via _persist_course_title
+        or (state.get("request") or {}).get("courseTitle")   # direct from job request body
+        or a2_course_title                                     # A2 LLM-detected title
+        or course_slug.replace("_", " ")                      # slug fallback (never a section heading)
+        or course_metadata.get("title")                       # last resort (may be a section heading)
     )
 
 
@@ -1774,6 +1796,7 @@ async def get_course_content(
             "level": level,
             "sectionType": "content",
             "content": content_text,
+            "paragraphs": sec.get("body_paragraphs") or [],
             "learningObjectives": [],
             "wordCount": word_count,
             "hasKnowledgeCheck": bool(sec.get("is_knowledge_check")),
@@ -1822,6 +1845,7 @@ async def get_course_content(
             "level": 1,
             "sectionType": "overview",
             "content": course_description,
+            "paragraphs": [{"type": "text", "content": course_description}],
             "learningObjectives": [],
             "wordCount": len(course_description.split()),
             "hasKnowledgeCheck": False,
@@ -1835,6 +1859,7 @@ async def get_course_content(
             "level": 1,
             "sectionType": "learning-objectives",
             "content": lo_text,
+            "paragraphs": [],
             "learningObjectives": course_learning_objectives,
             "wordCount": len(lo_text.split()),
             "hasKnowledgeCheck": False,
@@ -1850,6 +1875,7 @@ async def get_course_content(
             "level": 1,
             "sectionType": "conclusion",
             "content": course_conclusion,
+            "paragraphs": [{"type": "text", "content": course_conclusion}],
             "learningObjectives": [],
             "wordCount": len(course_conclusion.split()),
             "hasKnowledgeCheck": False,
@@ -1867,9 +1893,17 @@ async def get_course_content(
     estimated_read = f"{read_minutes} min read" if read_minutes < 60 else f"{read_minutes // 60}h {read_minutes % 60}m"
 
     from datetime import datetime, timezone
+    # Always resolve the title fresh from shared_state — the cached job record may
+    # have been recovered before _persist_course_title wrote the correct value.
+    resolved_title = (
+        _course_title_from_shared_state(shared_state, course_slug)
+        or job.course_title
+        or a2_output.get("course_title")
+        or "Untitled Course"
+    )
     return JSONResponse(content={
         "jobId": job_id,
-        "courseTitle": a2_output.get("course_title") or job.course_title,
+        "courseTitle": resolved_title,
         "courseType": job.course_type,
         "generatedAt": a2_output.get("timestamp") or datetime.now(timezone.utc).isoformat(),
         "meta": {

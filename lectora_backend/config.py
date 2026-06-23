@@ -77,6 +77,29 @@ class Settings(BaseSettings):
     # any branch/preview deploys (course-generation--<branch>.netlify.app).
     cors_origin_regex: str = r"https://course-generation(--[a-z0-9-]+)?\.netlify\.app"
 
+    # Azure AI Search
+    azure_search_endpoint: str = ""
+    azure_search_api_key: str = ""
+    azure_search_index_name: str = "course-chunks"
+
+    # Dedicated Azure OpenAI resource for embeddings (separate from main LLM resource)
+    # Endpoint is derived as: https://{resource_name}.openai.azure.com/
+    azure_openai_embeddings_resource_name: str = ""
+    azure_openai_embeddings_key: str = ""
+
+    # Embedding model deployment name on the embeddings resource
+    ingestion_embedding_deployment: str = "text-embedding-3-large"
+
+    # Ingestion LLM deployment (for metadata enrichment)
+    # Falls back to azure_openai_deployment if empty
+    ingestion_llm_deployment: str = ""
+
+    @property
+    def azure_openai_embeddings_endpoint(self) -> str:
+        """Derived endpoint URL for the dedicated embeddings resource."""
+        name = self.azure_openai_embeddings_resource_name.strip()
+        return f"https://{name}.openai.azure.com/" if name else ""
+
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 

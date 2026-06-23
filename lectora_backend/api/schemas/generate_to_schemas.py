@@ -13,6 +13,10 @@ class UploadDocumentResponse(BaseModel):
         alias="uploadFolder",
         description="Sanitized folder name under uploaded-documents/ (from course topic).",
     )
+    document_id: str = Field(
+        alias="documentId",
+        description="Unique ID for this uploaded document. Poll GET /documents/{documentId}/ingestion-status.",
+    )
 
     model_config = {"populate_by_name": True}
 

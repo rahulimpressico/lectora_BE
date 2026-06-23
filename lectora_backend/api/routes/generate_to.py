@@ -34,7 +34,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse
 
 from lectora_backend.api.generate_to_job_store import (
@@ -72,7 +72,69 @@ from lectora_backend.pipeline.agent.a0_request_synthesizer.utils.outline_metrics
     compute_course_totals,
     get_difficulty_factor,
 )
+
 logger = logging.getLogger(__name__)
+
+
+# ── Ingestion background task helpers ────────────────────────────────────────
+
+def _run_ingestion_background(
+    file_bytes: bytes,
+    filename: str,
+    document_id: str,
+) -> None:
+    """Background task: write bytes to a temp file, run ingestion, clean up."""
+    import asyncio
+    import tempfile
+    import os
+    from pathlib import Path
+    from lectora_backend.api.ingestion_status_store import set_status
+
+    set_status(document_id, "processing")
+
+    suffix = Path(filename).suffix.lower()
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=suffix, delete=False, prefix=f"ingest_{document_id}_"
+        ) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        from lectora_backend.ingestion.service import IngestionOrchestrator
+        orchestrator = IngestionOrchestrator.get_instance()
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        result = loop.run_until_complete(
+            orchestrator.ingest(tmp_path, document_id, filename)
+        )
+        logger.info(
+            "[ingestion-bg] Completed: document_id=%s chunks=%d status=%s",
+            document_id,
+            result.total_chunks,
+            result.status,
+        )
+        set_status(document_id, result.status, total_chunks=result.total_chunks)  # type: ignore[arg-type]
+    except Exception as exc:
+        logger.warning(
+            "[ingestion-bg] Failed for document_id=%s filename=%s: %s",
+            document_id,
+            filename,
+            exc,
+        )
+        set_status(document_id, "failed", error=str(exc))
+    finally:
+        if tmp_path:
+            try:
+                import os
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 router = APIRouter()
 
 # ── Section-key constants shared by all outline-parsing helpers ───────────────
@@ -605,6 +667,7 @@ _CONTENT_TYPES: dict[str, str] = {
     summary="Upload a DOCX, PDF, or JSON (Timed Outline) file (uploaded-documents container or local temp)",
 )
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(
         ...,
         description="A .docx or .pdf source document, or a .json Timed Outline file.",
@@ -656,6 +719,9 @@ async def upload_document(
         )
 
     blob_path = _uploads_blob_path(folder, filename)
+    document_id = uuid.uuid4().hex[:12]
+
+    from lectora_backend.api.ingestion_status_store import set_status as _set_ingestion_status
 
     if _azure_storage_ready():
         try:
@@ -671,7 +737,13 @@ async def upload_document(
                 detail="Failed to upload file to storage — see server logs.",
             ) from exc
         logger.info("[upload] Azure blob %s (%d bytes)", blob_path, len(content))
-        return UploadDocumentResponse(blob_path=blob_path, upload_folder=folder)
+        # Trigger ingestion for DOCX and PDF files only (skip JSON TO files)
+        if ext in {".docx", ".pdf"}:
+            _set_ingestion_status(document_id, "pending")
+            background_tasks.add_task(
+                _run_ingestion_background, content, filename, document_id
+            )
+        return UploadDocumentResponse(blob_path=blob_path, upload_folder=folder, document_id=document_id)
 
     slot_dir = _UPLOAD_ROOT / folder
     slot_dir.mkdir(parents=True, exist_ok=True)
@@ -685,7 +757,40 @@ async def upload_document(
         ) from exc
 
     logger.info("[upload] Saved %s → %s (%d bytes)", filename, dest, dest.stat().st_size)
-    return UploadDocumentResponse(blob_path=blob_path, upload_folder=folder)
+    # Trigger ingestion for DOCX and PDF files only (skip JSON TO files)
+    if ext in {".docx", ".pdf"}:
+        _set_ingestion_status(document_id, "pending")
+        background_tasks.add_task(
+            _run_ingestion_background, content, filename, document_id
+        )
+    return UploadDocumentResponse(blob_path=blob_path, upload_folder=folder, document_id=document_id)
+
+
+@router.get(
+    "/{document_id}/ingestion-status",
+    summary="Poll background ingestion status for an uploaded document",
+)
+async def get_ingestion_status(document_id: str) -> JSONResponse:
+    """
+    Return the ingestion pipeline status for a document uploaded via POST /documents/upload.
+
+    Status values:
+      pending    — queued but not yet started
+      processing — parse → chunk → enrich → embed → index in progress
+      indexed    — fully embedded and indexed in Azure AI Search
+      parsed     — chunked but embedding/indexing was skipped (Azure Search not configured)
+      failed     — ingestion encountered an unrecoverable error
+
+    Returns 404 when the document_id is unknown or has expired (4 hr TTL).
+    """
+    from lectora_backend.api.ingestion_status_store import get_status
+    entry = get_status(document_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No ingestion record for document_id: {document_id}",
+        )
+    return JSONResponse(content=entry)
 
 
 @router.post(

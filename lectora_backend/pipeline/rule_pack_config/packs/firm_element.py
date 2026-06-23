@@ -114,19 +114,43 @@ PACK: dict = {
     "kc_placement_rules": {
         # KC placement rule: content-driven, not positionally predictable
         "placement": "content_driven_not_positionally_predictable",
-        "min_kc_per_lesson": 1,
-        "max_kc_per_lesson": 4,
+        "min_kc_per_lesson": 2,
+        "max_kc_per_lesson": 5,
         # KC answer options: 4 only
         "min_answer_options": 4,
         "max_answer_options": 4,
+        "cadence": {
+            "screens_min": 3,
+            "screens_max": 6,
+            "approximate_word_pages_min": 1,
+            "approximate_word_pages_max": 3,
+        },
+        "kc_triggers": [
+            "important_new_concepts",
+            "complex_or_difficult_explanations",
+            "section_or_subsection_completion",
+            "scenario_or_case_study_interactions",
+        ],
+        "embedded_kc_format": {
+            "typical_answer_option_count": 4,
+            "components": [
+                "stem",
+                "answer_options",
+                "correct_answer",
+                "explanation",
+            ],
+            "allow_scenario_or_case_study": True,
+            "prefer_scenario_or_case_study": True,
+        },
         "forbidden_placements": [
             "mid_paragraph",
-            "after_table",
             "inside_regulatory_block",
         ],
-        # KC structure: stem + options + correct answer with explanation
+        # KC structure: stem + options + correct answer with explanation for all options
         "require_explanation": True,
+        "require_explanation_for_all_options": True,
         "distractor_quality": "plausible",
+        "prefer_scenario_based_stems": True,
     },
     "deduplication_rules": {
         "similarity_threshold": 0.82,

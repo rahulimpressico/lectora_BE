@@ -126,16 +126,16 @@ PACK: dict = {
         "maintain_section_boundary_integrity": True,
     },
     "kc_placement_rules": {
-        "placement": "every_5_to_10_screens_instructional_priority",
+        "placement": "every_3_to_5_screens_instructional_priority",
         "min_kc_per_lesson": 2,
         "max_kc_per_lesson": 8,
         "min_answer_options": 2,
         "max_answer_options": 4,
         "cadence": {
-            "screens_min": 5,
-            "screens_max": 10,
-            "approximate_word_pages_min": 2,
-            "approximate_word_pages_max": 4,
+            "screens_min": 3,
+            "screens_max": 5,
+            "approximate_word_pages_min": 1,
+            "approximate_word_pages_max": 3,
         },
         "placement_priorities": [
             "instructional_value",
@@ -166,6 +166,7 @@ PACK: dict = {
                 "explanation",
             ],
             "allow_scenario_or_case_study": True,
+            "prefer_scenario_or_case_study": True,
         },
         "forbidden_placements": [
             "introduction",
@@ -173,11 +174,12 @@ PACK: dict = {
             "summary_section",
             "course_summary",
             "mid_paragraph",
-            "after_table",
             "inside_regulatory_block",
         ],
         "require_explanation": True,
+        "require_explanation_for_all_options": True,
         "distractor_quality": "plausible",
+        "prefer_scenario_based_stems": True,
     },
     "deduplication_rules": {
         "similarity_threshold": 0.82,

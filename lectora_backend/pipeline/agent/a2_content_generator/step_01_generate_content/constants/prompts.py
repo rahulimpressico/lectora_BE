@@ -95,18 +95,27 @@ def _build_teaching_style_section(rule_pack: dict, audience: str = "") -> str:
 
     lines.extend([
         "",
-        "### Lesson continuity (CRITICAL)",
-        "The course is a continuous learning journey — NOT a collection of isolated chapters.",
-        "When a `Previous Lesson Context` block is present in the user message:",
+        "### Course and lesson continuity (CRITICAL)",
+        "The course is a continuous learning journey — NOT a collection of isolated sections.",
+        "",
+        "**Between lessons** — when a `Previous Lesson Context` block is present:",
         "  - The FIRST section of this lesson MUST open with ONE bridging sentence that:",
         "    a) acknowledges what the learner just covered in the previous lesson, and",
         "    b) explains why the current topic is the natural next step.",
-        "  - Example bridge: 'Now that you understand how coinsurance works, let's look at "
+        "  - Example: 'Now that you understand how coinsurance works, let's look at "
         "how deductibles interact with those rules — because the two work together in every claim.'",
         "  - The bridge must feel like a real instructor pivoting, not a mechanical summary.",
         "  - Do NOT repeat content from the previous lesson — one sentence of acknowledgment only.",
-        "Within each lesson, each subsequent section should also open with a sentence that",
-        "connects it to the section immediately before it, showing how the ideas build on each other.",
+        "",
+        "**Between sections within this lesson** — when a section block shows `prev_section`:",
+        "  - Open THAT section with ONE sentence connecting it to the named previous section.",
+        "  - Show HOW the new topic follows from or builds on the previous one.",
+        "  - Examples of good intra-lesson bridges:",
+        "    'With that foundation in place, let's look at how [new topic] applies in practice.'",
+        "    '[Prev topic] sets the stage — now we need to understand [new topic] to complete the picture.'",
+        "    'Understanding [prev topic] is only half the equation; [new topic] is what determines...'",
+        "  - NEVER start a non-first section cold, as if the previous section did not exist.",
+        "  - Keep the bridge to ONE sentence — do not summarise the prior section at length.",
     ])
 
     if labels or callout_range:
@@ -127,7 +136,12 @@ def _build_teaching_style_section(rule_pack: dict, audience: str = "") -> str:
 
 def build_lesson_system_prompt(rule_pack: dict, audience: str = "") -> str:
     """System prompt: output contract + authority rules; voice/KC details come from rule pack JSON."""
-    fam = rule_pack.get("family", "CE")
+    fam = rule_pack.get("family") or ""
+    if not fam:
+        raise ValueError(
+            "rule_pack must contain a non-empty 'family' key — "
+            "ensure resolve_rule_pack() was called before building the system prompt."
+        )
     ver = rule_pack.get("version", "")
     meta = f"{fam} v{ver}" if ver else fam
     teaching_block = _build_teaching_style_section(rule_pack, audience=audience)
@@ -190,6 +204,20 @@ Use an `options` count that stays within `full_rule_pack.kc_placement_rules.min_
 - "knowledge_check"    — knowledge check block per `kc_placement_rules` + assessment-related rules
 - "heading_3"          — sub-heading within the section
 - "heading_4"          — minor sub-heading
+- "table"              — comparison matrix, process table, or structured reference data
+
+Table format:
+```json
+{{
+  "type": "table",
+  "caption": "optional bold title above the table",
+  "headers": ["Column A", "Column B", "Column C"],
+  "rows": [
+    ["row 1 cell A", "row 1 cell B", "row 1 cell C"],
+    ["row 2 cell A", "row 2 cell B", "row 2 cell C"]
+  ]
+}}
+```
 
 ## Voice, tone, and structure
 
@@ -213,12 +241,65 @@ When the voice mentions **third_person**:
 If the voice rule conflicts with the source text, **rewrite** the source text to match the rule — do not preserve the source voice.
 
 {teaching_block}
-## Knowledge checks
+## Knowledge checks (CRITICAL — quality and frequency)
 
 Placement cadence and forbidden placements: follow `full_rule_pack.kc_placement_rules`.
 Stem style, forbidden question types, option counts, and rationales: follow `full_rule_pack.assessment_rules` **as they apply to embedded section KCs**.
 
+When `full_rule_pack.kc_placement_rules.prefer_scenario_based_stems` is true (which it is for all rule packs), EVERY knowledge check MUST:
+
+1. **Use a scenario-based stem** — do NOT write simple recall questions.
+   - WRONG: "Which of the following defines coinsurance?"
+   - RIGHT: "A client calls after a fire damaged her $800,000 building, which was only insured for $400,000. She expects a full payout for the $300,000 in damages. What should you explain to her about her coverage?"
+
+2. **Test application, not memorization** — the correct answer requires using a concept in a real situation, not just recalling its definition.
+
+3. **Explain ALL options** when `full_rule_pack.assessment_rules.require_distractor_rationales` or `full_rule_pack.kc_placement_rules.require_explanation_for_all_options` is true:
+   - The `explanation` field must say: "(A) This is wrong because… (B) This is correct because… (C) This is wrong because… (D) This is wrong because…"
+   - Each incorrect option must be a plausible near-miss, not an obviously wrong answer.
+
+4. **Validate the key learning objective** of the section — each KC must map directly to the LO listed for that section.
+
+5. **Vary the stem style** — use different scenario setups across KCs: client conversations, compliance situations, policy reviews, claim scenarios, supervisor decisions.
+
 Avoid near-duplicate stems across the course per `full_rule_pack.deduplication_rules` when generating new KCs.
+
+## Visual learning aids (Priority 2)
+
+Use `table` blocks to make structured information scannable. A table is BETTER than a bullet list when:
+- Comparing 2+ policy types, coverage options, regulatory tiers, or plan features
+- Showing a process with steps and their descriptions or conditions
+- Presenting attributes of 2+ entities side-by-side
+- Mapping requirements to actions (e.g. "If the client has X, then Y applies")
+
+**Good triggers for tables:**
+- "Types of X and their differences" → comparison matrix
+- "Steps in the [process]" → numbered process table
+- "Regulatory requirements" → requirement / action / example columns
+- "Coverage tiers" → tier / benefit / limit columns
+
+**Do NOT use tables for:**
+- Lists with only one attribute per item (use bullet_list instead)
+- Fewer than 2 rows (use a callout or bullet instead)
+- Content that is flowing narrative (use text instead)
+
+Introduce each table with a `heading_3` or `text` block before it. The table should feel like a teaching aid, not raw data.
+
+## Content optimization
+
+- **No repetition**: Do not re-explain a concept already covered in the `Prior Sections Summary`. If a concept from a prior section is relevant, reference it briefly ("As you saw in the previous section, …") and build on it — do not re-teach it.
+- **Consolidate overlapping content**: When two closely related concepts appear in the same or adjacent sections, explain their relationship and how they interact, rather than presenting them as completely independent topics.
+- **Avoid summary openers**: Do not start a section by listing what you are about to cover ("In this section, we will discuss X, Y, and Z"). Jump directly into the teaching.
+- **Compress at the concept level**: If the source material has more detail than the word budget allows, select the most instructionally valuable points — do not produce a thin summary of everything.
+
+## Regulatory content
+
+When regulatory references are applicable (insurance rules, SEC/NASAA regulations, FINRA rules), integrate them naturally into the narrative:
+- Name specific regulations or regulatory bodies when citing them: "Under FINRA Rule 1240…", "State departments of insurance require…", "SEC Release IA-5248 clarifies…"
+- Connect regulations to real consequences: what happens if the learner or their client violates this requirement?
+- Use regulatory context to ground scenarios: "If a state insurance examiner reviewed this policy, they would expect to see…"
+- Frame compliance not as a checkbox but as professional responsibility: why these rules protect clients and practitioners.
+- Do NOT hallucinate regulation numbers or names — cite only what the source material supports.
 
 ## Lectora / layout
 
@@ -352,13 +433,23 @@ def build_lesson_user_message(
         else:
             compression_note = ""
 
+        prev_heading = (spec.get("prev_section_heading") or "").strip()
+        if prev_heading:
+            prev_section_line = (
+                f"\nprev_section      : \"{prev_heading}\""
+                f"\n→ Open this section with ONE sentence that bridges FROM \"{prev_heading}\" "
+                f"INTO \"{spec['heading']}\" — show how the two topics connect or build on each other."
+            )
+        else:
+            prev_section_line = ""
+
         block = f"""### Section {i + 1} of {len(subtopic_specs)}: "{spec['heading']}"
 section_kind      : {section_kind}
 word_count        : {target_wc} words  (acceptable band: {wc_min}–{wc_max} words; ±5%){compression_note}
 has_knowledge_check: {str(spec.get('has_knowledge_check', False)).lower()}
 sub_headings      : {json.dumps(sub_headings)}
 image_count       : {spec.get('image_count', 0)}
-interactive_elements: {json.dumps(spec.get('interactive_elements', []))}
+interactive_elements: {json.dumps(spec.get('interactive_elements', []))}{prev_section_line}
 
 Learning Objectives to address:
 {lo_text}
@@ -426,14 +517,14 @@ Return a JSON ARRAY with exactly {n} element(s), one per section, in order:
 - Each section's word count MUST land within ±5% of the target — count before submitting.
 - Total across all sections must land within ±5% of {lesson_wc} words.
 - Address the learner directly per `full_rule_pack.style_constraints.voice` — every long section needs the required voice tokens (see Voice enforcement above).
-- Add a knowledge_check paragraph where has_knowledge_check is true, following full_rule_pack KC rules.
+- Add a knowledge_check paragraph where has_knowledge_check is true, following full_rule_pack KC rules. Make every KC scenario-based and explain all answer options.
 - Use "important_callout" with a `label` per content_rules / style_constraints (see Teaching style).
 - Include **lightweight** scenario-based examples and transition sentences when the rule pack requires them.
 - Stay faithful to each section's Source Content when `require_source_fidelity` is set.
 - Prefer bullet_list for lists of 3+ items when lectora constraints favor bullets.
+- Use "table" for any structured comparison or multi-attribute data (2+ rows, 2+ columns). Tables count toward word count.
+- Do NOT repeat concepts already described in the Prior Sections Summary — reference them briefly if needed.
 - Return ONLY the JSON array — no explanation, no markdown fences.
 """
 
 
-# Backwards compatibility: old code importing LESSON_SYSTEM
-LESSON_SYSTEM = build_lesson_system_prompt({"family": "CE", "version": ""})

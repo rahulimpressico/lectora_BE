@@ -33,6 +33,7 @@ from .source_chunker import (
     extract_last_section_tail,
     load_doc_paragraphs,
     count_source_words,
+    extract_section_key_points,
 )
 
 # Reserved section headings rendered by A2 from metadata (not from LLM generation).
@@ -141,6 +142,12 @@ def _count_words_in_section(section_data: dict) -> int:
             for opt in para.get("options", []):
                 total += len(re.findall(r"\w+", opt))
             total += len(re.findall(r"\w+", para.get("explanation", "")))
+        elif ptype == "table":
+            for hdr in (para.get("headers") or []):
+                total += len(re.findall(r"\w+", str(hdr)))
+            for row in (para.get("rows") or []):
+                for cell in (row or []):
+                    total += len(re.findall(r"\w+", str(cell)))
     return total
 
 
@@ -547,8 +554,18 @@ def generate_all_sections(
                 "image_count":          0,
                 "target_minutes":       lesson_mins,
                 "_is_parent_overview":  True,
+                # First spec of the lesson — inter-lesson bridging is handled via
+                # prev_lesson_context at the lesson level; no intra-lesson prev here.
+                "prev_section_heading": "",
             })
             parent_overview_added = True
+
+        # Track what immediately precedes each subtopic for transition context.
+        # When a parent overview was prepended it is the first section, so the
+        # first subtopic's "previous" is the lesson title (overview heading).
+        # Without a parent overview, the first subtopic has no intra-lesson prev
+        # (inter-lesson bridging is already handled via prev_lesson_context).
+        _prev_spec_heading: str = to_title if parent_overview_added else ""
 
         for sub_i, sub in enumerate(subtopics):
             source_text = extract_full_section_text(
@@ -556,10 +573,51 @@ def generate_all_sections(
                 para_start=sub.get("para_start", 0),
                 para_end=sub.get("para_end", 0),
             )
+
+            # If the Section Mapper pre-fetched vector-retrieved chunks for this
+            # subtopic, use them as the primary source text.
+            # The paragraph-range text is appended as supplementary ONLY when it
+            # contains meaningful content (para_start != 0 or para_end != 0).
+            # When both are 0 the subtopic was built from the TO outline alone
+            # (new vector-retrieval architecture) and has no meaningful para span.
+            matched_chunks = sub.get("matched_chunks") or []
+            if matched_chunks:
+                # Deduplicate and merge chunks in document order into a single block.
+                seen_texts: set[str] = set()
+                merged_parts: list[str] = []
+                for c in matched_chunks:
+                    t = (c.get("raw_text") or "").strip()
+                    if t and t not in seen_texts:
+                        merged_parts.append(t)
+                        seen_texts.add(t)
+                vector_text = "\n\n".join(merged_parts)
+
+                if vector_text:
+                    para_start = sub.get("para_start", 0)
+                    para_end = sub.get("para_end", 0)
+                    has_para_range = para_start != 0 or para_end != 0
+
+                    if source_text and has_para_range:
+                        source_text = (
+                            f"{vector_text}"
+                            "\n\n--- Supplementary paragraph range ---\n"
+                            f"{source_text}"
+                        )
+                    else:
+                        source_text = vector_text
+
+                    logger.debug(
+                        "[A2] Subtopic=%r — %d vector chunk(s) (%.0f chars)%s",
+                        sub.get("title", "")[:40],
+                        len(matched_chunks),
+                        len(vector_text),
+                        "; para-range appended" if (source_text and has_para_range) else "",
+                    )
+
             # When a multi-file chunk index is available, retrieve topic-relevant
-            # passages from all source files and append them to the primary DOCX
-            # paragraph-range text. This ensures A2 uses content from PDFs and
-            # additional DOCXs without sending every file to every LLM call.
+            # passages from all source files and append them to the source text.
+            # This ensures A2 uses content from PDFs and additional DOCXs without
+            # sending every file to every LLM call.
             if _build_context and source_chunks:
                 sub_heading = sub.get("title", "")
                 query = f"{to_title} {sub_heading}".strip()
@@ -568,8 +626,9 @@ def generate_all_sections(
                     separator = "\n\n--- Additional source material ---\n"
                     source_text = f"{source_text}{separator}{chunk_ctx}" if source_text else chunk_ctx
             source_text = _trim_source_to_budget(source_text, wc_per_sub[sub_i])
+            sub_heading = sub.get("title", f"Section {sub_i + 1}")
             subtopic_specs.append({
-                "heading":             sub.get("title", f"Section {sub_i + 1}"),
+                "heading":             sub_heading,
                 "target_word_count":   wc_per_sub[sub_i],
                 "source_text":         source_text,
                 "has_knowledge_check": sub.get("has_knowledge_check", False),
@@ -581,7 +640,13 @@ def generate_all_sections(
                 "interactive_elements": sub.get("interactive_elements", []),
                 "image_count":         sub.get("image_count", 0),
                 "target_minutes":      lesson_mins,
+                # Intra-lesson continuity: heading of the section that immediately
+                # precedes this one in the batch. Empty for the first section of a
+                # lesson when no parent overview exists (inter-lesson context is
+                # handled separately via prev_lesson_context).
+                "prev_section_heading": _prev_spec_heading,
             })
+            _prev_spec_heading = sub_heading
 
         # ── Single LLM call for the whole lesson ──────────────────────────────
         prior_summary = build_prior_summary(generated)

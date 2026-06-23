@@ -136,33 +136,97 @@ def build_prior_summary(completed_sections: list[dict], max_chars: int = 600) ->
     return "Previously completed sections:\n" + "\n".join(parts)
 
 
-def extract_last_section_tail(completed_sections: list[dict], max_words: int = 60) -> str:
+def extract_last_section_tail(completed_sections: list[dict], max_words: int = 80) -> str:
     """
-    Return a short excerpt from the end of the most recently generated section.
+    Return a compact summary of the most recently generated section for bridging.
 
-    Used to give the LLM actual closing content to bridge from when generating
-    the next lesson, so sections connect naturally rather than starting cold.
+    Captures three things in priority order:
+    1. Any important_callout blocks — these are explicit key takeaways.
+    2. The closing prose (last paragraph) — the section's final teaching point.
+    3. Up to two bullet items if prose is absent.
 
-    Pulls plain text from body_paragraphs (text / important_callout types only),
-    then trims to the last `max_words` words.  Returns an empty string when no
-    suitable content is found (first lesson, failed section, etc.).
+    The combined result is trimmed to max_words so the bridge stays lightweight.
+    Used to give the LLM enough context to open the next lesson with a natural
+    single-sentence transition rather than starting cold.
+
+    Returns an empty string when no suitable content is found (first lesson,
+    failed sections, etc.).
     """
     for sec in reversed(completed_sections):
         if sec.get("status") == "failed":
             continue
         heading = sec.get("heading", "")
-        paragraphs = sec.get("body_paragraphs", [])
-        text_parts: list[str] = []
+        paragraphs = sec.get("body_paragraphs") or []
+
+        callouts: list[str] = []
+        prose: list[str] = []
+        bullets: list[str] = []
+
         for para in paragraphs:
             ptype = para.get("type", "")
-            if ptype in ("text", "important_callout", "heading_3", "heading_4"):
+            if ptype == "important_callout":
                 content = (para.get("content") or "").strip()
                 if content:
-                    text_parts.append(content)
-        if not text_parts:
+                    label = (para.get("label") or "").strip()
+                    callouts.append(f"{label}: {content}" if label else content)
+            elif ptype in ("text", "heading_3", "heading_4"):
+                content = (para.get("content") or "").strip()
+                if content:
+                    prose.append(content)
+            elif ptype in ("bullet_list", "numbered_list"):
+                for item in (para.get("items") or [])[:2]:
+                    bullets.append(str(item).strip())
+
+        if not callouts and not prose and not bullets:
             continue
-        full_text = " ".join(text_parts)
-        words = full_text.split()
-        tail = " ".join(words[-max_words:]) if len(words) > max_words else full_text
-        return f'Section: "{heading}"\nClosing content: …{tail}'
+
+        parts: list[str] = []
+        # Include the most recent callout (highest instructional signal)
+        if callouts:
+            parts.append(callouts[-1])
+        # Include the final prose paragraph
+        if prose:
+            parts.append(prose[-1])
+        # Fallback to bullets when prose is absent
+        if not prose and bullets:
+            parts.append("; ".join(bullets[:2]))
+
+        combined = " | ".join(p for p in parts if p)
+        words = combined.split()
+        tail = " ".join(words[:max_words]) + ("…" if len(words) > max_words else "")
+        return f'Section: "{heading}"\nKey takeaway: {tail}'
     return ""
+
+
+def extract_section_key_points(section: dict, max_words: int = 50) -> str:
+    """
+    Return a concise summary of key points from a single generated section.
+
+    Prefers callout labels and content, then the first text paragraph.
+    Used to populate `prev_section_key_points` in subtopic_specs for
+    intra-lesson section-to-section bridging.
+
+    Returns an empty string when the section has no usable body content.
+    """
+    paragraphs = section.get("body_paragraphs") or []
+    heading = (section.get("heading") or "").strip()
+
+    callout_text = ""
+    first_prose = ""
+
+    for para in paragraphs:
+        ptype = para.get("type", "")
+        if ptype == "important_callout" and not callout_text:
+            label = (para.get("label") or "").strip()
+            content = (para.get("content") or "").strip()
+            callout_text = f"{label}: {content}" if label else content
+        elif ptype == "text" and not first_prose:
+            first_prose = (para.get("content") or "").strip()
+
+    raw = callout_text or first_prose
+    if not raw:
+        return heading  # bare heading is better than nothing
+
+    words = raw.split()
+    summary = " ".join(words[:max_words]) + ("…" if len(words) > max_words else "")
+    return summary

@@ -281,6 +281,67 @@ def _apply_scenario_c(
 
 
 # ---------------------------------------------------------------------------
+# Coverage fill — ensures every lesson meets min_kc_per_lesson
+# ---------------------------------------------------------------------------
+
+def _fill_kc_coverage(enriched_sections: list, kc_rules: dict) -> list:
+    """
+    After Scenarios A or B, some lessons may have fewer KCs than
+    min_kc_per_lesson (e.g. the TO did not declare KCs for every lesson).
+    This pass finds those lessons and algorithmically adds KCs to close
+    the gap — mirroring Scenario C logic on the undercovered lessons only.
+
+    Called unconditionally after every scenario so Scenario C (which already
+    guarantees coverage) is unaffected (no lesson will need filling).
+    """
+    min_kc = int(kc_rules.get("min_kc_per_lesson", 1))
+    forbidden = kc_rules.get("forbidden_placements", [])
+
+    for lesson in enriched_sections:
+        subtopics = lesson.get("subtopics", [])
+        if not subtopics:
+            continue
+
+        current_kc_count = sum(1 for s in subtopics if s.get("has_knowledge_check"))
+        if current_kc_count >= min_kc:
+            continue
+
+        needed = min_kc - current_kc_count
+
+        # Prefer placing KCs near the end of the lesson (best pedagogical position).
+        # Skip already-KCd subtopics, intros at position 0, summaries at last position.
+        candidates: list[int] = []
+        for idx in range(len(subtopics) - 1, -1, -1):
+            sub = subtopics[idx]
+            if sub.get("has_knowledge_check"):
+                continue
+            heading = sub.get("title", sub.get("heading", ""))
+            if _is_forbidden_heading(heading, forbidden):
+                continue
+            if idx == 0 and _INTRO_RE.search(heading):
+                continue
+            if idx == len(subtopics) - 1 and _SUMMARY_RE.search(heading):
+                continue
+            candidates.append(idx)
+            if len(candidates) >= needed:
+                break
+
+        for idx in candidates:
+            subtopics[idx]["has_knowledge_check"] = True
+            _ensure_kc_in_ie(subtopics[idx])
+            logger.info(
+                "[KCPlanner] Coverage fill: added KC to '%s' / '%s'",
+                lesson.get("title", ""),
+                subtopics[idx].get("title", ""),
+            )
+
+        if candidates:
+            _sync_lesson_kc_flag(lesson)
+
+    return enriched_sections
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -388,6 +449,11 @@ def run(shared_state_path: str) -> dict[str, Any]:
         scenario = "C"
         logger.info("[KCPlanner] Scenario C — no KCs anywhere; placing KCs via rule-pack cadence")
         enriched_sections, report = _apply_scenario_c(enriched_sections, kc_rules)
+
+    # Fill coverage gaps: Scenarios A and B may leave lessons with fewer KCs
+    # than min_kc_per_lesson. Apply algorithmic placement to close the gap.
+    if kc_rules:
+        enriched_sections = _fill_kc_coverage(enriched_sections, kc_rules)
 
     kcs_total = sum(
         1

@@ -167,7 +167,27 @@ def _inject_missing_lesson_parent_sections(sections: list[dict]) -> list[dict]:
         3.0 Lesson Title
         3.1 First subtopic
         3.2 Second subtopic
+
+    The injected parent section includes a bullet list of its subtopic headings so
+    both the DOCX body and the course editor have visible content for every lesson
+    group, not just a bare heading box.
     """
+    # Pass 1: collect subtopic headings per outline_lesson so synthetic parent
+    # sections can include a brief "Topics in this section" overview.
+    lesson_subtopic_headings: dict[str, list[str]] = {}
+    for sec in sections:
+        ol = (sec.get("outline_lesson") or "").strip()
+        lvl = sec.get("level", 2)
+        hd = (sec.get("heading") or "").strip()
+        is_parent = bool(
+            lvl == 1
+            or sec.get("is_parent_overview")
+            or (ol and hd == ol)
+        )
+        if ol and not is_parent and hd:
+            lesson_subtopic_headings.setdefault(ol, []).append(hd)
+
+    # Pass 2: inject synthetic L1 parents where the lesson has no existing parent.
     result: list[dict] = []
     current_outline_lesson = ""
     lesson_has_parent = False
@@ -189,16 +209,20 @@ def _inject_missing_lesson_parent_sections(sections: list[dict]) -> list[dict]:
         )
 
         if outline_lesson and not lesson_has_parent and not is_existing_parent:
+            subtopic_titles = lesson_subtopic_headings.get(outline_lesson, [])
+            body_paragraphs: list[dict] = []
+            if subtopic_titles:
+                body_paragraphs = [{"type": "bullet_list", "items": subtopic_titles}]
             result.append(
                 {
                     "heading": outline_lesson,
                     "level": 1,
                     "status": "skipped_thin",
-                    "body_paragraphs": [],
+                    "body_paragraphs": body_paragraphs,
                     "word_count": 0,
                     "outline_lesson": outline_lesson,
                     "images": [],
-                    "subtopics": [],
+                    "subtopics": subtopic_titles,
                     "maps_to_objectives": [],
                     "section_id": "",
                     "attempts": 1,
@@ -441,6 +465,70 @@ def _add_conclusion_section(
         p = doc.add_paragraph()
         _apply_body_indent(p)
         _render_text_with_bold(p, block, font_name=BODY_FONT, font_size=BODY_SIZE)
+
+
+def _render_table(doc, table_data: dict) -> None:
+    """Render a structured table (comparison matrix / process table) into the document."""
+    headers = table_data.get("headers") or []
+    rows = table_data.get("rows") or []
+    caption = (table_data.get("caption") or "").strip()
+
+    n_cols = len(headers) if headers else (len(rows[0]) if rows else 0)
+    if n_cols == 0:
+        return
+
+    # Optional caption above the table
+    if caption:
+        cap_p = doc.add_paragraph()
+        cap_p.paragraph_format.left_indent = BODY_LEFT_INDENT
+        cap_p.paragraph_format.space_before = Pt(8)
+        cap_p.paragraph_format.space_after = Pt(2)
+        cap_run = cap_p.add_run(caption)
+        cap_run.bold = True
+        cap_run.font.name = BODY_FONT
+        cap_run.font.size = BODY_SIZE
+        cap_run.font.color.rgb = DARK_NAVY
+
+    n_rows = (1 if headers else 0) + len(rows)
+    if n_rows == 0:
+        return
+
+    table = doc.add_table(rows=n_rows, cols=n_cols)
+    table.style = "Table Grid"
+
+    row_offset = 0
+    if headers:
+        hdr_row = table.rows[0]
+        for i, hdr_text in enumerate(headers[:n_cols]):
+            cell = hdr_row.cells[i]
+            cell.text = ""
+            p = cell.paragraphs[0]
+            run = p.add_run(str(hdr_text))
+            run.bold = True
+            run.font.name = BODY_FONT
+            run.font.size = BODY_SIZE
+            # Light purple header shading
+            tc = cell._tc
+            tcPr = tc.get_or_add_tcPr()
+            shd = OxmlElement("w:shd")
+            shd.set(qn("w:val"), "clear")
+            shd.set(qn("w:color"), "auto")
+            shd.set(qn("w:fill"), "E8E0F0")
+            tcPr.append(shd)
+        row_offset = 1
+
+    for r_i, row_data in enumerate(rows):
+        row = table.rows[r_i + row_offset]
+        for c_i, cell_text in enumerate(list(row_data)[:n_cols]):
+            cell = row.cells[c_i]
+            cell.text = ""
+            p = cell.paragraphs[0]
+            _render_text_with_bold(p, str(cell_text), font_name=BODY_FONT, font_size=BODY_SIZE)
+
+    # Spacing after table
+    spacer = doc.add_paragraph()
+    spacer.paragraph_format.space_before = Pt(6)
+    spacer.paragraph_format.space_after = Pt(2)
 
 
 def _render_knowledge_check(doc, kc: dict):
@@ -689,6 +777,9 @@ def _render_section_content(
                 font_name=BODY_FONT, font_size=BODY_SIZE, color=NAVY_BLUE,
             )
 
+        elif ptype == "table":
+            _render_table(doc, para)
+
         elif ptype == "knowledge_check":
             _render_knowledge_check(doc, para)
 
@@ -781,6 +872,25 @@ def build_study_guide_docx(
                 bm_data = bookmark_map.get(heading)
                 if bm_data:
                     _apply_bookmark(h, *bm_data)
+            # Render any body_paragraphs (e.g. the subtopic overview list injected
+            # by _inject_missing_lesson_parent_sections so lesson groups have visible
+            # content in the document body, not just a bare heading box).
+            for para in section.get("body_paragraphs") or []:
+                ptype = para.get("type", "text")
+                if ptype == "bullet_list":
+                    for item in (para.get("items") or []):
+                        bp = doc.add_paragraph(style="List Bullet")
+                        bp.paragraph_format.left_indent = BODY_LEFT_INDENT
+                        _render_text_with_bold(
+                            bp, item, font_name=BODY_FONT, font_size=BODY_SIZE,
+                        )
+                elif ptype == "text":
+                    p = doc.add_paragraph()
+                    _apply_body_indent(p)
+                    _render_text_with_bold(
+                        p, para.get("content", ""),
+                        font_name=BODY_FONT, font_size=BODY_SIZE,
+                    )
             continue
 
         if status == "failed":

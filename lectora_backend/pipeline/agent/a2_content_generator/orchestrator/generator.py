@@ -159,6 +159,116 @@ def _build_course_conclusion(
         return ""
 
 
+def _build_capstone_exercise(
+    course_title: str,
+    learning_objectives: list[str],
+    generated_sections: list[dict],
+    rule_pack: dict,
+) -> dict | None:
+    """
+    Generate a comprehensive capstone exercise that integrates all major topics.
+
+    The capstone:
+    - Opens with a realistic scenario that spans multiple course sections.
+    - Contains 3–5 knowledge check questions testing practical application.
+    - Maps to all learning objectives collectively.
+    - Is appended as the final content section before the conclusion.
+    """
+    major_topics = [
+        s.get("heading", "").strip()
+        for s in generated_sections
+        if s.get("level", 2) == 1 and s.get("heading")
+        and s.get("status") != "failed"
+    ][:10]
+
+    if not major_topics:
+        logger.info("[A2] Skipping capstone — no major topic sections found.")
+        return None
+
+    family = rule_pack.get("family") or ""
+    if not family:
+        logger.warning("[A2] Capstone: rule_pack missing 'family' — skipping capstone generation.")
+        return None
+    los = (learning_objectives or [])[:10]
+
+    topics_list = "\n".join(f"- {t}" for t in major_topics)
+    los_list = "\n".join(f"- {lo}" for lo in los) if los else "(No explicit learning objectives)"
+
+    system = f"""\
+You are a professional continuing education course author for RegEd Inc. ({family}).
+
+Generate a capstone exercise that integrates concepts from all major sections of the course.
+Return ONLY a valid JSON object with exactly this structure — no markdown fences, no extra keys:
+
+{{
+  "heading": "Capstone Exercise",
+  "body_paragraphs": [
+    {{"type": "text", "content": "2-3 sentence scenario introduction describing a realistic situation the learner must navigate using knowledge from across the course."}},
+    {{
+      "type": "knowledge_check",
+      "question": "Scenario-based question drawing on Topic A and Topic B...",
+      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
+      "correct_answer": "B",
+      "explanation": "(A) Wrong because... (B) Correct because... (C) Wrong because... (D) Wrong because..."
+    }},
+    ... (3-5 knowledge_check blocks total)
+  ]
+}}
+
+Rules:
+- The scenario intro must feel like a real professional situation (claim, client meeting, compliance review, suitability analysis — matching the course domain).
+- Every knowledge_check must test PRACTICAL APPLICATION of a concept, not recall of a definition.
+- Each question must draw on a DIFFERENT major topic so coverage is broad.
+- ALL options must have distinct, plausible-but-wrong distractors. The explanation must address every option.
+- Questions must collectively cover the full range of learning objectives.
+- Do not repeat question formats — vary the scenario setup for each question.
+"""
+
+    user = f"""Course: {course_title}
+
+Major Topics Covered:
+{topics_list}
+
+Learning Objectives to validate:
+{los_list}
+
+Generate the capstone exercise now. Return ONLY the JSON object."""
+
+    try:
+        raw = llm_chat(
+            system,
+            user,
+            config=CONCLUSION_CONFIG,
+            agent="A2",
+        )
+        text = _strip_fences(raw)
+        data = json.loads(text)
+        if not isinstance(data, dict) or "body_paragraphs" not in data:
+            raise ValueError("Capstone LLM returned unexpected structure")
+
+        data.setdefault("heading", "Capstone Exercise")
+        data["level"] = 1
+        data["status"] = "generated"
+        data["word_count"] = sum(
+            len(str(bp.get("content", "") or bp.get("question", "")).split())
+            for bp in data.get("body_paragraphs", [])
+        )
+        data["images"] = []
+        data["maps_to_objectives"] = list(range(len(los)))
+        data["section_id"] = ""
+        data["outline_lesson"] = "Capstone"
+        data["is_capstone"] = True
+        logger.info(
+            "[A2] Capstone exercise generated (%s paragraphs, ~%s words).",
+            len(data.get("body_paragraphs", [])),
+            data["word_count"],
+        )
+        return data
+    except Exception as exc:
+        logger.warning("[A2] Capstone exercise generation failed (%s) — skipping.", exc)
+        return None
+
+
 class A2ContentGenerator:
     """
     A2 — Content Generator
@@ -229,7 +339,8 @@ class A2ContentGenerator:
         extracted = shared_state.get("extracted_inputs", {})
         learning_objectives = extracted.get("learning_objectives", [])
         course_title = (
-            extracted.get("title")
+            shared_state.get("course_title")
+            or extracted.get("title")
             or shared_state.get("agent_outputs", {}).get("A1", {})
                 .get("course_spec", {}).get("course_title", "Untitled Course")
         )
@@ -347,6 +458,16 @@ class A2ContentGenerator:
             audience=course_audience,
             special_instructions=special_instructions,
         )
+
+        # -- Step 3b: Capstone exercise (after all lessons generated) ----------
+        capstone = _build_capstone_exercise(
+            course_title,
+            learning_objectives,
+            generated_sections,
+            rule_pack,
+        )
+        if capstone:
+            generated_sections.append(capstone)
 
         # -- Collect stats -----------------------------------------------------
         total_generated_words = sum(s.get("word_count", 0) for s in generated_sections)

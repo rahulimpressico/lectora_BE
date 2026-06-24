@@ -71,11 +71,11 @@ class GenerateTORequest(BaseModel):
     )
 
     # ── New dynamic TO generation params ─────────────────────────────────────
-    duration_hours: int | None = Field(
+    duration_hours: float | None = Field(
         default=None,
         alias="durationHours",
         description=(
-            "Course duration selected by the user (1–5 hours). "
+            "Course duration selected by the user (e.g. 1.5, 3, 4.5 hours). "
             "When provided together with calculatedWordCount, activates the new "
             "dynamic TO generation flow (raw file content → LLM with config prompt)."
         ),
@@ -275,4 +275,22 @@ class SuggestOutlineStructureResponse(BaseModel):
     preferred_chapters: int = Field(alias="preferredChapters")
     lesson_style: str = Field(alias="lessonStyle")
     reasoning: str = Field(default="", alias="reasoning")
+    model_config = {"populate_by_name": True}
+
+
+class SuggestCourseTypeRequest(BaseModel):
+    """Body for POST /documents/suggest-course-type."""
+    course_title: str = Field(default="", alias="courseTitle")
+    course_description: str = Field(default="", alias="courseDescription")
+    target_audience: str = Field(default="", alias="targetAudience")
+    learning_objectives: list[str] = Field(default_factory=list, alias="learningObjectives")
+    model_config = {"populate_by_name": True}
+
+
+class SuggestCourseTypeResponse(BaseModel):
+    """Response from POST /documents/suggest-course-type."""
+    rule_family: str = Field(alias="ruleFamily", description="Rule family key, e.g. 'insurance_ce'.")
+    rule_family_label: str = Field(alias="ruleFamilyLabel", description="Display name, e.g. 'Insurance CE'.")
+    confidence: float = Field(default=0.0, description="LLM confidence score (0–1).")
+    reasoning: str = Field(default="", description="One-sentence explanation from the LLM.")
     model_config = {"populate_by_name": True}

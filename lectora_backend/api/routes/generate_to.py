@@ -49,6 +49,8 @@ from lectora_backend.api.schemas.generate_to_schemas import (
     GenerateTOJobPollResponse,
     GenerateTORequest,
     GenerateTOResponse,
+    SuggestCourseTypeRequest,
+    SuggestCourseTypeResponse,
     SuggestOutlineStructureRequest,
     SuggestOutlineStructureResponse,
     UploadDocumentResponse,
@@ -723,10 +725,11 @@ def _make_a0_runner(
     course_output_slug: str | None = None,
     step_logger=None,
     *,
-    duration_hours: int | None = None,
+    duration_hours: float | None = None,
     difficulty_level: str | None = None,
     calculated_word_count: int | None = None,
     audience: str | None = None,
+    course_description: str | None = None,
     cancel_event: threading.Event | None = None,
 ):
     """Build a callable that runs A0 on all source DOCX/PDF files with equal priority."""
@@ -746,6 +749,7 @@ def _make_a0_runner(
             duration_hours=duration_hours,
             difficulty_level=difficulty_level,
             calculated_word_count=calculated_word_count,
+            course_description=course_description,
             cancel_event=cancel_event,
         )
         return a0.run()
@@ -1056,7 +1060,7 @@ async def generate_to(
     course_type_hint = (body.course_type_hint or "").strip() or None
 
     # ── Dynamic TO flow params (new) ──────────────────────────────────────────
-    duration_hours: int | None = body.duration_hours
+    duration_hours: float | None = body.duration_hours
     difficulty_level: str | None = (body.difficulty_level or "").strip().lower() or None
     calculated_word_count: int | None = body.calculated_word_count
 
@@ -1157,6 +1161,7 @@ async def generate_to(
             difficulty_level=difficulty_level,
             calculated_word_count=calculated_word_count,
             audience=audience,
+            course_description=user_description,
             cancel_event=cancel_event,
         )
 
@@ -1602,6 +1607,76 @@ async def suggest_outline_structure(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to suggest structure: {exc}",
         ) from exc
+
+
+@router.post(
+    "/suggest-course-type",
+    response_model=SuggestCourseTypeResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_200_OK,
+    summary="AI-suggest the best course type (rule family) from course metadata",
+)
+async def suggest_course_type(body: SuggestCourseTypeRequest) -> SuggestCourseTypeResponse:
+    """Use the LLM classifier to recommend a rule family based on course metadata.
+
+    Accepts title, description, audience, and learning objectives — no uploaded files
+    required. Only called when the user explicitly clicks "Suggested by AI" in the UI;
+    never triggered automatically.
+
+    Returns the rule family key (e.g. ``insurance_ce``), its display label
+    (e.g. ``Insurance CE``), a confidence score, and a one-sentence reasoning.
+    """
+    from lectora_backend.pipeline.agent.a0_request_synthesizer.step_02_classification.utils.classifier import (
+        classify_with_llm,
+    )
+
+    # Build the content sample from the available wizard metadata.
+    content_parts: list[str] = []
+    if body.course_description.strip():
+        content_parts.append(body.course_description.strip())
+    if body.target_audience.strip():
+        content_parts.append(f"Target audience: {body.target_audience.strip()}")
+    content_sample = "\n".join(content_parts)
+
+    try:
+        result: dict = await asyncio.to_thread(
+            classify_with_llm,
+            body.course_title or "Untitled Course",
+            body.learning_objectives,
+            content_sample,
+        )
+    except Exception as exc:
+        logger.exception("[suggest-course-type] Classification failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to suggest course type: {exc}",
+        ) from exc
+
+    rule_family_key = str(result.get("rule_family") or "insurance_ce").strip()
+    if rule_family_key not in RULE_PACKS:
+        logger.warning(
+            "[suggest-course-type] LLM returned unknown rule_family %r — falling back to insurance_ce",
+            rule_family_key,
+        )
+        rule_family_key = "insurance_ce"
+
+    rule_family_label: str = RULE_PACKS[rule_family_key].get("family", rule_family_key)
+    confidence = float(result.get("confidence") or 0.0)
+    reasoning = str(result.get("reasoning") or "").strip()
+
+    logger.info(
+        "[suggest-course-type] Suggested rule_family=%s label=%r confidence=%.2f",
+        rule_family_key,
+        rule_family_label,
+        confidence,
+    )
+
+    return SuggestCourseTypeResponse(
+        rule_family=rule_family_key,
+        rule_family_label=rule_family_label,
+        confidence=confidence,
+        reasoning=reasoning,
+    )
 
 
 @router.get(

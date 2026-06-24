@@ -190,9 +190,8 @@ def _recover_job_from_disk(job_id: str):
 
 
 def _regenerate_special_section_sync(job_id: str, section_id: str) -> str:
-    """Regenerate Overview or Conclusion by re-running the same LLM call A2 used originally."""
+    """Regenerate Conclusion (LLM) or return the stored user-provided Overview verbatim."""
     from lectora_backend.pipeline.agent.a2_content_generator.main import (
-        _build_course_description,
         _build_course_conclusion,
     )
 
@@ -205,18 +204,22 @@ def _regenerate_special_section_sync(job_id: str, section_id: str) -> str:
         shared_state = json.load(fh)
 
     a2_output: dict = shared_state.get("agent_outputs", {}).get("A2") or {}
-    course_title: str = a2_output.get("course_title") or "Untitled Course"
-    extracted: dict = shared_state.get("extracted_inputs", {}) or {}
-    learning_objectives: list[str] = [str(lo) for lo in (extracted.get("learning_objectives") or [])]
-    content_sample: str = extracted.get("content_sample", "") or ""
 
     if section_id == "course-overview":
-        new_content = _build_course_description(
-            course_title,
-            content_sample=content_sample,
-            learning_objectives=learning_objectives,
-        )
+        # The overview comes from the TO's description — the single source of truth.
+        # Read from llm_to_outline_classification first, then fall back to what A2 stored.
+        llm_to: dict = shared_state.get("llm_to_outline_classification") or {}
+        new_content = (
+            (llm_to.get("description") or "")
+            or (a2_output.get("course_description") or "")
+        ).strip()
+        if not new_content:
+            raise ValueError("No course description found in TO or A2 output.")
     elif section_id == "course-conclusion":
+        course_title: str = a2_output.get("course_title") or "Untitled Course"
+        extracted: dict = shared_state.get("extracted_inputs", {}) or {}
+        learning_objectives: list[str] = [str(lo) for lo in (extracted.get("learning_objectives") or [])]
+        content_sample: str = extracted.get("content_sample", "") or ""
         sections: list[dict] = a2_output.get("sections") or []
         new_content = _build_course_conclusion(
             course_title,
@@ -224,11 +227,10 @@ def _regenerate_special_section_sync(job_id: str, section_id: str) -> str:
             learning_objectives=learning_objectives,
             generated_sections=sections,
         )
+        if not new_content:
+            raise ValueError(f"LLM returned empty content for section '{section_id}'")
     else:
         raise ValueError(f"Cannot regenerate special section '{section_id}'")
-
-    if not new_content:
-        raise ValueError(f"LLM returned empty content for section '{section_id}'")
 
     _persist_section_text(job_id, section_id, new_content)
     return new_content
@@ -517,6 +519,25 @@ class SourceFileSpecPayload(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class CourseConfigPayload(BaseModel):
+    """Onboarding wizard fields forwarded to A2 for dynamic prompt construction."""
+    # User-provided title and description — always the single source of truth.
+    course_title: str | None = Field(default=None, alias="courseTitle")
+    course_description: str | None = Field(default=None, alias="courseDescription")
+    experience_level: str | None = Field(default=None, alias="experienceLevel")
+    learner_outcomes: str | None = Field(default=None, alias="learnerOutcomes")
+    audience_notes: str | None = Field(default=None, alias="audienceNotes")
+    learning_objectives: list[str] = Field(default_factory=list, alias="learningObjectives")
+    tone: str | None = Field(default=None)
+    depth: str | None = Field(default=None)
+    emphasis: str | None = Field(default=None)
+    avoid: str | None = Field(default=None)
+    include_scenarios: bool | None = Field(default=None, alias="includeScenarios")
+    include_knowledge_checks: bool | None = Field(default=None, alias="includeKnowledgeChecks")
+
+    model_config = {"populate_by_name": True}
+
+
 class CreateJobPayload(BaseModel):
     course_title: str = Field(alias="courseTitle")
     course_type: str = Field(alias="courseType")
@@ -530,6 +551,8 @@ class CreateJobPayload(BaseModel):
     # Optional special instructions provided by the user before course generation.
     # Injected into A2 prompts to influence tone, depth, and emphasis.
     special_instructions: str | None = Field(default=None, alias="specialInstructions")
+    # All wizard onboarding fields for dynamic A2 prompt construction.
+    course_config: CourseConfigPayload | None = Field(default=None, alias="courseConfig")
 
     model_config = {"populate_by_name": True}
 
@@ -637,6 +660,44 @@ def _persist_course_title(shared_state_path: str, title: str) -> None:
         json.dump(state, fh, indent=2, default=str)
 
 
+def _persist_course_config(shared_state_path: str, course_config: "CourseConfigPayload") -> None:
+    """Store wizard onboarding fields in shared_state for A2 dynamic prompt construction.
+
+    Only prompt-guidance fields (tone, depth, emphasis, etc.) are written here.
+    course_title, course_description, and learning_objectives are intentionally
+    NOT overwritten — A2 reads them directly from llm_to_outline_classification,
+    which holds the exact TO the LLM generated (or the user's edited TO).
+    """
+    p = Path(shared_state_path)
+    with open(p, encoding="utf-8") as fh:
+        state = json.load(fh)
+    config_dict: dict[str, Any] = {}
+    # Prompt-guidance fields only — do NOT include course_title or course_description.
+    if course_config.experience_level:
+        config_dict["experience_level"] = course_config.experience_level
+    if course_config.learner_outcomes and course_config.learner_outcomes.strip():
+        config_dict["learner_outcomes"] = course_config.learner_outcomes.strip()
+    if course_config.audience_notes and course_config.audience_notes.strip():
+        config_dict["audience_notes"] = course_config.audience_notes.strip()
+    if course_config.learning_objectives:
+        config_dict["learning_objectives"] = list(course_config.learning_objectives)
+    if course_config.tone and course_config.tone.strip():
+        config_dict["tone"] = course_config.tone.strip()
+    if course_config.depth and course_config.depth.strip():
+        config_dict["depth"] = course_config.depth.strip()
+    if course_config.emphasis and course_config.emphasis.strip():
+        config_dict["emphasis"] = course_config.emphasis.strip()
+    if course_config.avoid and course_config.avoid.strip():
+        config_dict["avoid"] = course_config.avoid.strip()
+    if course_config.include_scenarios is not None:
+        config_dict["include_scenarios"] = course_config.include_scenarios
+    if course_config.include_knowledge_checks is not None:
+        config_dict["include_knowledge_checks"] = course_config.include_knowledge_checks
+    state["course_config"] = config_dict
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, default=str)
+
+
 def _sync_legacy_shared_state_dir(course_slug: str) -> None:
     """Mirror ``pipeline/courses/{slug}`` into legacy ``pipeline/shared_state/{slug}``."""
     if not course_slug:
@@ -691,6 +752,7 @@ def _run_pipeline_sync(
     audience: str = "",
     special_instructions: str | None = None,
     source_file_specs: list[dict] | None = None,
+    course_config: "CourseConfigPayload | None" = None,
 ) -> tuple[str | None, str | None]:
     """Execute the full pipeline synchronously.  Returns (shared_state_path, study_guide_docx_path)."""
     store = get_local_course_job_store()
@@ -704,6 +766,7 @@ def _run_pipeline_sync(
             job_id, study_guide_path, timed_outline_path, to_override, difficulty,
             temp_input_dir, source_file_paths, audience, special_instructions,
             source_file_specs=source_file_specs,
+            course_config=course_config,
         )
     finally:
         # Ephemeral input dir is tiny (user_edited_to.json only); clean up always.
@@ -721,6 +784,7 @@ def _run_pipeline_inner(
     audience: str = "",
     special_instructions: str | None = None,
     source_file_specs: list[dict] | None = None,
+    course_config: "CourseConfigPayload | None" = None,
 ) -> tuple[str | None, str | None]:
     """Inner pipeline body, called from _run_pipeline_sync after temp dir setup."""
     store = get_local_course_job_store()
@@ -805,6 +869,9 @@ def _run_pipeline_inner(
         # Persist special instructions so A2 can inject them into generation prompts.
         if special_instructions:
             _persist_special_instructions(shared_state_path, special_instructions)
+        # Persist wizard onboarding config for dynamic A2 prompt construction.
+        if course_config:
+            _persist_course_config(shared_state_path, course_config)
         # Persist user-provided course title so A2 never substitutes the LLM-extracted one.
         _job_title = (store.get(job_id) or _job_rec)
         if _job_title and _job_title.course_title:
@@ -958,6 +1025,7 @@ async def _run_pipeline_background(
     audience: str = "",
     special_instructions: str | None = None,
     source_file_specs: list[dict] | None = None,
+    course_config: "CourseConfigPayload | None" = None,
 ) -> None:
     store = get_local_course_job_store()
     store.update_status(job_id, LocalJobStatus.PROCESSING)
@@ -969,6 +1037,7 @@ async def _run_pipeline_background(
             job_id, study_guide_path, timed_outline_path, to_override, difficulty,
             source_file_paths, audience, special_instructions,
             source_file_specs=source_file_specs,
+            course_config=course_config,
         )
 
     try:
@@ -1144,6 +1213,7 @@ async def create_job(payload: CreateJobPayload) -> JSONResponse:
             audience=payload.audience,
             special_instructions=payload.special_instructions,
             source_file_specs=source_file_specs,
+            course_config=payload.course_config,
         )
     )
 
@@ -1188,7 +1258,9 @@ def _resolve_study_guide_path(artifact_dir: Path) -> Path | None:
 
 
 def _course_title_from_shared_state(state: dict, course_slug: str) -> str:
-    # TO outline's course_title is the authoritative human-readable title.
+    # The TO (llm_to_outline_classification) is the single source of truth for
+    # course_title. It holds the exact LLM-generated title (or the user's edited
+    # TO title when to_override was used). All downstream stages use this same value.
     # course_metadata.title can be a section heading (e.g. "3.0 What long-term care…")
     # when A1 incorrectly lifts it from the document's first section, so it goes last.
     to_outline = state.get("llm_to_outline_classification") or {}
@@ -1197,10 +1269,10 @@ def _course_title_from_shared_state(state: dict, course_slug: str) -> str:
     request_spec = state.get("request_spec") or {}
     course_metadata = request_spec.get("course_metadata") or {}
     return (
-        to_course_title                                        # TO outline title (authoritative)
-        or state.get("course_title")                          # job-request title via _persist_course_title
-        or (state.get("request") or {}).get("courseTitle")   # direct from job request body
-        or a2_course_title                                     # A2 LLM-detected title
+        to_course_title                                        # TO title — single source of truth
+        or a2_course_title                                     # A2 output (fallback when TO not yet run)
+        or state.get("course_title")                          # legacy field
+        or (state.get("request") or {}).get("courseTitle")   # job request body fallback
         or course_slug.replace("_", " ")                      # slug fallback (never a section heading)
         or course_metadata.get("title")                       # last resort (may be a section heading)
     )

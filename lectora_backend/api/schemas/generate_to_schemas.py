@@ -98,6 +98,15 @@ class GenerateTORequest(BaseModel):
         ),
     )
 
+    course_title: str | None = Field(
+        default=None,
+        alias="courseTitle",
+        description=(
+            "User-provided course title — single source of truth. "
+            "When present, overrides any LLM-generated title in the TO response."
+        ),
+    )
+
     audience: str | None = Field(
         default=None,
         alias="audience",
@@ -122,6 +131,54 @@ class GenerateTORequest(BaseModel):
         default=None,
         alias="lessonStyle",
         description="Lesson style preference: 'short' (compact) or 'detailed' (comprehensive).",
+    )
+
+    # ── Extended onboarding fields ────────────────────────────────────────────
+    course_description: str | None = Field(
+        default=None,
+        alias="courseDescription",
+        description="Short description of what this course covers, written by the user in the wizard.",
+    )
+    experience_level: str | None = Field(
+        default=None,
+        alias="experienceLevel",
+        description="Learner experience level: 'new', 'some', or 'experienced'.",
+    )
+    learner_outcomes: str | None = Field(
+        default=None,
+        alias="learnerOutcomes",
+        description="Free-text statement of what learners should be able to do after the course.",
+    )
+    audience_notes: str | None = Field(
+        default=None,
+        alias="audienceNotes",
+        description="Additional learner context: industry background, prior knowledge, regulatory sensitivity.",
+    )
+    tone: str | None = Field(
+        default=None,
+        description="Desired writing tone (e.g. 'Professional', 'Conversational', 'Academic').",
+    )
+    depth: str | None = Field(
+        default=None,
+        description="Course depth preference: 'overview', 'balanced', or 'detailed'.",
+    )
+    emphasis: str | None = Field(
+        default=None,
+        description="Topics or concepts to emphasise throughout the course.",
+    )
+    avoid: str | None = Field(
+        default=None,
+        description="Topics, language, or approaches the course should explicitly avoid.",
+    )
+    include_scenarios: bool | None = Field(
+        default=None,
+        alias="includeScenarios",
+        description="Whether to include real-world scenarios and examples.",
+    )
+    include_knowledge_checks: bool | None = Field(
+        default=None,
+        alias="includeKnowledgeChecks",
+        description="Whether to include knowledge check questions.",
     )
 
     model_config = {"populate_by_name": True}

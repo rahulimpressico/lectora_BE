@@ -469,14 +469,142 @@ def _build_generate_to_response(
     return GenerateTOResponse(to=to, rules=rules, to_blob_path=to_blob_path)
 
 
+def _enforce_user_fields_in_to(
+    result: "A0Result",
+    *,
+    user_title: str | None,
+    user_description: str | None,
+    user_los: list[str] | None,
+) -> None:
+    """Guarantee user-provided values appear verbatim in llm_to_outline (memory + disk).
+
+    Belt-and-suspenders: the LLM prompt already instructs the model to copy these
+    values, but LLMs occasionally rephrase them.  This function enforces them
+    unconditionally after A0 completes so the file, the in-memory result, and the
+    API response are always identical to the user's onboarding input.
+
+    Mutates ``result.llm_to_outline`` in-place (dict reference) so that
+    ``_build_generate_to_response`` and ``_log_to_consistency`` see the same values
+    without needing to re-read the file.
+    """
+    if not user_title and not user_description and not user_los:
+        return
+
+    # 1. Patch in-memory dict (reference shared with _build_generate_to_response)
+    mem = result.llm_to_outline
+    if isinstance(mem, dict):
+        if user_title:
+            mem["course_title"] = user_title
+        if user_description:
+            mem["description"] = user_description
+        if user_los:
+            mem["learning_objectives"] = list(user_los)
+
+    # 2. Patch persisted file so llm_to_outline.json matches the API response.
+    #    A2 reads llm_to_outline_classification from shared_state (which is set
+    #    from this file by A0), so the values flow into content generation too.
+    try:
+        outline_path = Path(result.output_files.llm_to_outline)
+        if not outline_path.exists():
+            logger.warning(
+                "[generate-to][enforce] llm_to_outline.json not found at %s — skipping disk patch",
+                outline_path,
+            )
+            return
+        with open(outline_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        inner: dict = payload.get("llm_to_outline") or {}
+        if user_title:
+            inner["course_title"] = user_title
+        if user_description:
+            inner["description"] = user_description
+        if user_los:
+            inner["learning_objectives"] = list(user_los)
+        payload["llm_to_outline"] = inner
+        with open(outline_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False, default=str)
+        logger.info(
+            "[generate-to][enforce] User values written to llm_to_outline.json — "
+            "title=%r | desc=%d chars | LOs=%d",
+            user_title,
+            len(user_description or ""),
+            len(user_los or []),
+        )
+    except Exception as exc:
+        logger.warning("[generate-to][enforce] Could not write to llm_to_outline.json: %s", exc)
+
+
+def _log_to_consistency(result: "A0Result", response_to: dict[str, Any]) -> None:
+    """Compare the in-memory LLM TO against the persisted file and the API response.
+
+    Logs a warning for any mismatch so data inconsistencies are visible immediately.
+    Expected: LLM output == llm_to_outline.json == API response (TO Response).
+    """
+    # Read persisted file
+    try:
+        with open(result.output_files.llm_to_outline, encoding="utf-8") as fh:
+            file_payload = json.load(fh)
+        file_inner: dict = file_payload.get("llm_to_outline") or {}
+    except Exception as exc:
+        logger.warning("[generate-to][consistency] Could not read llm_to_outline.json: %s", exc)
+        file_inner = {}
+
+    mem_inner: dict = result.llm_to_outline or {}
+    checks = {
+        "course_title": (
+            mem_inner.get("course_title"),
+            file_inner.get("course_title"),
+            response_to.get("course_name"),
+        ),
+        "description": (
+            mem_inner.get("description"),
+            file_inner.get("description"),
+            response_to.get("description"),
+        ),
+        "learning_objectives": (
+            mem_inner.get("learning_objectives"),
+            file_inner.get("learning_objectives"),
+            response_to.get("learning_objectives"),
+        ),
+    }
+    all_ok = True
+    for field, (mem_val, file_val, resp_val) in checks.items():
+        if mem_val != file_val or mem_val != resp_val:
+            logger.warning(
+                "[generate-to][consistency] MISMATCH on '%s':\n"
+                "  LLM output : %s\n"
+                "  File       : %s\n"
+                "  API resp   : %s",
+                field,
+                str(mem_val)[:200],
+                str(file_val)[:200],
+                str(resp_val)[:200],
+            )
+            all_ok = False
+    if all_ok:
+        logger.info("[generate-to][consistency] ✓ LLM output == file == API response for title/description/LOs")
+
+
 def _result_to_payload(
     result: A0Result,
     difficulty: str,
     source_blob_path: str | None = None,
+    user_title: str | None = None,
+    user_description: str | None = None,
+    user_los: list[str] | None = None,
 ) -> dict[str, Any]:
-    return _build_generate_to_response(
+    """Build the API response payload, enforcing user-provided fields before serializing."""
+    _enforce_user_fields_in_to(
+        result,
+        user_title=user_title,
+        user_description=user_description,
+        user_los=user_los,
+    )
+    payload = _build_generate_to_response(
         result, difficulty, source_blob_path=source_blob_path
     ).model_dump(by_alias=True)
+    _log_to_consistency(result, payload.get("to") or {})
+    return payload
 
 
 def _parse_course_topic(course_topic: str) -> str:
@@ -631,16 +759,103 @@ def _build_explicit_context(body: "GenerateTORequest") -> str | None:
     This is prepended to ``custom_to_prompt`` so A0 sees well-formatted,
     unambiguous parameters regardless of what the FE composite prompt contains.
     Returns ``None`` when no structured fields are set.
+
+    The LOCKED FIELDS block (course_title, description, learning_objectives) is
+    placed first and instructs the LLM to copy these user-provided values verbatim.
+    A post-processing enforcement step in the route handler guarantees these values
+    even if the LLM ignores the instructions.
     """
     parts: list[str] = []
+
+    # ── LOCKED FIELDS — must be copied verbatim into the JSON output ──────────
+    locked_lines: list[str] = []
+    has_title = bool(body.course_title and body.course_title.strip())
+    has_desc  = bool(body.course_description and body.course_description.strip())
+    has_los   = bool(body.learning_objectives)
+
+    if has_title:
+        locked_lines.append(f'  course_title   → "{body.course_title.strip()}"')  # type: ignore[union-attr]
+    if has_desc:
+        desc_preview = body.course_description.strip()  # type: ignore[union-attr]
+        locked_lines.append(
+            f"  description    → Use EXACTLY the text below (do NOT rewrite, shorten, or enhance):\n"
+            f'"""\n{desc_preview}\n"""'
+        )
+    if has_los:
+        lo_lines = "\n".join(f"    {i + 1}. {o}" for i, o in enumerate(body.learning_objectives))
+        locked_lines.append(
+            f"  learning_objectives → Copy these {len(body.learning_objectives)} objectives VERBATIM "
+            f"(do NOT add, remove, reword, or reorder them):\n{lo_lines}"
+        )
+
+    if locked_lines:
+        parts.append(
+            "═══════════════════════════════════════════════════════════\n"
+            "LOCKED FIELDS — COPY VERBATIM INTO JSON OUTPUT\n"
+            "═══════════════════════════════════════════════════════════\n"
+            "The course author has provided the following values. They MUST appear\n"
+            "character-for-character in the JSON output. Do NOT generate, rewrite,\n"
+            "summarize, enhance, or infer alternatives for these fields.\n\n"
+            + "\n\n".join(locked_lines)
+            + "\n\n"
+            "Generate ONLY the section structure (sections, subtopics, word counts,\n"
+            "timings, para indices). All other JSON fields are your responsibility."
+        )
+
+    # ── Course identity (guidance only — not locked) ──────────────────────────
+    # course_description is already in the locked block above; skip here.
+
+    # ── Audience & experience ─────────────────────────────────────────────────
+    if body.experience_level and body.experience_level.strip():
+        level_labels = {"new": "New to Topic (little or no prior knowledge)",
+                        "some": "Some Experience (familiar with core concepts)",
+                        "experienced": "Experienced (strong existing knowledge)"}
+        label = level_labels.get(body.experience_level.strip().lower(), body.experience_level.strip())
+        parts.append(f"Learner Experience Level: {label}")
+
+    if body.learner_outcomes and body.learner_outcomes.strip():
+        parts.append(f"Desired Learner Outcomes:\n{body.learner_outcomes.strip()}")
+
+    if body.audience_notes and body.audience_notes.strip():
+        parts.append(f"Additional Learner Context:\n{body.audience_notes.strip()}")
+
+    # ── Learning objectives ───────────────────────────────────────────────────
     if body.learning_objectives:
         lo_text = "\n".join(f"- {o}" for o in body.learning_objectives)
         parts.append(f"Learning Objectives:\n{lo_text}")
+
+    # ── Content direction ─────────────────────────────────────────────────────
+    if body.tone and body.tone.strip():
+        parts.append(f"Writing Tone: {body.tone.strip()}")
+
+    if body.depth and body.depth.strip():
+        depth_labels = {"overview": "Overview (high-level introduction, minimal detail)",
+                        "balanced": "Balanced (mix of concepts and application)",
+                        "detailed": "Detailed (thorough, in-depth coverage)"}
+        label = depth_labels.get(body.depth.strip().lower(), body.depth.strip())
+        parts.append(f"Course Depth: {label}")
+
+    if body.emphasis and body.emphasis.strip():
+        parts.append(f"Topics to Emphasise: {body.emphasis.strip()}")
+
+    if body.avoid and body.avoid.strip():
+        parts.append(f"Topics/Approaches to Avoid: {body.avoid.strip()}")
+
+    # ── Instructional design flags ────────────────────────────────────────────
+    if body.include_scenarios is not None:
+        parts.append(f"Include Real-World Scenarios: {'Yes' if body.include_scenarios else 'No'}")
+
+    if body.include_knowledge_checks is not None:
+        parts.append(f"Include Knowledge Checks: {'Yes' if body.include_knowledge_checks else 'No'}")
+
+    # ── Outline structure ─────────────────────────────────────────────────────
     if body.preferred_chapters is not None:
         parts.append(f"Preferred number of chapters/sections: {body.preferred_chapters}")
+
     if body.lesson_style:
         style_label = "Short, focused sections" if body.lesson_style == "short" else "Detailed, comprehensive chapters"
         parts.append(f"Lesson style: {style_label}")
+
     return "\n\n".join(parts) if parts else None
 
 
@@ -830,6 +1045,11 @@ async def generate_to(
     explicit_ctx = _build_explicit_context(body)
     if explicit_ctx:
         custom_to_prompt = "\n\n".join(filter(None, [explicit_ctx, custom_to_prompt]))
+    # User-provided locked fields: enforced verbatim into llm_to_outline after A0 runs.
+    user_title: str | None = (body.course_title or "").strip() or None
+    user_description: str | None = (body.course_description or "").strip() or None
+    user_los: list[str] | None = list(body.learning_objectives) if body.learning_objectives else None
+
     # Audience flows as a dedicated parameter to A0 → build_dynamic_to_prompt,
     # not as a text prefix injected into the custom prompt.
     audience = (body.audience or "").strip() or None
@@ -846,6 +1066,10 @@ async def generate_to(
         "duration_hours=%r | calculated_word_count=%r | audience=%r | "
         "course_type_hint=%r | learning_objectives_count=%d | "
         "preferred_chapters=%r | lesson_style=%r | "
+        "experience_level=%r | tone=%r | depth=%r | "
+        "has_description=%s | has_learner_outcomes=%s | has_audience_notes=%s | "
+        "has_emphasis=%s | has_avoid=%s | "
+        "include_scenarios=%r | include_knowledge_checks=%r | "
         "blob_paths_count=%d | has_custom_prompt=%s | has_to_doc=%s",
         body.difficulty,
         body.difficulty_level,
@@ -856,6 +1080,16 @@ async def generate_to(
         len(body.learning_objectives) if body.learning_objectives else 0,
         body.preferred_chapters,
         body.lesson_style,
+        body.experience_level,
+        body.tone,
+        body.depth,
+        bool(body.course_description),
+        bool(body.learner_outcomes),
+        bool(body.audience_notes),
+        bool(body.emphasis),
+        bool(body.avoid),
+        body.include_scenarios,
+        body.include_knowledge_checks,
         len(blob_paths),
         bool(body.custom_to_prompt),
         bool(body.to_doc_blob_path),
@@ -942,9 +1176,17 @@ async def generate_to(
                 "[generate-to] A0 complete (sync) | run_id=%s",
                 result.request_spec.run_id,
             )
+            # Enforce user-provided locked fields before building response.
+            _enforce_user_fields_in_to(
+                result,
+                user_title=user_title,
+                user_description=user_description,
+                user_los=user_los,
+            )
             response = _build_generate_to_response(
                 result, difficulty, source_blob_path=source_blob
             )
+            _log_to_consistency(result, response.to)
             return response
         except asyncio.TimeoutError as exc:
             raise HTTPException(
@@ -1010,7 +1252,11 @@ async def generate_to(
             output_dir=output_dir,
             runner=runner,
             build_response=lambda r, d: _result_to_payload(
-                r, d, source_blob_path=source_blob
+                r, d,
+                source_blob_path=source_blob,
+                user_title=user_title,
+                user_description=user_description,
+                user_los=user_los,
             ),
             slot_acquired=True,
             cancel_event=reg.cancel_event,

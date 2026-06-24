@@ -144,9 +144,10 @@ class A0RequestSynthesizer:
         docx_path: Optional[str] = None,
         extra_docx_paths: Optional[list[str]] = None,
         course_output_slug: Optional[str] = None,
-        duration_hours: Optional[int] = None,
+        duration_hours: Optional[float] = None,
         difficulty_level: Optional[str] = None,
         calculated_word_count: Optional[int] = None,
+        course_description: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
     ):
         paths: list[str] = [str(p) for p in (docx_paths or []) if p]
@@ -168,6 +169,7 @@ class A0RequestSynthesizer:
         self.custom_to_prompt: Optional[str] = custom_to_prompt
         self.course_type_hint: Optional[str] = course_type_hint
         self.audience: Optional[str] = (audience or "").strip() or None
+        self.course_description: Optional[str] = (course_description or "").strip() or None
         self.course_output_slug = (course_output_slug or "").strip() or None
         self.step_logger = step_logger
 
@@ -176,10 +178,10 @@ class A0RequestSynthesizer:
         )
         self._generate_to_from_source: bool = not bool(to_outline_doc_path)
         if self._generate_to_from_source:
-            self.duration_hours: int = (
-                int(duration_hours)
+            self.duration_hours: float = (
+                float(duration_hours)
                 if duration_hours is not None
-                else DEFAULT_TO_DURATION_HOURS
+                else float(DEFAULT_TO_DURATION_HOURS)
             )
             self.calculated_word_count: int = (
                 int(calculated_word_count)
@@ -189,7 +191,7 @@ class A0RequestSynthesizer:
                 )
             )
         else:
-            self.duration_hours = int(duration_hours) if duration_hours is not None else None
+            self.duration_hours = float(duration_hours) if duration_hours is not None else None
             self.calculated_word_count = (
                 int(calculated_word_count) if calculated_word_count is not None else None
             )
@@ -737,6 +739,7 @@ class A0RequestSynthesizer:
                         duration_hours=self.duration_hours,
                         calculated_word_count=self.calculated_word_count,
                         audience=self.audience,
+                        course_description=self.course_description,
                         custom_system_prompt=self.custom_to_prompt,
                         validation_hints=hints_arg,
                         all_doc_titles=_all_doc_titles,

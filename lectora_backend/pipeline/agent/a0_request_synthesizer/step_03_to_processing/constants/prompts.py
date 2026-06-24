@@ -290,6 +290,7 @@ def build_dynamic_to_prompt(
     difficulty_level: str,
     calculated_word_count: int,
     audience: str | None = None,
+    course_description: str | None = None,
 ) -> str:
     """Build the dynamic system prompt for LLM-based TO generation.
 
@@ -305,6 +306,10 @@ def build_dynamic_to_prompt(
                                "trained insurance agents"). When provided, the prompt
                                instructs the LLM to tailor topic selection, examples,
                                vocabulary, and learning objectives for this audience.
+        course_description:    Author-provided course description. When present, the LLM
+                               is instructed to align topic selection, terminology, and
+                               examples with this description, and to reproduce it
+                               verbatim in the `description` JSON field.
     """
     _difficulty_cap = difficulty_level.strip().capitalize()
     _difficulty_low = difficulty_level.strip().lower()
@@ -382,6 +387,31 @@ Tailor EVERY decision below for this specific audience:
 
 """
 
+    # Course description block — only injected when a description is provided.
+    _description_block = ""
+    if course_description and course_description.strip():
+        _description_block = f"""\
+═══════════════════════════════════════════════════════════
+COURSE DESCRIPTION (AUTHOR-PROVIDED)
+═══════════════════════════════════════════════════════════
+{course_description.strip()}
+
+Use this description to calibrate EVERY content decision below:
+  • SCOPE            — Prioritize source topics that fall within the scope described above.
+                       Exclude or minimize source content that falls outside this scope.
+  • TERMINOLOGY      — Use vocabulary and framing consistent with the described subject
+                       matter. Adopt domain-specific terms as written in the description.
+  • EXAMPLES         — Ground scenarios and illustrations in the professional context
+                       described above. Avoid examples that contradict or drift from it.
+  • LEARNING OBJECTIVES — Objectives must be achievable within the scope described.
+                       They should reflect what a learner can do after completing this
+                       specific course, not a generic course on the same broad topic.
+  • `description` FIELD — The `description` field in your JSON output MUST reproduce
+                       the author's text above VERBATIM. Do NOT rewrite, shorten,
+                       paraphrase, or enhance it.
+
+"""
+
     _section_schema = {
         "title": "1. Introduction",
         "content": "Students will learn to ...",
@@ -424,7 +454,7 @@ You are a seasoned industry trainer and curriculum designer. The user message co
 course content extracted from source documents. Your task: design a Timed Outline (TO)
 that an instructor could teach in exactly the time and at the depth specified below.
 
-{_audience_block}\
+{_audience_block}{_description_block}\
 ═══════════════════════════════════════════════════════════
 COURSE CONFIGURATION
 ═══════════════════════════════════════════════════════════

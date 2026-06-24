@@ -192,6 +192,7 @@ def generate_to_with_llm(
     duration_hours: int | float | None = None,
     calculated_word_count: int | None = None,
     audience: str | None = None,
+    course_description: str | None = None,
     custom_system_prompt: str | None = None,
     validation_hints: str | None = None,
     all_doc_titles: list[str] | None = None,
@@ -225,6 +226,10 @@ def generate_to_with_llm(
         audience:              Target audience string (e.g. "trained insurance agents").
                                Injected into the dynamic prompt and user message so the
                                LLM tailors topic selection, vocabulary, and examples.
+        course_description:    Author-provided course description. Injected into the
+                               dynamic prompt so the LLM aligns topic selection,
+                               terminology, and examples with the described scope, and
+                               reproduces it verbatim in the `description` JSON field.
         custom_system_prompt:  When set, takes highest priority as the system prompt.
         validation_hints:      Optional S1/S2 retry feedback to embed in the request.
         all_doc_titles:        Titles extracted from every source doc (not just the first). Enables multi-doc title synthesis.
@@ -243,10 +248,12 @@ def generate_to_with_llm(
             difficulty_level=course_difficulty,
             calculated_word_count=calculated_word_count,
             audience=audience,
+            course_description=course_description,
         )
         prompt_source = (
             f"dynamic (duration={duration_hours}h, words={calculated_word_count:,}, "
-            f"difficulty={course_difficulty}, audience={'set' if audience else 'none'})"
+            f"difficulty={course_difficulty}, audience={'set' if audience else 'none'}, "
+            f"description={'set' if course_description else 'none'})"
         )
     else:
         system_prompt = GENERATE_TO_PROMPT

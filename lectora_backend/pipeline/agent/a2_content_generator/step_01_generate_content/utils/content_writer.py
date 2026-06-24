@@ -168,12 +168,13 @@ def _generate_lesson_single_call(
     audience: str = "",
     special_instructions: str | None = None,
     prev_lesson_context: str = "",
+    course_config: dict | None = None,
 ) -> list[dict]:
     """One LLM round-trip for a slice of subtopic_specs (internal)."""
     if not subtopic_specs:
         return []
 
-    system_prompt = build_lesson_system_prompt(rule_pack, audience=audience)
+    system_prompt = build_lesson_system_prompt(rule_pack, audience=audience, course_config=course_config)
 
     user_msg = build_lesson_user_message(
         lesson=lesson,
@@ -186,6 +187,7 @@ def _generate_lesson_single_call(
         audience=audience,
         special_instructions=special_instructions,
         prev_lesson_context=prev_lesson_context,
+        course_config=course_config,
     )
 
     last_error: str | None = None
@@ -276,6 +278,7 @@ def generate_lesson(
     audience: str = "",
     special_instructions: str | None = None,
     prev_lesson_context: str = "",
+    course_config: dict | None = None,
 ) -> list[dict]:
     """
     Generate content for ALL subtopics of one TO lesson (one or more LLM calls).
@@ -320,6 +323,7 @@ def generate_lesson(
             audience=audience,
             special_instructions=special_instructions,
             prev_lesson_context=prev_lesson_context,
+            course_config=course_config,
         )
 
     n_batches = (n_specs + MAX_SECTIONS_PER_LLM_CALL - 1) // MAX_SECTIONS_PER_LLM_CALL
@@ -359,6 +363,7 @@ def generate_lesson(
                 audience=audience,
                 special_instructions=special_instructions,
                 prev_lesson_context=batch_prev_ctx,
+                course_config=course_config,
             )
         )
 
@@ -377,6 +382,7 @@ def generate_all_sections(
     shared_state_path: str | None = None,
     audience: str = "",
     special_instructions: str | None = None,
+    course_config: dict | None = None,
 ) -> list[dict]:
     """
     Generate content for every lesson in enriched_sections.
@@ -662,6 +668,7 @@ def generate_all_sections(
             audience=audience,
             special_instructions=special_instructions,
             prev_lesson_context=prev_lesson_context,
+            course_config=course_config,
         )
 
         # ── Attach metadata and collect ───────────────────────────────────────

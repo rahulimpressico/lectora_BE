@@ -134,7 +134,60 @@ def _build_teaching_style_section(rule_pack: dict, audience: str = "") -> str:
     return "\n".join(lines)
 
 
-def build_lesson_system_prompt(rule_pack: dict, audience: str = "") -> str:
+def _build_course_config_system_block(course_config: dict) -> str:
+    """Build an authoring guidance block from onboarding wizard fields."""
+    if not course_config:
+        return ""
+
+    lines: list[str] = []
+
+    tone = (course_config.get("tone") or "").strip()
+    if tone:
+        lines.append(f"- **Tone**: Write in a {tone} voice throughout. Every section must reflect this tone.")
+
+    depth = (course_config.get("depth") or "").strip()
+    if depth:
+        depth_labels = {
+            "overview": "Overview — high-level introduction, minimal technical detail. Prioritise accessibility over completeness.",
+            "balanced": "Balanced — mix conceptual explanation with practical application.",
+            "detailed": "Detailed — thorough, in-depth coverage. Unpack nuance, include edge cases, go beyond definitions.",
+        }
+        depth_desc = depth_labels.get(depth.lower(), depth)
+        lines.append(f"- **Course depth**: {depth_desc}")
+
+    experience = (course_config.get("experience_level") or "").strip()
+    if experience:
+        exp_labels = {
+            "new": "New to the topic — assume little or no prior knowledge. Define all terms, avoid jargon without explanation.",
+            "some": "Some experience — familiar with core concepts. Skip basic definitions; focus on application and nuance.",
+            "experienced": "Experienced — strong existing knowledge. Use precise terminology, assume domain fluency, focus on advanced application.",
+        }
+        exp_desc = exp_labels.get(experience.lower(), experience)
+        lines.append(f"- **Learner experience**: {exp_desc}")
+
+    emphasis = (course_config.get("emphasis") or "").strip()
+    if emphasis:
+        lines.append(f"- **Emphasise**: {emphasis}. Weight your examples and explanations toward these topics.")
+
+    avoid = (course_config.get("avoid") or "").strip()
+    if avoid:
+        lines.append(f"- **Avoid**: {avoid}. Do not introduce this material in any section.")
+
+    include_scenarios = course_config.get("include_scenarios")
+    if include_scenarios is False:
+        lines.append("- **Scenarios**: Omit real-world scenarios and case studies — deliver content as direct instruction.")
+
+    include_kc = course_config.get("include_knowledge_checks")
+    if include_kc is False:
+        lines.append("- **Knowledge checks**: Do NOT insert embedded knowledge check questions in any section.")
+
+    if not lines:
+        return ""
+
+    return "## Authoring guidance (from course configuration)\n\n" + "\n".join(lines) + "\n"
+
+
+def build_lesson_system_prompt(rule_pack: dict, audience: str = "", course_config: dict | None = None) -> str:
     """System prompt: output contract + authority rules; voice/KC details come from rule pack JSON."""
     fam = rule_pack.get("family") or ""
     if not fam:
@@ -158,6 +211,7 @@ Honor `full_rule_pack.active_difficulty` and any difficulty-specific fields in
 `kc_placement_rules`. Do not write below or above the expected depth for this level.
 
 """
+    course_config_block = _build_course_config_system_block(course_config or {})
 
     return f"""\
 You are a professional continuing education course author for RegEd Inc.
@@ -168,7 +222,7 @@ You are a professional continuing education course author for RegEd Inc.
 
 If any instruction in this system prompt conflicts with `full_rule_pack`, **obey full_rule_pack**.
 
-{difficulty_block}## Your Output Format
+{difficulty_block}{course_config_block}## Your Output Format
 
 Return ONLY a valid JSON ARRAY where each element is one section, in the same
 order as the sections listed in the prompt. No markdown fences, no commentary:
@@ -352,6 +406,7 @@ def build_lesson_user_message(
     audience: str = "",
     special_instructions: str | None = None,
     prev_lesson_context: str = "",
+    course_config: dict | None = None,
 ) -> str:
     """
     Build a single user message that asks the LLM to generate content for ALL
@@ -487,6 +542,22 @@ Source Content (reference material — paraphrase faithfully; do NOT copy verbat
             "Do not repeat the previous content — one sentence of acknowledgment, then move forward."
         )
 
+    course_config_block = ""
+    cfg = course_config or {}
+    cfg_lines: list[str] = []
+    learner_outcomes = (cfg.get("learner_outcomes") or "").strip()
+    if learner_outcomes:
+        cfg_lines.append(f"Desired Learner Outcomes: {learner_outcomes}")
+    audience_notes = (cfg.get("audience_notes") or "").strip()
+    if audience_notes:
+        cfg_lines.append(f"Additional Learner Context: {audience_notes}")
+    cfg_objectives = cfg.get("learning_objectives") or []
+    if cfg_objectives:
+        lo_list = "\n".join(f"- {o}" for o in cfg_objectives)
+        cfg_lines.append(f"Course Learning Objectives:\n{lo_list}")
+    if cfg_lines:
+        course_config_block = "\n\n## Course Configuration Context\n" + "\n\n".join(cfg_lines)
+
     return f"""## Lesson
 Title      : {lesson_title}
 Description: {lesson_content[:400] if lesson_content else "(none)"}
@@ -500,7 +571,7 @@ Interactive elements: {json.dumps(lesson_ie)}
 ## Prior Sections Summary (do NOT repeat these concepts)
 
 {prior_summary if prior_summary else "(No prior sections — this is the first lesson)"}
-{prev_lesson_block}{feedback_block}{audience_block}{special_instructions_block}
+{prev_lesson_block}{feedback_block}{audience_block}{special_instructions_block}{course_config_block}
 ## Sections to Generate  [{n} total — return as JSON array in this exact order]
 
 {sections_block}

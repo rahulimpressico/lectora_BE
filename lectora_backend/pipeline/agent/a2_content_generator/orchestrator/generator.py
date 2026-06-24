@@ -45,11 +45,7 @@ from pathlib import Path
 from lectora_backend.pipeline.models import A2Output, A2Stats
 from lectora_backend.pipeline.rule_pack_config.rule_packs import resolve_rule_pack
 from lectora_backend.pipeline.shared_llm_config.llm import chat as llm_chat
-from ..config.llm import AGENT_CONFIG, COURSE_DESCRIPTION_CONFIG, CONCLUSION_CONFIG
-from ..step_02_course_description.constants.prompts import (
-    COURSE_DESCRIPTION_SYSTEM_PROMPT,
-    build_course_description_user_message,
-)
+from ..config.llm import AGENT_CONFIG, CONCLUSION_CONFIG
 from ..step_03_conclusion.constants.prompts import (
     CONCLUSION_SYSTEM_PROMPT,
     build_conclusion_user_message,
@@ -61,66 +57,6 @@ from ..shared.helpers.text_utils import _strip_fences
 logger = logging.getLogger(__name__)
 
 # Target length for prompts/logging — short LLM replies are still kept (no template fallback).
-_TARGET_DESC_WORDS = 110
-
-
-def _build_course_description(
-    course_title: str,
-    *,
-    content_sample: str | None = None,
-    learning_objectives: list[str] | None = None,
-) -> str:
-    """
-    Generate the study-guide course description via **LLM**.
-
-    Sent to the model: course title, learning objectives, and up to ~8000 words
-    of raw document content (``content_sample``).
-
-    Returns empty string only when there is no content sample, the LLM call fails, or the
-    model returns whitespace-only text. Any non-empty model prose is written to the DOCX
-    (length only affects logging — avoids blank OVERVIEW when the model stops under the target).
-    """
-    sample_nonempty = bool((content_sample or "").strip())
-    if not sample_nonempty:
-        logger.warning("[A2] No content_sample — course description left empty.")
-        return ""
-
-    title_for_prompt = (course_title or "").strip() or "Untitled Course"
-    user_msg = build_course_description_user_message(
-        title_for_prompt,
-        content_sample or "",
-        learning_objectives=learning_objectives or [],
-    )
-
-    try:
-        raw = llm_chat(
-            COURSE_DESCRIPTION_SYSTEM_PROMPT,
-            user_msg,
-            config=COURSE_DESCRIPTION_CONFIG,
-            agent="A2",
-        )
-        text = _strip_fences(raw)
-        wc = len(text.split())
-        if not text:
-            logger.warning("[A2] LLM returned empty course description after strip.")
-            return ""
-        if wc < _TARGET_DESC_WORDS:
-            logger.warning(
-                "[A2] Course description via LLM (%s words) — below target (%s+); keeping output.",
-                wc,
-                _TARGET_DESC_WORDS,
-            )
-        else:
-            logger.info("[A2] Course description via LLM (%s words).", wc)
-        return text
-    except Exception as exc:
-        logger.warning(
-            "[A2] LLM course description failed (%s) — leaving empty.",
-            exc,
-        )
-        return ""
-
-
 def _build_course_conclusion(
     course_title: str,
     *,
@@ -335,20 +271,62 @@ class A2ContentGenerator:
         if not enriched_sections:
             raise RuntimeError("Section Mapper produced no enriched_sections — nothing to generate")
 
-        # Extract metadata from A0 / request_spec (title → DOCX title page + description prompt)
+        # Extract metadata — llm_to_outline_classification is the single source of
+        # truth for course_title, description, and learning_objectives.
+        # It holds the exact TO the LLM generated (or the user's edited TO when
+        # to_override was provided) and must flow to the DOCX unchanged.
         extracted = shared_state.get("extracted_inputs", {})
-        learning_objectives = extracted.get("learning_objectives", [])
-        course_title = (
-            shared_state.get("course_title")
+        content_sample = extracted.get("content_sample", "")
+
+        llm_to: dict = shared_state.get("llm_to_outline_classification") or {}
+        course_title: str = (
+            llm_to.get("course_title")
             or extracted.get("title")
             or shared_state.get("agent_outputs", {}).get("A1", {})
                 .get("course_spec", {}).get("course_title", "Untitled Course")
         )
-        content_sample = extracted.get("content_sample", "")
+        course_description: str = (llm_to.get("description") or "").strip()
+        learning_objectives: list[str] = list(llm_to.get("learning_objectives") or [])
+
+        # Fallback: if the TO had no LOs, use what A0 extracted from the source doc.
+        if not learning_objectives:
+            learning_objectives = list(extracted.get("learning_objectives") or [])
 
         # Read user-provided audience and special instructions (stored by local_jobs.py)
         course_audience: str = (shared_state.get("course_audience") or "").strip()
         special_instructions: str | None = (shared_state.get("special_instructions") or "").strip() or None
+        # Wizard onboarding config — used only for prompt tone/depth/style guidance,
+        # NOT for overriding course_title, course_description, or learning_objectives.
+        course_config: dict = shared_state.get("course_config") or {}
+
+        # Consistency check: log any mismatch between TO fields and extracted_inputs.
+        _extracted_los = extracted.get("learning_objectives") or []
+        _config_title = (course_config.get("course_title") or "").strip()
+        _config_desc = (course_config.get("course_description") or "").strip()
+        if _config_title and _config_title != course_title:
+            logger.warning(
+                "[A2][consistency] course_title mismatch — TO: %r | course_config: %r",
+                course_title[:120],
+                _config_title[:120],
+            )
+        if _config_desc and _config_desc != course_description:
+            logger.warning(
+                "[A2][consistency] description mismatch — TO: %d chars | course_config: %d chars",
+                len(course_description),
+                len(_config_desc),
+            )
+        if _extracted_los and _extracted_los != learning_objectives:
+            logger.warning(
+                "[A2][consistency] learning_objectives mismatch — TO: %d items | extracted: %d items",
+                len(learning_objectives),
+                len(_extracted_los),
+            )
+        logger.info(
+            "[A2][consistency] Using TO as source of truth — title: %r | desc: %d chars | LOs: %d",
+            course_title[:80],
+            len(course_description),
+            len(learning_objectives),
+        )
 
         # Build source material guidance from per-file specs if present
         raw_specs: list[dict] = shared_state.get("source_file_specs") or []
@@ -457,6 +435,7 @@ class A2ContentGenerator:
             shared_state_path=self.shared_state_path,
             audience=course_audience,
             special_instructions=special_instructions,
+            course_config=course_config,
         )
 
         # -- Step 3b: Capstone exercise (after all lessons generated) ----------
@@ -491,11 +470,10 @@ class A2ContentGenerator:
             total_words=total_generated_words,
         )
 
-        # -- Step 4: Build course description ---------------------------------
-        course_description = _build_course_description(
-            course_title,
-            content_sample=content_sample,
-            learning_objectives=learning_objectives,
+        # -- Step 4: Course description (already resolved from llm_to_outline_classification above) --
+        logger.info(
+            "[A2] Course description: %d chars (from TO).",
+            len(course_description),
         )
         course_conclusion = _build_course_conclusion(
             course_title,
@@ -584,15 +562,8 @@ def render_study_guide_from_state(shared_state_path: str, output_dir: str = "") 
     extracted = shared_state.get("extracted_inputs", {}) or {}
     learning_objectives = extracted.get("learning_objectives", []) or []
     content_sample = extracted.get("content_sample") or ""
-    # Use stored values from shared_state (set during A2 run).
-    # Fall back to LLM only for old runs that pre-date storage.
+    # Use the description stored during A2 run (sourced from llm_to_outline_classification).
     course_description = (a2_output.get("course_description") or "").strip()
-    if not course_description:
-        course_description = _build_course_description(
-            course_title,
-            content_sample=content_sample,
-            learning_objectives=learning_objectives,
-        )
 
     course_conclusion = (a2_output.get("course_conclusion") or "").strip()
     if not course_conclusion:

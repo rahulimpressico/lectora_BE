@@ -244,6 +244,7 @@ class A2ContentGenerator:
         self.shared_state_path = shared_state_path
         self.docx_path = docx_path
         self.output_dir = Path(output_dir) if output_dir else Path(shared_state_path).expanduser().resolve().parent
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.render_docx = render_docx
         self.feedback = feedback
         self.course_difficulty = course_difficulty

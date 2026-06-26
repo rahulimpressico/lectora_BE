@@ -1,9 +1,12 @@
 from __future__ import annotations
 import asyncio
 import logging
+import time
+from pathlib import Path
 
 from lectora_backend.ingestion.chunking.models import ChunkMetadata, CourseChunk
 from lectora_backend.ingestion.enrichment.prompts import ENRICHMENT_SYSTEM, ENRICHMENT_USER
+from lectora_backend.pipeline.shared_llm_config.tracer import LLMTrace, write_trace
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,10 @@ class MetadataEnricher:
             parent_title=chunk.parent_title or "",
             content=chunk.raw_text[:_CONTENT_PREVIEW_CHARS],
         )
+        t_start = time.perf_counter()
+        raw_json = "{}"
+        prompt_tokens = completion_tokens = total_tokens = 0
+        error_msg: str | None = None
         try:
             response = await self._client.chat.completions.create(
                 model=self._deployment,
@@ -37,6 +44,10 @@ class MetadataEnricher:
                 temperature=0.2,
             )
             raw_json = response.choices[0].message.content or "{}"
+            if getattr(response, "usage", None):
+                prompt_tokens = response.usage.prompt_tokens or 0
+                completion_tokens = response.usage.completion_tokens or 0
+                total_tokens = response.usage.total_tokens or 0
             data = _parse_json_safe(raw_json)
             chunk = chunk.model_copy(
                 update={
@@ -53,9 +64,41 @@ class MetadataEnricher:
                 }
             )
         except Exception as exc:
+            error_msg = str(exc)
             logger.warning(
                 "[metadata_enricher] Enrichment failed for chunk %s: %s", chunk.chunk_id, exc
             )
+        finally:
+            write_trace(LLMTrace(
+                agent="INGEST_METADATA",
+                deployment=self._deployment,
+                system_prompt=ENRICHMENT_SYSTEM,
+                user_msg=user_msg,
+                response=raw_json,
+                latency_ms=(time.perf_counter() - t_start) * 1000,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                error=error_msg,
+                run_id=f"ingest:{chunk.document_id}",
+                doc_name=Path(chunk.source_file or chunk.document_id).stem,
+                source_refs=[chunk.source_file or chunk.document_id],
+                model_parameters={
+                    "temperature": 0.2,
+                    "max_tokens": 1024,
+                    "response_format": {"type": "json_object"},
+                },
+                prompt_metadata={
+                    "step": "ingestion.metadata_enrichment",
+                    "chunk_id": chunk.chunk_id,
+                    "document_id": chunk.document_id,
+                    "section_id": chunk.section_id,
+                    "chunk_title": chunk.title,
+                    "prompt_file": "lectora_backend/ingestion/enrichment/metadata_enricher.py",
+                    "prompt_function": "MetadataEnricher.enrich",
+                },
+                observation_name="INGEST_METADATA | prompt -> output",
+            ))
         return chunk
 
     async def enrich_batch(self, chunks: list[CourseChunk]) -> list[CourseChunk]:

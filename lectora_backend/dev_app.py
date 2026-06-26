@@ -44,6 +44,7 @@ from lectora_backend.api.routes import storage
 from lectora_backend.api.routes import settings as settings_routes
 from lectora_backend.api.routes import dashboard
 from lectora_backend.api.routes import costing
+from lectora_backend.pipeline.shared_llm_config import flush_langfuse, shutdown_langfuse
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,8 @@ async def lifespan(_app: FastAPI):
         os.getenv("LOG_LEVEL", "INFO"),
     )
     yield
+    flush_langfuse()
+    shutdown_langfuse()
 
 
 app = FastAPI(

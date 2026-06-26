@@ -413,7 +413,7 @@ async def run_a0_job_background(
             doc_name = _Path(job.blob_paths[0]).stem
         elif blob_path:
             doc_name = _Path(blob_path).stem
-        set_run_context(job_id, doc_name or job_id[:8])
+        set_run_context(job_id, doc_name or job_id[:8], source_refs=(job.blob_paths if job and job.blob_paths else ([blob_path] if blob_path else [])))
     except Exception as exc:  # noqa: BLE001
         logger.debug("[generate-to] trace context setup skipped: %s", exc)
 

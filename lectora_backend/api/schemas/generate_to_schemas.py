@@ -6,6 +6,60 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 
+class SourceAnalysis(BaseModel):
+    """Per-document source analysis result — used in both the analyze-source response
+    and as input to generate-to so the TO/LO generation is source-aware."""
+    source_name: str = Field(alias="sourceName", description="Original file name.")
+    source_role: str = Field(
+        alias="sourceRole",
+        description="Categorical role: 'primary_source', 'supporting_source', or 'reference_only'.",
+    )
+    importance: str = Field(description="Importance level: 'high', 'medium', or 'low'.")
+    main_topics: list[str] = Field(
+        default_factory=list,
+        alias="mainTopics",
+        description="Key topics extracted from the document TOC.",
+    )
+    recommended_course_use: str = Field(
+        default="",
+        alias="recommendedCourseUse",
+        description="LLM recommendation on how to use this source in the course.",
+    )
+    recommended_depth: str = Field(
+        default="",
+        alias="recommendedDepth",
+        description="Recommended coverage depth: 'light', 'moderate', or 'comprehensive'.",
+    )
+    supports_learning_objectives: list[str] = Field(
+        default_factory=list,
+        alias="supportsLearningObjectives",
+        description="Suggested learning objectives this source can support.",
+    )
+    ignore_or_reduce: list[str] = Field(
+        default_factory=list,
+        alias="ignoreOrReduce",
+        description="Topics or sections that should be deprioritised or omitted.",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class SourceAnalysisRequest(BaseModel):
+    """Body for POST /documents/analyze-source."""
+    blob_path: str = Field(alias="blobPath", description="Uploaded-documents blob path for the source file.")
+    source_role: str = Field(
+        alias="sourceRole",
+        description="Categorical role chosen by the user: 'primary_source', 'supporting_source', or 'reference_only'.",
+    )
+    importance: str = Field(description="User-selected importance: 'high', 'medium', or 'low'.")
+
+    model_config = {"populate_by_name": True}
+
+
+class SourceAnalysisResponse(SourceAnalysis):
+    """Response from POST /documents/analyze-source (extends SourceAnalysis with no extra fields)."""
+
+
 class UploadDocumentResponse(BaseModel):
     """Returned by POST /documents/upload."""
     blob_path: str = Field(alias="blobPath")
@@ -181,6 +235,29 @@ class GenerateTORequest(BaseModel):
         description="Whether to include knowledge check questions.",
     )
 
+    # ── Source-analysis results (pre-computed by the frontend) ────────────────
+    source_analyses: list[SourceAnalysis] = Field(
+        default_factory=list,
+        alias="sourceAnalyses",
+        description=(
+            "Per-document source analysis results computed by POST /documents/analyze-source "
+            "before generate-to is called. When present, A0 uses these to weight the TO/LO "
+            "generation: high-importance primary sources dominate; supporting sources contribute "
+            "to relevant sections only; ignore_or_reduce topics are deprioritised."
+        ),
+    )
+
+    # ── Required topics (mandatory content areas from the wizard) ─────────────
+    required_topics: list[str] = Field(
+        default_factory=list,
+        alias="requiredTopics",
+        description=(
+            "Mandatory course topics specified by the user in the wizard. "
+            "Every topic in this list MUST appear in the generated TO. "
+            "Treated as highest-priority content — overrides deprioritisation signals."
+        ),
+    )
+
     model_config = {"populate_by_name": True}
 
     @model_validator(mode="after")
@@ -250,6 +327,19 @@ class GenerateLearningObjectivesRequest(BaseModel):
     desired_outcomes: str = Field(default="", alias="desiredOutcomes")
     certification_focus: str = Field(default="", alias="certificationFocus")
     additional_instructions: str = Field(default="", alias="additionalInstructions")
+    source_analyses: list[SourceAnalysis] = Field(
+        default_factory=list,
+        alias="sourceAnalyses",
+        description="Pre-computed source analysis results from POST /documents/analyze-source.",
+    )
+    required_topics: list[str] = Field(
+        default_factory=list,
+        alias="requiredTopics",
+        description=(
+            "Mandatory course topics from the wizard. "
+            "Used to guide LO generation toward these required areas."
+        ),
+    )
     model_config = {"populate_by_name": True}
 
 
@@ -293,4 +383,43 @@ class SuggestCourseTypeResponse(BaseModel):
     rule_family_label: str = Field(alias="ruleFamilyLabel", description="Display name, e.g. 'Insurance CE'.")
     confidence: float = Field(default=0.0, description="LLM confidence score (0–1).")
     reasoning: str = Field(default="", description="One-sentence explanation from the LLM.")
+    model_config = {"populate_by_name": True}
+
+
+class SaveTORequest(BaseModel):
+    """Body for POST /documents/save-to — persist user-edited TO to blob storage."""
+    blob_path: str = Field(
+        alias="blobPath",
+        description="The blob path originally returned by POST /documents/generate-to.",
+    )
+    to: dict[str, Any] = Field(description="Current FE-format Training Outline JSON.")
+    rules: dict[str, Any] | None = Field(
+        default=None,
+        description="Current FE-format rules JSON (optional; pass through from store).",
+    )
+    model_config = {"populate_by_name": True}
+
+
+class SaveTOResponse(BaseModel):
+    """Response from POST /documents/save-to."""
+    blob_path: str = Field(alias="blobPath", description="Confirmed path where the TO was saved.")
+    model_config = {"populate_by_name": True}
+
+
+class ReviseTORequest(BaseModel):
+    """Body for POST /documents/revise-to."""
+    current_to: dict[str, Any] = Field(
+        alias="currentTo",
+        description="The complete Training Outline JSON currently shown in the editor.",
+    )
+    revision_prompt: str = Field(
+        alias="revisionPrompt",
+        description="User's natural-language instruction describing the desired changes.",
+    )
+    model_config = {"populate_by_name": True}
+
+
+class ReviseTOResponse(BaseModel):
+    """Response from POST /documents/revise-to — contains only the revised TO."""
+    to: dict[str, Any] = Field(description="The revised Training Outline JSON.")
     model_config = {"populate_by_name": True}

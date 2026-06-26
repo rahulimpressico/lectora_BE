@@ -60,9 +60,13 @@ class Settings(BaseSettings):
     course_generation_artifacts_container_name: str = "course-generation-artifacts"
 
     # Langfuse
+    langfuse_api_key: str = ""
+    langfuse_project: str = ""
+    langfuse_env: str = ""
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
     langfuse_host: str = "https://cloud.langfuse.com"
+    langfuse_base_url: str = ""
 
     # Comma-separated browser origins (FE dev server, Docker FE on :8080, Netlify, etc.)
     cors_origins: str = (

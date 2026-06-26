@@ -276,7 +276,10 @@ class Orchestrator:
             course_title = (state.get("request") or {}).get("courseTitle") or ""
             study_guide_path = str(prepared_inputs["studyGuidePath"])
             doc_name = Path(study_guide_path).stem or course_title.replace(" ", "_")
-            set_run_context(job_id, doc_name)
+            source_refs = list(state.get("source_file_paths") or [])
+            if study_guide_path and study_guide_path not in source_refs:
+                source_refs.insert(0, study_guide_path)
+            set_run_context(job_id, doc_name, source_refs=source_refs)
 
             job_log.info("Inputs ready — beginning A0 → A1 → S1 gate cycles")
 

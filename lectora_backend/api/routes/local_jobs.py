@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -70,10 +71,8 @@ def _resolve_and_validate(blob_path: str, label: str) -> str:
     return str(resolved)
 
 # Course-title output roots (``{slug}/``) — same layout as Azure artifacts.
-_PIPELINE_COURSES_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "courses"
+_PIPELINE_COURSES_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "shared_state"
 _PIPELINE_COURSES_DIR.mkdir(parents=True, exist_ok=True)
-_LEGACY_SHARED_STATE_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "shared_state"
-_LEGACY_SHARED_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 from lectora_backend.api.local_course_job_store import (
     LocalJobStatus,
@@ -130,6 +129,89 @@ def _paragraphs_to_text(body_paragraphs: list[dict]) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+def _section_stable_id(sec: dict, idx: int) -> str:
+    """Derive a stable, repeatable frontend ID for an A2 section.
+
+    A2 sets section_id = "" for virtually all sections (it comes from A1 which
+    often leaves it blank).  We therefore derive the ID from the section's
+    heading (primary) or outline_lesson (fallback), producing a slug that is
+    the same every time shared_state is read — unlike a positional "sec_N" ID
+    which breaks whenever section order changes.
+
+    Falls back to positional "sec_{idx+1}" only when both heading and
+    outline_lesson are absent.
+    """
+    real_id = (sec.get("section_id") or "").strip()
+    if real_id:
+        return real_id
+    text = (sec.get("heading") or sec.get("outline_lesson") or "").strip()
+    if text:
+        slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")[:80]
+        return f"h_{slug}"
+    return f"sec_{idx + 1}"
+
+
+def _promote_synthetic_parent(sections: list[dict], synth_sec: dict) -> None:
+    """Insert *synth_sec* into *sections* immediately before its first L2 child.
+
+    When a synthetic L1 parent is appended at the end of the list, the next
+    call to _inject_missing_lesson_parent_sections processes the L2 children
+    before it finds the existing parent, injects a duplicate synthetic parent,
+    and the tree ends up with the persisted section having no children.  By
+    inserting it in the correct position the duplication is avoided.
+    """
+    target_lesson = (synth_sec.get("outline_lesson") or synth_sec.get("heading") or "").strip()
+    for i, sec in enumerate(sections):
+        sec_lesson = (sec.get("outline_lesson") or "").strip()
+        if sec_lesson == target_lesson and sec.get("level", 2) != 1:
+            sections.insert(i, synth_sec)
+            return
+    # No L2 child found — append as fallback (e.g., section with no children yet).
+    sections.append(synth_sec)
+
+
+def _find_a2_section(sections: list[dict], section_id: str) -> tuple[dict | None, int]:
+    """Locate an A2 output section by the frontend-facing section_id.
+
+    Three-pass lookup so both new (heading-based) and legacy (positional)
+    IDs are handled:
+
+    Pass 1 — exact match on the section_id field stored in A2 output.
+              Works when A1 assigned a real ID (rare in practice).
+
+    Pass 2 — reconstruct what _section_stable_id / get_course_content assigns
+              for each section and compare.  This is the primary path because
+              A2 always sets section_id = "" for regular sections, so the
+              heading-based slug is what get_course_content now sends to FE.
+
+    Pass 3 — legacy positional fallback: "sec_N" → sections[N-1].
+              Handles old FE sessions that cached IDs before this fix.
+
+    Returns (section_dict, index) or (None, -1) when not found.
+    """
+    # Pass 1: exact section_id field match (A1-derived IDs, very rare)
+    for i, sec in enumerate(sections):
+        sid = (sec.get("section_id") or "").strip()
+        if sid and sid == section_id:
+            return sec, i
+
+    # Pass 2: heading-based stable ID match (primary path for all real courses)
+    for i, sec in enumerate(sections):
+        if _section_stable_id(sec, i) == section_id:
+            return sec, i
+
+    # Pass 3: legacy positional fallback for old "sec_N" format IDs
+    if section_id.startswith("sec_"):
+        try:
+            idx = int(section_id[4:]) - 1
+            if 0 <= idx < len(sections):
+                return sections[idx], idx
+        except ValueError:
+            pass
+
+    return None, -1
+
+
 def _persist_section_text(job_id: str, section_id: str, new_content: str) -> None:
     """Persist plain-text content to shared_state for any section (special or regular)."""
     store = get_local_course_job_store()
@@ -145,11 +227,10 @@ def _persist_section_text(job_id: str, section_id: str, new_content: str) -> Non
         a2_output["course_conclusion"] = new_content
     else:
         sections: list[dict] = a2_output.get("sections") or []
-        for sec in sections:
-            if sec.get("section_id") == section_id:
-                sec["body_paragraphs"] = [{"type": "text", "content": new_content}]
-                sec["word_count"] = len(new_content.split())
-                break
+        target, _ = _find_a2_section(sections, section_id)
+        if target is not None:
+            target["body_paragraphs"] = [{"type": "text", "content": new_content}]
+            target["word_count"] = len(new_content.split())
         a2_output["sections"] = sections
     shared_state["agent_outputs"]["A2"] = a2_output
     with open(job.shared_state_path, "w", encoding="utf-8") as fh:
@@ -160,10 +241,10 @@ def _recover_job_from_disk(job_id: str):
     """Find and register a completed job from filesystem when it's absent from the in-memory store.
 
     This handles the common dev-server-restart case where the in-memory store is empty
-    but pipeline/courses/{slug}/{job_id}/ still exists on disk.
+    but pipeline/shared_state/{slug}/{job_id}/ still exists on disk.
     Returns the LocalCourseJob if found, or None.
     """
-    # Job ID is always a path segment: pipeline/courses/{slug}/{job_id}/
+    # Job ID is always a path segment: pipeline/shared_state/{slug}/{job_id}/
     for state_file in (
         *_PIPELINE_COURSES_DIR.glob(f"*/{job_id}/shared_state.json"),
         *_PIPELINE_COURSES_DIR.glob(f"*/{job_id}/state/shared_state.json"),
@@ -196,7 +277,7 @@ def _regenerate_special_section_sync(job_id: str, section_id: str) -> str:
     )
 
     store = get_local_course_job_store()
-    job = store.get(job_id) or _recover_job_from_disk(job_id)
+    job = _resolve_job_with_filesystem(store, job_id)
     if not job or not job.shared_state_path:
         raise ValueError(f"Job {job_id} not found or has no shared state")
 
@@ -243,13 +324,17 @@ def _set_trace_context_for_job(job_id: str, *, study_guide_path: str | None = No
     store = get_local_course_job_store()
     job = store.get(job_id)
     doc_name = ""
+    source_refs: list[str] = []
     if study_guide_path:
         doc_name = Path(study_guide_path).stem
+        source_refs.append(study_guide_path)
+    if job and job.input_docx_path and job.input_docx_path not in source_refs:
+        source_refs.append(job.input_docx_path)
     if not doc_name and job and job.course_title:
         doc_name = sanitize_course_slug(job.course_title)
     if not doc_name:
         doc_name = job_id[:8]
-    set_run_context(job_id, doc_name)
+    set_run_context(job_id, doc_name, source_refs=source_refs)
 
 
 def _rewrite_section_sync(job_id: str, section_id: str, current_content: str, user_prompt: str) -> str:
@@ -369,6 +454,9 @@ def _regenerate_section_sync(job_id: str, section_id: str, current_content: str)
     Regenerate a single section's content via LLM and persist to shared_state.
     Returns the new plain-text content for the section.
     """
+    # Propagate trace context so A2 LLM calls are attributed to this job in Langfuse.
+    _set_trace_context_for_job(job_id)
+
     # Special sections (overview / conclusion) use their own dedicated generators
     if section_id in ("course-overview", "course-conclusion"):
         return _regenerate_special_section_sync(job_id, section_id)
@@ -385,7 +473,7 @@ def _regenerate_section_sync(job_id: str, section_id: str, current_content: str)
     from lectora_backend.pipeline.rule_pack_config.rule_packs import resolve_rule_pack
 
     store = get_local_course_job_store()
-    job = store.get(job_id) or _recover_job_from_disk(job_id)
+    job = _resolve_job_with_filesystem(store, job_id)
     if not job or not job.shared_state_path:
         raise ValueError(f"Job {job_id} not found or has no shared state")
 
@@ -395,10 +483,19 @@ def _regenerate_section_sync(job_id: str, section_id: str, current_content: str)
     a2_output: dict = shared_state.get("agent_outputs", {}).get("A2") or {}
     sections: list[dict] = a2_output.get("sections") or []
 
-    # Find target section
-    target_sec = next((s for s in sections if s.get("section_id") == section_id), None)
+    # Find target section — try exact section_id match, then positional "sec_N" fallback
+    target_sec, _ = _find_a2_section(sections, section_id)
     if not target_sec:
-        raise ValueError(f"Section '{section_id}' not found in A2 output")
+        # The section may be a synthetic L1 parent injected by _inject_missing_lesson_parent_sections
+        # (these are not stored in shared_state but ARE assigned IDs in get_course_content).
+        # Promote it into the real sections list so it can be regenerated and persisted.
+        expanded = _inject_missing_lesson_parent_sections(sections)
+        synth_sec, _ = _find_a2_section(expanded, section_id)
+        if synth_sec:
+            _promote_synthetic_parent(sections, synth_sec)
+            target_sec, _ = _find_a2_section(sections, section_id)
+        else:
+            raise ValueError(f"Section '{section_id}' not found in A2 output")
 
     extracted = shared_state.get("extracted_inputs", {}) or {}
     learning_objectives: list[str] = [str(lo) for lo in (extracted.get("learning_objectives") or [])]
@@ -411,16 +508,24 @@ def _regenerate_section_sync(job_id: str, section_id: str, current_content: str)
     if not rule_pack:
         raise ValueError(f"Cannot resolve rule pack for family '{rule_family}'")
 
-    # Locate original para_start / para_end from enriched_sections (Section Mapper output)
+    # Locate original para_start / para_end from enriched_sections (Section Mapper output).
+    # Match by the section's own A1 section_id first, then fall back to title/heading match
+    # so parent-overview sections (which have empty section_id) are handled correctly.
     enriched_sections: list[dict] = (
         shared_state.get("agent_outputs", {})
         .get("section_map", {})
         .get("enriched_sections", [])
     )
+    section_real_id: str = target_sec.get("section_id") or ""
+    section_heading: str = target_sec.get("heading") or ""
     para_start = para_end = 0
     for lesson in enriched_sections:
         for sub in lesson.get("subtopics") or []:
-            if sub.get("id") == section_id:
+            matched = (
+                (section_real_id and sub.get("id") == section_real_id)
+                or (section_heading and sub.get("title") == section_heading)
+            )
+            if matched:
                 para_start = int(sub.get("para_start") or 0)
                 para_end = int(sub.get("para_end") or 0)
                 break
@@ -478,13 +583,10 @@ def _regenerate_section_sync(job_id: str, section_id: str, current_content: str)
     new_body = new_data.get("body_paragraphs") or []
     new_wc = int(new_data.get("word_count") or word_count)
 
-    # Persist updated section to shared_state
-    for sec in sections:
-        if sec.get("section_id") == section_id:
-            sec["body_paragraphs"] = new_body
-            sec["word_count"] = new_wc
-            sec["status"] = "regenerated"
-            break
+    # Persist updated section to shared_state (target_sec is already the matched object)
+    target_sec["body_paragraphs"] = new_body
+    target_sec["word_count"] = new_wc
+    target_sec["status"] = "regenerated"
 
     a2_output["sections"] = sections
     shared_state["agent_outputs"]["A2"] = a2_output
@@ -698,18 +800,6 @@ def _persist_course_config(shared_state_path: str, course_config: "CourseConfigP
         json.dump(state, fh, indent=2, default=str)
 
 
-def _sync_legacy_shared_state_dir(course_slug: str) -> None:
-    """Mirror ``pipeline/courses/{slug}`` into legacy ``pipeline/shared_state/{slug}``."""
-    if not course_slug:
-        return
-    source_dir = (_PIPELINE_COURSES_DIR / course_slug).resolve()
-    if not source_dir.is_dir():
-        return
-    target_dir = (_LEGACY_SHARED_STATE_DIR / course_slug).resolve()
-    shutil.rmtree(target_dir, ignore_errors=True)
-    shutil.copytree(source_dir, target_dir)
-
-
 def _format_s1_feedback(report: Any) -> str:
     lines: list[str] = []
     for issue in getattr(report, "issues", []) or []:
@@ -809,7 +899,7 @@ def _run_pipeline_inner(
     s1_feedback: str | None = None
 
     # Compute per-job output slug once — each run gets its own isolated dir:
-    # pipeline/courses/{course_slug}/{job_id}/
+    # pipeline/shared_state/{course_slug}/{job_id}/
     _job_rec = store.get(job_id)
     course_slug = sanitize_course_slug(_job_rec.course_title if _job_rec else "course")
     job_output_slug = f"{course_slug}/{job_id}"
@@ -852,7 +942,7 @@ def _run_pipeline_inner(
         ).run()
         shared_state_path = a0_result.shared_state_path
         # Point the job's artifact dir to the actual pipeline output directory
-        # (parent of shared_state.json = pipeline/courses/{course_slug}/{job_id}/).
+        # (parent of shared_state.json = pipeline/shared_state/{course_slug}/{job_id}/).
         store.set_temp_dir(job_id, str(Path(shared_state_path).parent))
         _persist_difficulty(shared_state_path, difficulty)
 
@@ -876,7 +966,6 @@ def _run_pipeline_inner(
         _job_title = (store.get(job_id) or _job_rec)
         if _job_title and _job_title.course_title:
             _persist_course_title(shared_state_path, _job_title.course_title)
-        _sync_legacy_shared_state_dir(job_output_slug)
         log("success", "Document analyzed — course structure and rule family identified", "A0")
         store.complete_stage(job_id, "A0", "PASS")
 
@@ -893,14 +982,12 @@ def _run_pipeline_inner(
             docx_path=study_guide_path,
             feedback=a1_feedback,
         )
-        _sync_legacy_shared_state_dir(job_output_slug)
         log("success", "Course outline built — sections and learning objectives mapped", "A1")
         store.complete_stage(job_id, "A1", "PASS")
 
         log("info", "Reviewing course structure for quality and compliance…", "S1")
         store.start_stage(job_id, "S1")
         s1_result = S1Validator(shared_state_path).run()
-        _sync_legacy_shared_state_dir(job_output_slug)
 
         if not _s1_blocks(s1_result.status):
             log("success", "Structure review passed — course outline meets quality standards", "S1")
@@ -930,7 +1017,6 @@ def _run_pipeline_inner(
     log("info", "Organizing course sections and mapping lessons to the training outline…", "SECTION_MAPPER")
     store.start_stage(job_id, "SECTION_MAPPER")
     section_mapper_run(shared_state_path=shared_state_path)
-    _sync_legacy_shared_state_dir(job_output_slug)
     log("success", "Course sections organized and lesson mapping complete", "SECTION_MAPPER")
     store.complete_stage(job_id, "SECTION_MAPPER", "PASS")
 
@@ -938,7 +1024,6 @@ def _run_pipeline_inner(
     log("info", "Planning interactive knowledge check placement…", "KC_PLANNER")
     store.start_stage(job_id, "KC_PLANNER")
     kc_result = kc_planner_run(shared_state_path=shared_state_path)
-    _sync_legacy_shared_state_dir(job_output_slug)
     kc_count = kc_result.get("kc_count", 0)
     log("success", f"Knowledge check placement complete — {kc_count} interactive checks planned", "KC_PLANNER")
     store.complete_stage(job_id, "KC_PLANNER", "PASS")
@@ -965,7 +1050,6 @@ def _run_pipeline_inner(
             feedback=a2_feedback,
             source_file_paths=source_file_paths,
         ).run()
-        _sync_legacy_shared_state_dir(job_output_slug)
         log(
             "success",
             f"Content generation complete — {a2_result.stats.generated} lessons written "
@@ -976,7 +1060,6 @@ def _run_pipeline_inner(
         log("info", "Checking content quality, accuracy, and completeness…", "S2")
         store.start_stage(job_id, "S2")
         s2_result = S2Validator(shared_state_path).run()
-        _sync_legacy_shared_state_dir(job_output_slug)
 
         if not _s2_blocks(s2_result.status):
             log("success", "Content quality review passed", "S2")
@@ -1002,10 +1085,8 @@ def _run_pipeline_inner(
     if s2_result and not _s2_blocks(s2_result.status):
         log("info", "Assembling your final course document…", "A2")
         final_docx_path = render_study_guide_from_state(shared_state_path=shared_state_path)
-        _sync_legacy_shared_state_dir(job_output_slug)
         log("success", "Your course document is ready", "A2")
     else:
-        _sync_legacy_shared_state_dir(job_output_slug)
         log("error", "Course document could not be assembled — quality gate blocked", "A2")
 
     return shared_state_path, final_docx_path
@@ -1307,7 +1388,7 @@ def _reconstruct_job_from_filesystem(
     store: "LocalCourseJobStore",
     course_slug: str,
 ) -> "LocalCourseJob | None":
-    """Scan pipeline/courses/{course_slug}/ for the most recent shared_state.json
+    """Scan pipeline/shared_state/{course_slug}/ for the most recent shared_state.json
     and register a COMPLETED job in the in-memory store.
 
     This allows the Asset Library to open courses generated before the current
@@ -1352,7 +1433,7 @@ def _find_shared_state_for_job_id(job_id: str) -> Path | None:
     """Return the path to shared_state.json for the given job_id, or None.
 
     Supports both the new isolated layout ({course_slug}/{job_id}/state/) and
-    the legacy layout ({course_slug}/state/).  Scans pipeline/courses/.
+    the legacy layout ({course_slug}/state/).  Scans pipeline/shared_state/.
     """
     for pattern in (
         f"*/{job_id}/shared_state.json",
@@ -1663,7 +1744,7 @@ async def delete_job(job_id: str) -> JSONResponse:
 )
 async def get_job(job_id: str) -> JSONResponse:
     store = get_local_course_job_store()
-    job = store.get(job_id)
+    job = _resolve_job_with_filesystem(store, job_id)
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1859,7 +1940,7 @@ async def get_course_content(
                 })
 
         flat.append({
-            "id": sec.get("section_id") or f"sec_{i + 1}",
+            "id": _section_stable_id(sec, i),
             "title": _clean_title(
                 sec.get("heading"),
                 sec.get("outline_lesson"),
@@ -2001,6 +2082,7 @@ class AIOperationPayload(BaseModel):
 class SaveSectionPayload(BaseModel):
     content: str
     section_type: str | None = Field(None, alias="sectionType")
+    title: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -2039,13 +2121,12 @@ async def save_section_content(
 
     elif stype == "learning-objectives":
         # Parse "1. text\n2. text" back to plain list
-        import re as _re
         los: list[str] = []
         for line in content.split("\n"):
             line = line.strip()
             if not line:
                 continue
-            m = _re.match(r"^\d+\.\s*(.+)$", line)
+            m = re.match(r"^\d+\.\s*(.+)$", line)
             los.append(m.group(1).strip() if m else line)
         extracted = shared_state.get("extracted_inputs") or {}
         extracted["learning_objectives"] = los
@@ -2054,18 +2135,24 @@ async def save_section_content(
     else:
         # Regular content section — replace body_paragraphs with single plain-text block
         sections: list[dict] = a2_output.get("sections") or []
-        updated = False
-        for sec in sections:
-            if sec.get("section_id") == section_id:
-                sec["body_paragraphs"] = [{"type": "text", "content": content}]
-                sec["word_count"] = len(content.split())
-                updated = True
-                break
-        if not updated:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Section '{section_id}' not found in A2 output",
-            )
+        target, _ = _find_a2_section(sections, section_id)
+        if target is None:
+            # May be a synthetic L1 parent injected by _inject_missing_lesson_parent_sections.
+            # Promote it into the real sections list so it can be persisted.
+            expanded = _inject_missing_lesson_parent_sections(sections)
+            synth_sec, _ = _find_a2_section(expanded, section_id)
+            if synth_sec:
+                _promote_synthetic_parent(sections, synth_sec)
+                target, _ = _find_a2_section(sections, section_id)
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Section '{section_id}' not found in A2 output",
+                )
+        target["body_paragraphs"] = [{"type": "text", "content": content}]
+        target["word_count"] = len(content.split())
+        if payload.title and payload.title.strip():
+            target["heading"] = payload.title.strip()
         a2_output["sections"] = sections
 
     shared_state["agent_outputs"]["A2"] = a2_output
@@ -2083,7 +2170,7 @@ async def run_ai_operation(job_id: str, payload: AIOperationPayload) -> JSONResp
     import asyncio
 
     store = get_local_course_job_store()
-    job = store.get(job_id)
+    job = _resolve_job_with_filesystem(store, job_id)
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

@@ -49,6 +49,13 @@ from lectora_backend.api.schemas.generate_to_schemas import (
     GenerateTOJobPollResponse,
     GenerateTORequest,
     GenerateTOResponse,
+    ReviseTORequest,
+    ReviseTOResponse,
+    SaveTORequest,
+    SaveTOResponse,
+    SourceAnalysis,
+    SourceAnalysisRequest,
+    SourceAnalysisResponse,
     SuggestCourseTypeRequest,
     SuggestCourseTypeResponse,
     SuggestOutlineStructureRequest,
@@ -76,6 +83,24 @@ from lectora_backend.pipeline.agent.a0_request_synthesizer.utils.outline_metrics
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _set_preview_trace_context(
+    *,
+    route_name: str,
+    course_title: str | None = None,
+    source_refs: list[str] | None = None,
+) -> None:
+    """Tag preview-only LLM routes with a readable trace context for Langfuse."""
+    from lectora_backend.pipeline.shared_llm_config.tracer import set_run_context
+
+    resolved_title = (course_title or "").strip() or route_name
+    run_id = f"{route_name.lower()}-{sanitize_segment(resolved_title) or 'preview'}"
+    set_run_context(
+        run_id,
+        resolved_title,
+        source_refs=source_refs or [],
+    )
 
 
 # ── Ingestion background task helpers ────────────────────────────────────────
@@ -860,6 +885,54 @@ def _build_explicit_context(body: "GenerateTORequest") -> str | None:
         style_label = "Short, focused sections" if body.lesson_style == "short" else "Detailed, comprehensive chapters"
         parts.append(f"Lesson style: {style_label}")
 
+    # ── Required topics (must appear in every generated TO) ──────────────────
+    if body.required_topics:
+        rt_lines: list[str] = [
+            "REQUIRED TOPICS — MANDATORY COVERAGE",
+            "The following topics MUST appear in the generated training outline.",
+            "They are non-negotiable and take highest priority over any deprioritisation signals:",
+            "",
+        ]
+        for topic in body.required_topics:
+            rt_lines.append(f"  • {topic}")
+        rt_lines.append("")
+        rt_lines.append("Every required topic above must be represented by at least one dedicated section or subtopic.")
+        parts.append("\n".join(rt_lines))
+
+    # ── Source analysis guidance ──────────────────────────────────────────────
+    if body.source_analyses:
+        sa_lines: list[str] = [
+            "SOURCE ANALYSIS GUIDANCE",
+            "The following sources have been pre-analyzed. Weight your content selection accordingly:",
+            "",
+        ]
+        for sa in body.source_analyses:
+            sa_lines.append(f"[{sa.source_name}]")
+            sa_lines.append(f"  Role: {sa.source_role} | Importance: {sa.importance}")
+            if sa.main_topics:
+                sa_lines.append(f"  Key topics: {', '.join(sa.main_topics)}")
+            if sa.recommended_course_use:
+                sa_lines.append(f"  How to use: {sa.recommended_course_use}")
+            if sa.recommended_depth:
+                sa_lines.append(f"  Coverage depth: {sa.recommended_depth}")
+            if sa.supports_learning_objectives:
+                sa_lines.append("  Supports LOs:")
+                for lo in sa.supports_learning_objectives:
+                    sa_lines.append(f"    - {lo}")
+            if sa.ignore_or_reduce:
+                sa_lines.append("  Deprioritise:")
+                for ig in sa.ignore_or_reduce:
+                    sa_lines.append(f"    - {ig}")
+            sa_lines.append("")
+        sa_lines.extend([
+            "Weighting rules:",
+            "  - primary_source + high importance → these topics must dominate the course structure",
+            "  - supporting_source → incorporate only into sections where directly relevant",
+            "  - reference_only → cite for edge cases; do not build sections around this source",
+            "  - Ignore/reduce topics listed above should be minimised or omitted",
+        ])
+        parts.append("\n".join(sa_lines))
+
     return "\n\n".join(parts) if parts else None
 
 
@@ -1010,6 +1083,107 @@ async def get_ingestion_status(document_id: str) -> JSONResponse:
             detail=f"No ingestion record for document_id: {document_id}",
         )
     return JSONResponse(content=entry)
+
+
+@router.post(
+    "/analyze-source",
+    response_model=SourceAnalysisResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_200_OK,
+    summary="Analyze a single uploaded source document (TOC extraction + LLM source analysis)",
+)
+async def analyze_source(body: SourceAnalysisRequest) -> SourceAnalysisResponse:
+    """
+    Extract the TOC from an uploaded DOCX or PDF and send it to the LLM for structured
+    source analysis.  Call this for every uploaded document before ``POST /documents/generate-to``
+    so the TO and LO generation can weight content by source role and importance.
+
+    Returns a :class:`SourceAnalysisResponse` with main topics, recommended course use,
+    depth, learning objectives supported, and topics to ignore.
+    """
+    resolved = _validate_document_path(body.blob_path)
+    ext = resolved.suffix.lower()
+    if ext not in {".docx", ".pdf"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only .docx and .pdf files can be analyzed.",
+        )
+
+    # ── Extract TOC entries ───────────────────────────────────────────────────
+    toc_lines: list[str] = []
+    try:
+        if ext == ".docx":
+            from lectora_backend.pipeline.agent.a0_request_synthesizer.step_01_document_parsing.utils.doc_parser import (
+                CourseDocParser,
+            )
+            parser = CourseDocParser(docx_paths=[str(resolved)])
+            entries = parser.extract_toc_entries()
+            for e in entries[:200]:
+                indent = "  " * max(0, e.level - 1)
+                toc_lines.append(f"{indent}[L{e.level}] {e.text}")
+        else:
+            from lectora_backend.pipeline.agent.a0_request_synthesizer.step_01_document_parsing.utils.pdf_parser import (
+                PDFSourceParser,
+            )
+            pdf_parser = PDFSourceParser([str(resolved)])
+            entries = pdf_parser.extract_toc_entries(include_heading_fallback=True)
+            for e in entries[:200]:
+                page_suffix = f" p{e.page}" if e.page else ""
+                indent = "  " * max(0, e.level - 1)
+                toc_lines.append(f"{indent}[L{e.level}] {e.text}{page_suffix}")
+    except Exception:
+        logger.warning("[analyze-source] TOC extraction failed for %s — proceeding without TOC", resolved.name)
+
+    toc_text = "\n".join(toc_lines) if toc_lines else "(no structured TOC found)"
+
+    # ── Build the LLM prompt ─────────────────────────────────────────────────
+    _SOURCE_ANALYSIS_SYSTEM = (
+        "You are a course design expert. Analyze a training source document and return structured JSON.\n\n"
+        "Return ONLY valid JSON matching this exact schema (no markdown, no prose):\n"
+        "{\n"
+        '  "main_topics": ["topic1", "topic2", ...],\n'
+        '  "recommended_course_use": "one sentence on how to use this source",\n'
+        '  "recommended_depth": "light" | "moderate" | "comprehensive",\n'
+        '  "supports_learning_objectives": ["LO1", "LO2", ...],\n'
+        '  "ignore_or_reduce": ["topic or section to deprioritize", ...]\n'
+        "}\n\n"
+        "Guidelines:\n"
+        "- primary_source + high importance → comprehensive depth, broad topic coverage\n"
+        "- supporting_source → moderate depth, use only for relevant sections\n"
+        "- reference_only → light depth, cite for edge cases only\n"
+        "- Low importance sources should have short ignore_or_reduce lists — deprioritize broadly\n"
+        "- Learning objectives should be action-verb (Bloom's taxonomy) statements\n"
+        "- 3–8 main_topics, 2–4 supports_learning_objectives, 1–4 ignore_or_reduce entries"
+    )
+
+    user_msg = (
+        f"Source file: {resolved.name}\n"
+        f"Source role: {body.source_role}\n"
+        f"Importance: {body.importance}\n\n"
+        f"Document TOC:\n{toc_text}"
+    )
+
+    try:
+        from lectora_backend.pipeline.agent.a0_request_synthesizer.config.llm import chat_for_to
+        raw_json = chat_for_to(_SOURCE_ANALYSIS_SYSTEM, user_msg)
+        data = json.loads(raw_json)
+    except Exception as exc:
+        logger.exception("[analyze-source] LLM call or JSON parse failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Source analysis LLM call failed: {exc}",
+        ) from exc
+
+    return SourceAnalysisResponse(
+        source_name=resolved.name,
+        source_role=body.source_role,
+        importance=body.importance,
+        main_topics=data.get("main_topics", []),
+        recommended_course_use=data.get("recommended_course_use", ""),
+        recommended_depth=data.get("recommended_depth", "moderate"),
+        supports_learning_objectives=data.get("supports_learning_objectives", []),
+        ignore_or_reduce=data.get("ignore_or_reduce", []),
+    )
 
 
 @router.post(
@@ -1169,7 +1343,11 @@ async def generate_to(
         from lectora_backend.pipeline.shared_llm_config.tracer import set_run_context
 
         sync_doc_name = all_docx[0].stem if all_docx else (all_pdf[0].stem if all_pdf else "")
-        set_run_context(f"sync-{sync_doc_name or 'to'}", sync_doc_name or "unknown")
+        set_run_context(
+            f"sync-{sync_doc_name or 'to'}",
+            sync_doc_name or "unknown",
+            source_refs=blob_paths,
+        )
 
         runner = _build_runner()
         try:
@@ -1382,7 +1560,71 @@ async def load_to_from_path(
     source: Literal["uploads", "artifacts"] = Query(default="uploads"),
 ) -> GenerateTOResponse:
     payload = _read_json_blob(path, source)
+    # FE-format blobs (written by POST /documents/save-to) contain "to" + "rules"
+    # directly — skip the LLM→FE conversion step.
+    if isinstance(payload.get("to"), dict) and isinstance(payload.get("rules"), dict):
+        return GenerateTOResponse(to=payload["to"], rules=payload["rules"])
     return build_fe_to_response_from_llm_outline(_unwrap_llm_outline(payload))
+
+
+@router.post(
+    "/save-to",
+    response_model=SaveTOResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_200_OK,
+    summary="Persist user-edited Training Outline to blob storage",
+)
+async def save_to(body: SaveTORequest) -> SaveTOResponse:
+    """
+    Overwrite the blob at ``blobPath`` with the user-edited Training Outline.
+
+    Written in FE format ``{ "to": {...}, "rules": {...} }`` so that
+    ``GET /documents/load-to`` can detect and return it directly without
+    passing it through the LLM→FE conversion pipeline.
+
+    Both the local filesystem cache and Azure Blob Storage (when configured)
+    are updated so that the backend always reflects the latest user edits.
+    """
+    blob_path = body.blob_path.strip()
+    if not blob_path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="blobPath is required.",
+        )
+
+    # Resolve relative path — strip container prefix if present
+    rel = blob_path
+    for prefix in (f"{UPLOADED_DOCUMENTS_PREFIX}/", f"{UPLOADED_DOCUMENTS_PREFIX}"):
+        if rel.startswith(prefix):
+            rel = rel[len(prefix):]
+            break
+
+    payload = {"to": body.to}
+    if body.rules is not None:
+        payload["rules"] = body.rules  # type: ignore[assignment]
+    content = json.dumps(payload, ensure_ascii=False, indent=2)
+    content_bytes = content.encode("utf-8")
+
+    # Always write to local filesystem (dev mode + Azure cache)
+    local_path = _UPLOAD_ROOT / rel
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_text(content, encoding="utf-8")
+    logger.info("[save-to] Wrote TO to local path → %s", local_path)
+
+    # Write to Azure Blob Storage when configured
+    if _azure_storage_ready():
+        try:
+            _uploads_blob_repo().upload_bytes(
+                rel,
+                content_bytes,
+                content_type="application/json",
+            )
+            logger.info("[save-to] Uploaded TO to Azure → %s", rel)
+        except Exception as exc:
+            # Local write succeeded; log the Azure failure but don't fail the request.
+            logger.warning("[save-to] Azure upload failed (local copy saved): %s", exc)
+
+    return SaveTOResponse(blob_path=blob_path)
 
 
 @router.post(
@@ -1491,15 +1733,54 @@ Return a JSON object with this exact structure:
     if body.additional_instructions:
         input_parts.append(f"Additional instructions: {body.additional_instructions}")
 
+    if body.required_topics:
+        rt_lo_lines = [
+            "\nREQUIRED TOPICS — Every generated objective must be traceable to at least one of these:",
+        ]
+        for topic in body.required_topics:
+            rt_lo_lines.append(f"  • {topic}")
+        rt_lo_lines.append(
+            "\nEnsure each required topic is covered by at least one learning objective. "
+            "Do not omit any topic from this list."
+        )
+        input_parts.append("\n".join(rt_lo_lines))
+
+    if body.source_analyses:
+        sa_lines = [
+            "\nSOURCE ANALYSIS (use this to align objectives to the actual source content):",
+        ]
+        for sa in body.source_analyses:
+            sa_lines.append(f"\n[{sa.source_name}] role={sa.source_role} importance={sa.importance}")
+            if sa.main_topics:
+                sa_lines.append(f"  Topics: {', '.join(sa.main_topics)}")
+            if sa.supports_learning_objectives:
+                sa_lines.append("  Suggested LOs from this source:")
+                for lo in sa.supports_learning_objectives:
+                    sa_lines.append(f"    - {lo}")
+            if sa.ignore_or_reduce:
+                sa_lines.append(f"  Avoid/reduce: {', '.join(sa.ignore_or_reduce)}")
+        sa_lines.extend([
+            "\nWeighting rules for LO selection:",
+            "  - Base objectives primarily on primary_source + high importance documents",
+            "  - Supporting sources may contribute to individual objectives only if highly relevant",
+            "  - Do NOT write objectives for topics listed under Avoid/reduce above",
+        ])
+        input_parts.append("\n".join(sa_lines))
+
     user_msg = (
         "\n".join(input_parts)
         or "Generate general learning objectives for this training course."
     )
+    _set_preview_trace_context(
+        route_name="lo-gen",
+        course_title=body.course_title,
+    )
 
     try:
-        raw = await asyncio.to_thread(
-            llm_chat, system_prompt, user_msg, config, "LO_GEN"
-        )
+        def _call_llm() -> str:
+            return llm_chat(system_prompt, user_msg, config, "LO_GEN")
+
+        raw = await asyncio.to_thread(_call_llm)
         data = json.loads(raw)
         objectives: list[str] = data.get("learning_objectives") or []
         if not isinstance(objectives, list):
@@ -1576,11 +1857,16 @@ async def suggest_outline_structure(
         "\n".join(input_parts)
         or "Recommend a structure for a standard training course."
     )
+    _set_preview_trace_context(
+        route_name="suggest-structure",
+        course_title=body.course_title,
+    )
 
     try:
-        raw = await asyncio.to_thread(
-            llm_chat, system_prompt, user_msg, config, "SUGGEST_STRUCTURE"
-        )
+        def _call_llm() -> str:
+            return llm_chat(system_prompt, user_msg, config, "SUGGEST_STRUCTURE")
+
+        raw = await asyncio.to_thread(_call_llm)
         data = json.loads(raw)
         preferred_chapters = max(4, min(16, int(data.get("preferred_chapters") or 6)))
         lesson_style = str(data.get("lesson_style") or "short").strip().lower()
@@ -1637,6 +1923,11 @@ async def suggest_course_type(body: SuggestCourseTypeRequest) -> SuggestCourseTy
     if body.target_audience.strip():
         content_parts.append(f"Target audience: {body.target_audience.strip()}")
     content_sample = "\n".join(content_parts)
+
+    _set_preview_trace_context(
+        route_name="suggest-course-type",
+        course_title=body.course_title,
+    )
 
     try:
         result: dict = await asyncio.to_thread(
@@ -1730,3 +2021,118 @@ async def get_generate_to_job(job_id: str) -> GenerateTOJobPollResponse:
         message=job.message,
         logs=[log.to_dict() for log in job.logs],
     )
+
+
+# ── Revise Training Outline ───────────────────────────────────────────────────
+
+_REVISE_TO_SYSTEM_PROMPT = """\
+You are an expert instructional designer. Your task is to revise an existing \
+Training Outline (TO) JSON based on the user's instructions.
+
+═══════════════════════════════════════════════════════════
+REVISION RULES (CRITICAL — follow all of them)
+═══════════════════════════════════════════════════════════
+RULE 1 — Output format: Return ONLY the revised Training Outline as a single \
+valid JSON object. Do NOT wrap it in markdown code fences, do NOT add any \
+explanatory text before or after the JSON.
+
+RULE 2 — Preserve structure: Keep the EXACT same top-level field names and \
+nested hierarchy as the input unless the user explicitly asks to add or \
+remove sections.
+
+RULE 3 — Preserve metadata: Do NOT change course-level metadata \
+(course_name, rule_family, learning_objectives, totals, word counts, \
+credit_hours, minutes) unless the user's instruction explicitly requires it.
+
+RULE 4 — Minimal changes: Apply ONLY what the user has requested. Do not \
+make unrelated modifications, reorder sections, or rename fields that were \
+not mentioned.
+
+RULE 5 — Consistent formatting: Maintain the same numbering style, \
+capitalisation, and field schema used in existing sections when adding or \
+editing content.
+
+RULE 6 — Return the complete TO: Always return the full Training Outline, \
+not just the changed parts.
+"""
+
+
+@router.post(
+    "/revise-to",
+    response_model=ReviseTOResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_200_OK,
+    summary="Revise an existing Training Outline using a custom user prompt",
+)
+async def revise_to(body: ReviseTORequest) -> ReviseTOResponse:
+    """
+    Send the current Training Outline JSON and a user revision prompt to the LLM.
+
+    The LLM revises the existing outline in place — it does NOT regenerate from
+    source documents. Only the changes described in ``revisionPrompt`` are applied;
+    everything else is preserved.
+
+    Returns the revised TO as ``{ "to": { ... } }``.
+    """
+    from lectora_backend.pipeline.shared_llm_config.llm import LLMConfig, chat as llm_chat
+    from lectora_backend.pipeline.shared_llm_config.model_registry import get_deployment
+
+    revision_prompt = (body.revision_prompt or "").strip()
+    if not revision_prompt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="revisionPrompt is required and must not be empty.",
+        )
+
+    current_to_json = json.dumps(body.current_to, indent=2)
+
+    user_message = (
+        f"Current Training Outline:\n{current_to_json}\n\n"
+        f"---\n\n"
+        f"Revision instructions:\n{revision_prompt}"
+    )
+
+    config = LLMConfig(
+        deployment=get_deployment("A0_TO"),
+        max_tokens=16_384,
+        response_format={"type": "json_object"},
+    )
+
+    logger.info(
+        "[revise-to] Starting TO revision | prompt_length=%d | to_sections=%s",
+        len(revision_prompt),
+        len(body.current_to.get("sections", body.current_to.get("modules", []))),
+    )
+
+    try:
+        def _call_llm() -> str:
+            return llm_chat(_REVISE_TO_SYSTEM_PROMPT, user_message, config, "REVISE_TO")
+
+        raw = await asyncio.to_thread(_call_llm)
+
+        # Strip accidental markdown fences if the model ignored RULE 1
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r"^```[a-zA-Z]*\n?", "", stripped)
+            stripped = re.sub(r"\n?```$", "", stripped.rstrip())
+
+        revised_to = json.loads(stripped)
+
+        if not isinstance(revised_to, dict):
+            raise ValueError("LLM returned a non-object JSON value.")
+
+        logger.info("[revise-to] Revision complete")
+        return ReviseTOResponse(to=revised_to)
+
+    except json.JSONDecodeError as exc:
+        logger.warning("[revise-to] JSON parse error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="The LLM returned malformed JSON. Please try again.",
+        ) from exc
+    except Exception as exc:
+        logger.exception("[revise-to] LLM call failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to revise the Training Outline: {exc}",
+        ) from exc

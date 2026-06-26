@@ -1,9 +1,14 @@
 from __future__ import annotations
 import logging
+import time
 
 import openai
 
 from lectora_backend.ingestion.chunking.models import CourseChunk
+from lectora_backend.pipeline.shared_llm_config.tracer import (
+    EmbeddingTrace,
+    write_embedding_trace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +67,11 @@ class MultiLevelEmbeddingService:
         if not chunks:
             return chunks
 
+        # Use the first chunk's document_id as the trace reference for this batch.
+        document_id: str | None = chunks[0].document_id if chunks else None
+        source_file: str | None = chunks[0].source_file if chunks else None
+        source_refs = [source_file] if source_file else []
+
         title_texts   = [c.title or "" for c in chunks]
         summary_texts = [c.metadata.summary or c.title or "" for c in chunks]
         content_texts = [c.raw_text[:_MAX_CONTENT_CHARS] for c in chunks]
@@ -70,7 +80,9 @@ class MultiLevelEmbeddingService:
             for c in chunks
         ]
 
-        title_embs   = await self._embed_all(title_texts,   level="title")
+        title_embs = await self._embed_all(
+            title_texts, level="title", document_id=document_id, source_refs=source_refs
+        )
         if self._endpoint_reachable is False:
             logger.warning(
                 "[embedding_service] Endpoint unreachable — skipping remaining levels. "
@@ -79,9 +91,15 @@ class MultiLevelEmbeddingService:
             )
             return chunks  # return without embeddings rather than burning retries
 
-        summary_embs = await self._embed_all(summary_texts, level="summary")
-        content_embs = await self._embed_all(content_texts, level="content")
-        keyword_embs = await self._embed_all(keyword_texts, level="keywords")
+        summary_embs = await self._embed_all(
+            summary_texts, level="summary", document_id=document_id, source_refs=source_refs
+        )
+        content_embs = await self._embed_all(
+            content_texts, level="content", document_id=document_id, source_refs=source_refs
+        )
+        keyword_embs = await self._embed_all(
+            keyword_texts, level="keywords", document_id=document_id, source_refs=source_refs
+        )
 
         enriched: list[CourseChunk] = []
         for i, chunk in enumerate(chunks):
@@ -95,19 +113,31 @@ class MultiLevelEmbeddingService:
         logger.info("[embedding_service] Embedded %d chunks × 4 levels", len(enriched))
         return enriched
 
-    async def _embed_all(self, texts: list[str], level: str = "") -> list[list[float]]:
+    async def _embed_all(
+        self,
+        texts: list[str],
+        level: str = "",
+        document_id: str | None = None,
+        source_refs: list[str] | None = None,
+    ) -> list[list[float]]:
         """Call the embeddings API in batches, returning a flat embedding list.
 
+        Each batch emits an EmbeddingTrace to Langfuse (latency, token usage, errors).
         On the first connection error, sets _endpoint_reachable=False and returns
         immediately so the caller can skip remaining levels without further retries.
         """
         all_embeddings: list[list[float]] = []
+        batch_index = 0
         for i in range(0, len(texts), _BATCH_SIZE):
             if self._endpoint_reachable is False:
                 # Endpoint already confirmed unreachable — skip remaining batches
                 all_embeddings.extend([] for _ in texts[i : i + _BATCH_SIZE])
+                batch_index += 1
                 continue
             batch = texts[i : i + _BATCH_SIZE]
+            t_start = time.perf_counter()
+            error_msg: str | None = None
+            total_tokens = 0
             try:
                 response = await self._client.embeddings.create(
                     model=self._deployment,
@@ -115,19 +145,46 @@ class MultiLevelEmbeddingService:
                     dimensions=_DIMENSIONS,
                 )
                 self._endpoint_reachable = True
+                if getattr(response, "usage", None):
+                    total_tokens = response.usage.total_tokens or 0
                 all_embeddings.extend(item.embedding for item in response.data)
             except Exception as exc:
-                exc_str = str(exc).lower()
-                is_connection_error = "connection" in exc_str or "connect" in exc_str
+                error_msg = str(exc)
+                exc_lower = error_msg.lower()
+                is_connection_error = "connection" in exc_lower or "connect" in exc_lower
                 if is_connection_error and self._endpoint_reachable is None:
                     self._endpoint_reachable = False
                 logger.warning(
                     "[embedding_service] Batch %d/%s failed: %s", i, level, exc
                 )
                 all_embeddings.extend([] for _ in batch)
-                if self._endpoint_reachable is False:
-                    # Abort this level immediately — no point retrying other batches
-                    remaining = texts[i + _BATCH_SIZE :]
-                    all_embeddings.extend([] for _ in remaining)
-                    break
+            finally:
+                latency_ms = (time.perf_counter() - t_start) * 1000
+                try:
+                    write_embedding_trace(EmbeddingTrace(
+                        agent="INGEST_EMBED",
+                        deployment=self._deployment,
+                        level=level,
+                        batch_index=batch_index,
+                        batch_size=len(batch),
+                        dimensions=_DIMENSIONS,
+                        latency_ms=latency_ms,
+                        total_tokens=total_tokens,
+                        error=error_msg,
+                        document_id=document_id,
+                        source_refs=source_refs or [],
+                        # Ingestion runs in its own async tasks; supply explicit IDs
+                        # rather than relying on context vars (which may not be set).
+                        run_id=f"ingest:{document_id}" if document_id else "",
+                        doc_name=document_id or "ingestion",
+                    ))
+                except Exception:
+                    pass  # tracing must never break the ingestion pipeline
+
+            if self._endpoint_reachable is False:
+                # Abort this level immediately — no point retrying other batches
+                remaining = texts[i + _BATCH_SIZE :]
+                all_embeddings.extend([] for _ in remaining)
+                break
+            batch_index += 1
         return all_embeddings

@@ -16,6 +16,7 @@ from lectora_backend.api.routes import settings as settings_routes
 from lectora_backend.api.routes import dashboard, costing
 from lectora_backend.config import settings
 from lectora_backend.dependencies import engine
+from lectora_backend.pipeline.shared_llm_config import flush_langfuse, shutdown_langfuse
 from lectora_backend.repositories.blob_repository import BlobRepository
 
 
@@ -53,6 +54,8 @@ async def lifespan(app: FastAPI):
             pass
 
     yield
+    flush_langfuse()
+    shutdown_langfuse()
 
 
 app = FastAPI(title="Lectora Backend", lifespan=lifespan)

@@ -39,7 +39,7 @@ class _DynamicTOConfig:
     classification config — o-series reasoning models do not support it.
     """
 
-    temperature: float | None = None
+    temperature: float | None = 0.1
     # Large courses (18k+ word targets) produce big JSON responses; 32k tokens
     # gives headroom for ~120-section TOs without truncation.
     max_tokens: int = 32768

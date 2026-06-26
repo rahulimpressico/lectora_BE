@@ -63,6 +63,7 @@ from lectora_backend.pipeline.rule_pack_config.rule_packs import (
 from lectora_backend.pipeline.shared_utils.learning_objectives import (
     normalize_learning_objectives,
 )
+from lectora_backend.pipeline.shared_llm_config.tracer import submit_with_trace_context
 
 logger = logging.getLogger(__name__)
 
@@ -225,17 +226,23 @@ class A0RequestSynthesizer:
             set_doc_name,
             set_run_context,
             set_run_id,
+            set_source_refs,
         )
 
         doc_name = self._resolve_trace_doc_name()
+        source_refs = [*self.docx_paths, *self.pdf_paths]
+        if self.to_outline_doc_path:
+            source_refs.append(self.to_outline_doc_path)
         has_doc = bool((get_doc_name() or "").strip())
         has_run = bool((get_run_id() or "").strip())
         if not has_doc and not has_run:
-            set_run_context(self.run_id, doc_name)
+            set_run_context(self.run_id, doc_name, source_refs=source_refs)
         elif not has_doc:
             set_doc_name(doc_name)
+            set_source_refs(source_refs)
         elif not has_run:
             set_run_id(self.run_id)
+            set_source_refs(source_refs)
 
     def run(self) -> A0Result:
         """Execute the full A0 pipeline and return a typed A0Result."""
@@ -599,7 +606,8 @@ class A0RequestSynthesizer:
         )
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            classify_future = pool.submit(
+            classify_future = submit_with_trace_context(
+                pool,
                 classify_with_llm,
                 title,
                 learning_objectives,
@@ -620,14 +628,15 @@ class A0RequestSynthesizer:
                         payload = json.load(fh)
                     return payload.get("llm_to_outline") or payload
 
-                to_future = pool.submit(_load_pregenerated_to)
+                to_future = submit_with_trace_context(pool, _load_pregenerated_to)
 
             elif self.to_outline_doc_path:
                 # ── TO MODE: TO document provided → parse via LLM ───────────────
                 logger.info(
                     "[TO MODE] Existing TO detected — sending TO document to LLM for parsing."
                 )
-                to_future = pool.submit(
+                to_future = submit_with_trace_context(
+                    pool,
                     classify_to_outline_with_llm,
                     to_outline_content,
                     validation_hints=hints_arg,
@@ -745,7 +754,7 @@ class A0RequestSynthesizer:
                         all_doc_titles=_all_doc_titles,
                     )
 
-                to_future = pool.submit(_generate_to_from_structured)
+                to_future = submit_with_trace_context(pool, _generate_to_from_structured)
 
             llm_result = classify_future.result()
             llm_to_outline_result = to_future.result()

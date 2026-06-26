@@ -198,7 +198,8 @@ CURRICULUM QUALITY RULES
 1. SELECT CRITICALLY — only topics that pass the trainer's test above
 2. MERGE — combine headings that teach the same concept
    e.g. "Types of Policies" + "Policy Types Overview" → "1.0 Policy Types"
-3. DEDUPLICATE — never two sections on the same concept
+3. DEDUPLICATE — never two sections on the same concept; never two subtopics
+   with the same meaning within or across sections
 4. SEQUENCE FOR LEARNING — foundational definitions first, then mechanics,
    then applied rules, then exceptions and edge cases
 5. TITLE FOR LEARNERS — write titles that describe what the student will
@@ -206,6 +207,34 @@ CURRICULUM QUALITY RULES
    source heading text (see SECTION TITLE RULES below)
 6. SUBTOPIC DISCIPLINE — 3–6 tight, distinct subtopics per section is ideal;
    more than 8 is a signal to split or consolidate the section
+
+═══════════════════════════════════════════════════════════
+UNIQUENESS ENFORCEMENT — MANDATORY BEFORE OUTPUT
+═══════════════════════════════════════════════════════════
+Before writing the final JSON, perform these checks in order:
+
+  A. SECTION TITLE UNIQUENESS
+     • Every section "title" value must be unique across the entire "sections" array.
+     • The leading "N.0 " number prefix must also be unique (1.0, 2.0, 3.0 …
+       sequential with no gaps or repeats).
+     • If two planned sections have identical or near-identical titles, MERGE them
+       into one richer section rather than emitting both.
+
+  B. SUBTOPIC UNIQUENESS
+     • Within each section, every subtopic string must be distinct.
+     • A subtopic title must not duplicate the parent section's title or any other
+       section's title — subtopics are sub-concepts, not aliases for sections.
+     • If two subtopics express the same idea, keep only the more specific one.
+
+  C. CROSS-SECTION SUBTOPIC OVERLAP
+     • The same subtopic concept must not appear in more than one section.
+     • If a subtopic legitimately belongs to two sections, place it in the section
+       where it is most central and note the connection in that section's "content"
+       objective instead.
+
+  SELF-CHECK: scan your completed "sections" list; if any "title" appears more than
+  once, or any two titles differ only in phrasing (e.g. "COBRA Overview" vs
+  "Overview of COBRA"), merge them before returning the JSON.
 
 {_LEARNER_CENTRIC_TITLE_BLOCK}
 
@@ -542,7 +571,8 @@ STRUCTURAL & OUTPUT RULES
 CURRICULUM QUALITY:
   1. SELECT CRITICALLY — trainer's test above; cut low-value topics
   2. MERGE — combine headings teaching the same concept into one section
-  3. DEDUPLICATE — never two sections on the same concept
+  3. DEDUPLICATE — never two sections on the same concept; never two subtopics
+     with the same meaning within or across sections
   4. SEQUENCE — foundational definitions → core mechanics → application → compliance edge cases
   5. TITLE PROFESSIONALLY — titles a trainer would use in a real training catalogue
 
@@ -550,6 +580,34 @@ SECTION PACING:
   - Each section covers one coherent topic (typically 10–25 minutes of instruction)
   - 3–6 subtopics per section is ideal; more than 8 signals over-splitting
   - Subtopics flow: context → concept → application
+
+═══════════════════════════════════════════════════════════
+UNIQUENESS ENFORCEMENT — MANDATORY BEFORE OUTPUT
+═══════════════════════════════════════════════════════════
+Before writing the final JSON, perform these checks in order:
+
+  A. SECTION TITLE UNIQUENESS
+     • Every section "title" value must be unique across the entire "sections" array.
+     • The leading "N.0 " number prefix must also be unique (1.0, 2.0, 3.0 …
+       sequential with no gaps or repeats).
+     • If two planned sections have identical or near-identical titles, MERGE them
+       into one richer section rather than emitting both.
+
+  B. SUBTOPIC UNIQUENESS
+     • Within each section, every subtopic string must be distinct.
+     • A subtopic title must not duplicate the parent section's title or any other
+       section's title — subtopics are sub-concepts, not aliases for sections.
+     • If two subtopics express the same idea, keep only the more specific one.
+
+  C. CROSS-SECTION SUBTOPIC OVERLAP
+     • The same subtopic concept must not appear in more than one section.
+     • If a subtopic legitimately belongs to two sections, place it in the section
+       where it is most central and note the connection in that section's "content"
+       objective instead.
+
+  SELF-CHECK: scan your completed "sections" list; if any "title" appears more than
+  once, or any two titles differ only in phrasing (e.g. "COBRA Overview" vs
+  "Overview of COBRA"), merge them before returning the JSON.
 
 {_LEARNER_CENTRIC_TITLE_BLOCK}
 

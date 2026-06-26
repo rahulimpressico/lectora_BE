@@ -51,7 +51,7 @@ from lectora_backend.pipeline.models import (
     S2ValidationReport,  # noqa: F401 — used in type hints and _format helpers
 )
 from lectora_backend.pipeline.models.validation import S1Status, S2Status
-from lectora_backend.pipeline.shared_llm_config.tracer import set_doc_name, set_run_id
+from lectora_backend.pipeline.shared_llm_config.tracer import set_doc_name, set_run_id, set_source_refs
 from lectora_backend.models.constants import MAX_A0_A1_S1_CYCLES, MAX_A2_S2_CYCLES
 
 
@@ -209,6 +209,7 @@ def run_pipeline(
 
     start = datetime.now(timezone.utc)
     set_doc_name(Path(primary_path).stem)
+    set_source_refs(paths)
 
     _separator("PIPELINE START")
     for i, p in enumerate(paths, 1):

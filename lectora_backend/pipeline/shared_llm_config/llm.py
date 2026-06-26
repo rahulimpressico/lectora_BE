@@ -17,6 +17,8 @@ Usage (from any agent's config/llm.py):
 
 import time
 from dataclasses import dataclass
+from inspect import currentframe
+from pathlib import Path
 
 from openai import AzureOpenAI
 
@@ -29,6 +31,7 @@ from lectora_backend.pipeline.shared_llm_config.tracer import LLMTrace, write_tr
 # ---------------------------------------------------------------------------
 
 _API_VERSION: str = "2024-12-01-preview"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +81,43 @@ def get_client() -> AzureOpenAI:
     )
 
 
+def _infer_prompt_callsite() -> dict[str, object]:
+    """
+    Capture the first caller outside the shared llm/tracer plumbing so Langfuse
+    can show where the exact prompt originated.
+    """
+    frame = currentframe()
+    if frame is None:
+        return {}
+    caller = frame.f_back
+    fallback: dict[str, object] = {}
+    while caller is not None:
+        filename = Path(caller.f_code.co_filename).resolve()
+        is_shared_llm_file = filename == Path(__file__).resolve()
+        is_tracer_file = filename.name == "tracer.py"
+        is_agent_config_wrapper = tuple(filename.parts[-2:]) == ("config", "llm.py")
+        if is_shared_llm_file or is_tracer_file or is_agent_config_wrapper:
+            caller = caller.f_back
+            continue
+
+        try:
+            rel = filename.relative_to(_REPO_ROOT).as_posix()
+            return {
+                "prompt_file": rel,
+                "prompt_function": caller.f_code.co_name,
+                "prompt_line": int(caller.f_lineno),
+            }
+        except ValueError:
+            if not fallback:
+                fallback = {
+                    "prompt_file": filename.as_posix(),
+                    "prompt_function": caller.f_code.co_name,
+                    "prompt_line": int(caller.f_lineno),
+                }
+        caller = caller.f_back
+    return fallback
+
+
 # ---------------------------------------------------------------------------
 # Core chat function — fully dynamic
 # ---------------------------------------------------------------------------
@@ -119,8 +159,6 @@ def chat(
         # (both o-series and gpt-5.x+). The legacy max_tokens parameter is not
         # accepted by gpt-5.4-mini or o-series models on this API version.
         create_kwargs["max_completion_tokens"] = config.max_tokens
-    if config.top_k is not None:
-        create_kwargs["top_k"] = config.top_k
     if config.response_format is not None:
         create_kwargs["response_format"] = config.response_format
 
@@ -166,6 +204,19 @@ def chat(
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             error=error_msg,
+            model_parameters={
+                "temperature": config.temperature,
+                "max_completion_tokens": config.max_tokens,
+                "top_k": config.top_k,
+                "response_format": config.response_format,
+            },
+            prompt_metadata={
+                "original_system_prompt": system_prompt,
+                "effective_system_prompt": effective_system_prompt,
+                "prompt_was_augmented_for_json_contract": effective_system_prompt != system_prompt,
+                **_infer_prompt_callsite(),
+            },
+            observation_name=f"{agent} | prompt -> output" if agent else "LLM | prompt -> output",
         ))
 
     return response_text

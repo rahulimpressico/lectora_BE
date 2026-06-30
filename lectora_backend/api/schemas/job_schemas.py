@@ -28,7 +28,7 @@ class JobInputs(CamelModel):
 class SourceFileSpec(CamelModel):
     blob_path: str
     extract_hint: str | None = None
-    importance: str | None = None  # 'high' | 'medium' | 'low'
+    importance: str | None = None  # deprecated — kept for backward compatibility
 
 
 class JobCreateRequest(CamelModel):
@@ -39,7 +39,7 @@ class JobCreateRequest(CamelModel):
     # When present the pipeline injects it into shared_state so A1 uses the
     # user's version instead of re-generating from the original DOCX.
     to_override: dict[str, Any] | None = None
-    # Per-file source specs with blob path, extract hint, and importance level.
+    # Per-file source specs with blob path and extraction focus.
     # Replaces the flat source_file_paths list — blob paths are derived from these.
     source_file_specs: list[SourceFileSpec] | None = None
 

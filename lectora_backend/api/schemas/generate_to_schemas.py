@@ -14,7 +14,15 @@ class SourceAnalysis(BaseModel):
         alias="sourceRole",
         description="Categorical role: 'primary_source', 'supporting_source', or 'reference_only'.",
     )
-    importance: str = Field(description="Importance level: 'high', 'medium', or 'low'.")
+    importance: str = Field(
+        default="medium",
+        description="Inferred coverage weight: 'high', 'medium', or 'low'.",
+    )
+    extract_hint: str = Field(
+        default="",
+        alias="extractHint",
+        description="User guidance on what to get from this source.",
+    )
     main_topics: list[str] = Field(
         default_factory=list,
         alias="mainTopics",
@@ -48,10 +56,19 @@ class SourceAnalysisRequest(BaseModel):
     """Body for POST /documents/analyze-source."""
     blob_path: str = Field(alias="blobPath", description="Uploaded-documents blob path for the source file.")
     source_role: str = Field(
+        default="primary_source",
         alias="sourceRole",
-        description="Categorical role chosen by the user: 'primary_source', 'supporting_source', or 'reference_only'.",
+        description="Categorical role: 'primary_source', 'supporting_source', or 'reference_only'.",
     )
-    importance: str = Field(description="User-selected importance: 'high', 'medium', or 'low'.")
+    extract_hint: str | None = Field(
+        default=None,
+        alias="extractHint",
+        description="What should we get from this source? User-provided extraction focus.",
+    )
+    importance: str | None = Field(
+        default=None,
+        description="Deprecated — inferred from source_role when omitted.",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -241,9 +258,8 @@ class GenerateTORequest(BaseModel):
         alias="sourceAnalyses",
         description=(
             "Per-document source analysis results computed by POST /documents/analyze-source "
-            "before generate-to is called. When present, A0 uses these to weight the TO/LO "
-            "generation: high-importance primary sources dominate; supporting sources contribute "
-            "to relevant sections only; ignore_or_reduce topics are deprioritised."
+            "before generate-to is called. When present, A0 uses extract hints and source roles "
+            "to weight TO/LO generation; ignore_or_reduce topics are deprioritised."
         ),
     )
 
@@ -289,13 +305,16 @@ class GenerateTOResponse(BaseModel):
     to: dict[str, Any]
     rules: dict[str, Any]
     to_blob_path: str | None = Field(default=None, alias="toBlobPath")
+    s1_validation: dict[str, Any] | None = Field(default=None, alias="s1Validation")
+
+    model_config = {"populate_by_name": True}
 
 
 class GenerateTOJobAccepted(BaseModel):
     """Returned immediately by async POST /documents/generate-to (HTTP 202)."""
     job_id: str = Field(alias="jobId")
     status: str = "processing"
-    message: str = "A0 started — poll until complete"
+    message: str = "A0 started — pipeline runs A0, then S1, then A1"
     poll_url: str = Field(alias="pollUrl")
 
     model_config = {"populate_by_name": True}
@@ -310,6 +329,7 @@ class GenerateTOJobPollResponse(BaseModel):
     to: dict[str, Any] | None = None
     rules: dict[str, Any] | None = None
     to_blob_path: str | None = Field(default=None, alias="toBlobPath")
+    s1_validation: dict[str, Any] | None = Field(default=None, alias="s1Validation")
     logs: list[dict[str, Any]] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}

@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, Response
 
 from pydantic import BaseModel, Field, model_validator
 
+from lectora_backend.core.artifact_paths import local_artifact_path_candidates
 from lectora_backend.core.blob_paths import UPLOADED_DOCUMENTS_PREFIX
 from lectora_backend.core.storage_cleanup import strip_upload_blob_roots as _strip_upload_blob_roots
 from lectora_backend.repositories.blob_repository import BlobRepository
@@ -328,23 +329,7 @@ def _local_artifact_path_candidates(relative_path: str) -> list[str]:
     from lectora_backend.core.course_storage import strip_legacy_outputs_prefix
 
     clean = strip_legacy_outputs_prefix(relative_path.strip().lstrip("/"))
-    if not clean:
-        return []
-    candidates = [clean]
-    if "/output/" in clean:
-        candidates.append(clean.replace("/output/", "/"))
-    if "/state/pipeline_shared_state.json" in clean:
-        candidates.append(clean.replace("/state/pipeline_shared_state.json", "/shared_state.json"))
-    if clean.endswith("/state/shared_state.json"):
-        candidates.append(clean.replace("/state/shared_state.json", "/shared_state.json"))
-    # Preserve order, drop duplicates.
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for item in candidates:
-        if item not in seen:
-            seen.add(item)
-            ordered.append(item)
-    return ordered
+    return local_artifact_path_candidates(clean)
 
 
 def _resolve_local_file(source: Literal["artifacts", "uploads"], relative_path: str) -> Path:

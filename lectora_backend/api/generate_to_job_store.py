@@ -1,7 +1,7 @@
 """
 In-memory job store for async POST /documents/generate-to (dev API).
 
-Keeps long-running A0 work off the HTTP request thread so the FE gets an
+Keeps long-running TO pipeline work (A0 -> A1 -> S1) off the HTTP request thread so the FE gets an
 immediate response and polls for results instead of holding the connection open.
 
 Persistence: completed and failed job results are written to a sidecar JSON file
@@ -29,7 +29,7 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-# Limit parallel A0 runs — each loads a full DOCX + multiple LLM calls.
+# Limit parallel TO runs — each loads full sources + multiple LLM calls.
 _MAX_CONCURRENT = max(1, int(os.environ.get("A0_API_MAX_CONCURRENT", "5")))
 _JOB_TTL_SEC = max(300, int(os.environ.get("A0_API_JOB_TTL_SEC", "3600")))
 
@@ -143,6 +143,9 @@ class GenerateTOJob:
     output_dir: str | None = None
     finished_at: float | None = None
     logs: list[GenerateTOLogEntry] = field(default_factory=list)
+    # Partial S1 validation payload — set when the job fails due to S1 block
+    # so the poll endpoint can return validation details alongside the error.
+    validation: dict[str, Any] | None = None
 
 
 class GenerateTOJobStore:
@@ -205,6 +208,7 @@ class GenerateTOJobStore:
             message=cached.get("message", ""),
             result=cached.get("result"),
             error=cached.get("error"),
+            validation=cached.get("validation"),
             finished_at=float(finished_at) if finished_at else None,
             logs=[
                 GenerateTOLogEntry(
@@ -252,7 +256,13 @@ class GenerateTOJobStore:
             if job.status == GenerateTOJobStatus.PROCESSING:
                 job.message = message
 
-    def complete(self, job_id: str, result: dict[str, Any]) -> None:
+    def complete(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        *,
+        final_message: str = "TO generation complete",
+    ) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
@@ -262,20 +272,27 @@ class GenerateTOJobStore:
             job.status = GenerateTOJobStatus.COMPLETED
             job.result = result
             job.finished_at = time.time()
-            job.message = "A0 complete"
+            job.message = final_message
             if job.output_dir:
                 _cleanup_ephemeral_output_dir(job.output_dir)
                 job.output_dir = None
         _write_cache(job_id, {
             "job_id": job_id,
             "status": "completed",
-            "message": "A0 complete",
+            "message": final_message,
             "result": result,
             "finished_at": job.finished_at,
             "logs": [lg.to_dict() for lg in job.logs],
         })
 
-    def fail(self, job_id: str, error: str) -> None:
+    def fail(
+        self,
+        job_id: str,
+        error: str,
+        *,
+        final_message: str = "TO generation failed",
+        validation: dict[str, Any] | None = None,
+    ) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
@@ -284,16 +301,18 @@ class GenerateTOJobStore:
                 return
             job.status = GenerateTOJobStatus.FAILED
             job.error = error
+            job.validation = validation
             job.finished_at = time.time()
-            job.message = "A0 failed"
+            job.message = final_message
             if job.output_dir:
                 _cleanup_ephemeral_output_dir(job.output_dir)
                 job.output_dir = None
         _write_cache(job_id, {
             "job_id": job_id,
             "status": "failed",
-            "message": "A0 failed",
+            "message": final_message,
             "error": error,
+            "validation": validation,
             "finished_at": job.finished_at,
             "logs": [lg.to_dict() for lg in job.logs],
         })
@@ -376,8 +395,8 @@ async def run_a0_job_background(
     cancel_event: threading.Event | None = None,
 ) -> None:
     """
-    Run A0 in a worker thread; update job store on success/failure.
-    ``build_response`` converts A0Result → serializable dict for the API.
+    Run the TO pipeline in a worker thread; update job store on success/failure.
+    ``build_response`` converts the runner output to a serializable dict for the API.
 
     When ``slot_acquired`` is True, the HTTP handler already took a semaphore
     slot (returns 503 if full); this task must ``release_slot`` in ``finally``.
@@ -434,8 +453,8 @@ async def run_a0_job_background(
         t_a0 = time.perf_counter()
         payload = build_response(result, difficulty)
         t_done = time.perf_counter()
-        log("success", "A0 run complete — generated Training Outline is ready.", "A0")
-        store.complete(job_id, payload)
+        log("success", "Pipeline complete — validated Training Outline is ready.", "S1")
+        store.complete(job_id, payload, final_message="TO generation complete")
         logger.info(
             "[generate-to] Job %s completed | A0=%.1fs | response_build=%.1fs | total=%.1fs",
             job_id,
@@ -450,9 +469,12 @@ async def run_a0_job_background(
             store.cancel(job_id, reason="Cancelled — source files removed or job stopped")
             logger.info("[generate-to] Job %s cancelled", job_id)
         else:
-            log("error", f"A0 run failed: {msg}", "A0")
+            stage = getattr(exc, "stage", "A0")
+            log("error", f"{stage} failed: {msg}", stage)
             logger.exception("[generate-to] Job %s failed: %s", job_id, exc)
-            store.fail(job_id, msg)
+            # Include S1 validation details when blocked — lets the FE show rich feedback.
+            validation = getattr(exc, "validation", None)
+            store.fail(job_id, msg, final_message=f"{stage} failed", validation=validation)
         _cleanup_ephemeral_output_dir(output_dir)
     finally:
         unregister_generate_to(job_id)

@@ -59,7 +59,13 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
+
+from lectora_backend.pipeline.shared_llm_config.tracer import (
+    RetrievalTrace,
+    write_retrieval_trace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +333,9 @@ class VectorRetriever:
             lesson_title[:50], query[:120], document_id, top,
         )
 
+        error_msg: str | None = None
+        raw: list[dict] = []
+        t_start = time.perf_counter()
         try:
             raw = self._service.retrieve_topic(
                 topic=query,
@@ -334,14 +343,43 @@ class VectorRetriever:
                 top=top,
             )
         except Exception as exc:
+            error_msg = str(exc)
             logger.warning(
                 "[vector_retriever] Lesson search failed for %r: %s",
                 lesson_title[:50], exc,
             )
+        finally:
+            latency_ms = (time.perf_counter() - t_start) * 1000
+            try:
+                write_retrieval_trace(RetrievalTrace(
+                    agent="SECTION_MAPPER",
+                    retrieval_type="lesson_hybrid",
+                    query=query,
+                    result_count=len(raw),
+                    latency_ms=latency_ms,
+                    document_id=document_id,
+                    error=error_msg,
+                    metadata={"lesson_title": lesson_title[:120], "top_k": top},
+                ))
+            except Exception:
+                pass
+
+        if error_msg:
             return []
 
         chunks = _parse_search_results(raw)
         chunks.sort(key=lambda c: c.similarity_score, reverse=True)
+
+        top_score = chunks[0].similarity_score if chunks else None
+        has_reranker = (
+            chunks[0].source_metadata.get("reranker_score") is not None
+            if chunks else False
+        )
+        # Threshold is derived inside _parse_search_results; re-compute for the trace.
+        threshold = (
+            max(_MIN_ABSOLUTE_THRESHOLD, top_score * _DYNAMIC_THRESHOLD_RATIO)
+            if top_score is not None else None
+        )
 
         logger.info(
             "[vector_retriever] Lesson=%r → %d/%d chunks above threshold",
@@ -353,6 +391,27 @@ class VectorRetriever:
                 [f"{c.similarity_score:.3f}" for c in chunks[:3]],
                 chunks[0].source_metadata.get("title", "")[:50],
             )
+
+        # Update the retrieval trace with score/threshold info now that we have it.
+        try:
+            write_retrieval_trace(RetrievalTrace(
+                agent="SECTION_MAPPER",
+                retrieval_type="lesson_hybrid_scored",
+                query=query,
+                result_count=len(chunks),
+                latency_ms=0,  # already captured above; this is the post-filter record
+                top_score=top_score,
+                threshold=threshold,
+                has_semantic_ranker=has_reranker,
+                document_id=document_id,
+                metadata={
+                    "lesson_title": lesson_title[:120],
+                    "raw_result_count": len(raw),
+                    "top_3_scores": [f"{c.similarity_score:.3f}" for c in chunks[:3]],
+                },
+            ))
+        except Exception:
+            pass
 
         return chunks
 
@@ -417,28 +476,55 @@ class VectorRetriever:
                 sub_title[:50], query[:120], document_id,
             )
 
-            raw: list[dict] = []
+            raw_sub: list[dict] = []
+            error_msg: str | None = None
+            t_start = time.perf_counter()
             try:
-                raw = self._service.retrieve_for_subtopic(
+                raw_sub = self._service.retrieve_for_subtopic(
                     subtopic_query=query,
                     document_id=document_id,
                     top=top_per_subtopic,
                 )
             except Exception as exc:
+                error_msg = str(exc)
                 logger.warning(
                     "[vector_retriever] Subtopic search failed for %r: %s — "
                     "using lesson-level keyword fallback.",
                     sub_title[:50], exc,
                 )
+            finally:
+                latency_ms = (time.perf_counter() - t_start) * 1000
+                try:
+                    write_retrieval_trace(RetrievalTrace(
+                        agent="SECTION_MAPPER",
+                        retrieval_type="subtopic_semantic" if not error_msg else "subtopic_semantic_failed",
+                        query=query,
+                        result_count=len(raw_sub),
+                        latency_ms=latency_ms,
+                        document_id=document_id,
+                        error=error_msg,
+                        metadata={
+                            "subtopic_title": sub_title[:120],
+                            "lesson_title": lesson_title[:120],
+                            "top_per_subtopic": top_per_subtopic,
+                        },
+                    ))
+                except Exception:
+                    pass
 
-            if raw:
-                chunks = _parse_search_results(raw)
+            if raw_sub:
+                chunks = _parse_search_results(raw_sub)
                 ordered = _sort_by_document_order(chunks)
                 sub["matched_chunks"] = [c.as_dict() for c in ordered]
 
                 has_reranker = any(
                     c.source_metadata.get("reranker_score") is not None
                     for c in ordered[:1]
+                )
+                top_score = ordered[0].similarity_score if ordered else None
+                threshold = (
+                    max(_MIN_ABSOLUTE_THRESHOLD, top_score * _DYNAMIC_THRESHOLD_RATIO)
+                    if top_score is not None else None
                 )
                 logger.debug(
                     "[vector_retriever] Subtopic=%r → %d chunks  "
@@ -448,6 +534,26 @@ class VectorRetriever:
                     [f"{c.similarity_score:.3f}" for c in ordered],
                     has_reranker,
                 )
+                # Emit scored trace for this subtopic
+                try:
+                    write_retrieval_trace(RetrievalTrace(
+                        agent="SECTION_MAPPER",
+                        retrieval_type="subtopic_semantic_scored",
+                        query=query,
+                        result_count=len(ordered),
+                        latency_ms=0,
+                        top_score=top_score,
+                        threshold=threshold,
+                        has_semantic_ranker=has_reranker,
+                        document_id=document_id,
+                        metadata={
+                            "subtopic_title": sub_title[:120],
+                            "lesson_title": lesson_title[:120],
+                            "raw_result_count": len(raw_sub),
+                        },
+                    ))
+                except Exception:
+                    pass
             else:
                 # Emergency fallback: keyword overlap over lesson-level pool.
                 fallback = _keyword_fallback(sub_title, lesson_chunks, top_per_subtopic)
@@ -457,6 +563,22 @@ class VectorRetriever:
                     "[vector_retriever] Subtopic=%r — keyword fallback (%d chunks)",
                     sub_title[:50], len(ordered),
                 )
+                try:
+                    write_retrieval_trace(RetrievalTrace(
+                        agent="SECTION_MAPPER",
+                        retrieval_type="keyword_fallback",
+                        query=sub_title,
+                        result_count=len(ordered),
+                        latency_ms=0,
+                        document_id=document_id,
+                        metadata={
+                            "subtopic_title": sub_title[:120],
+                            "lesson_title": lesson_title[:120],
+                            "lesson_pool_size": len(lesson_chunks),
+                        },
+                    ))
+                except Exception:
+                    pass
 
         return subtopics
 

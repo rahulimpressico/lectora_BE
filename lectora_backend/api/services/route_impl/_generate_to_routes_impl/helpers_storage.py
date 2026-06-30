@@ -320,10 +320,15 @@ def _read_json_blob(path: str, source: Literal["uploads", "artifacts"]) -> dict:
                 pass
 
         from lectora_backend.core.artifact_paths import local_artifact_path_candidates
-        from lectora_backend.core.pipeline_paths import (
-            PIPELINE_COURSES_DIR as courses_dir,
-            PIPELINE_SHARED_STATE_DIR as legacy_dir,
-        )
+        try:
+            from lectora_backend.core.pipeline_paths import (
+                PIPELINE_COURSES_DIR as courses_dir,
+                PIPELINE_SHARED_STATE_DIR as legacy_dir,
+            )
+        except ModuleNotFoundError:
+            backend_root = Path(__file__).resolve().parents[4]
+            courses_dir = backend_root / "pipeline" / "courses"
+            legacy_dir = backend_root / "pipeline" / "shared_state"
 
         for rel in local_artifact_path_candidates(clean):
             for base in (courses_dir, legacy_dir):

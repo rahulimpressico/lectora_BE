@@ -91,8 +91,21 @@ from lectora_backend.api.services.to_response_builder import (
     safe_int as _safe_int,
     unwrap_llm_outline as _unwrap_llm_outline,
 )
-from lectora_backend.core.pipeline_paths import PIPELINE_SHARED_STATE_DIR
-from lectora_backend.pipeline.shared_utils.validation_helpers import s1_blocks
+try:
+    from lectora_backend.core.pipeline_paths import PIPELINE_SHARED_STATE_DIR
+except ModuleNotFoundError:
+    # Backward-compatible fallback for environments that don't yet include
+    # the central pipeline_paths module.
+    PIPELINE_SHARED_STATE_DIR = Path(__file__).resolve().parents[4] / "pipeline" / "shared_state"
+try:
+    from lectora_backend.pipeline.shared_utils.validation_helpers import s1_blocks
+except ModuleNotFoundError:
+    # Fallback for container images built before validation_helpers.py was added.
+    # S1Status uses str-enum values "blocked" / "blocker" — match on both.
+    def s1_blocks(status: Any) -> bool:  # type: ignore[misc]  # noqa: F841
+        _BLOCKING = {"blocked", "blocker"}
+        v = status.value if hasattr(status, "value") else str(status)
+        return v in _BLOCKING
 logger = logging.getLogger(__name__)
 router = APIRouter()
 _UPLOAD_ROOT = Path(tempfile.gettempdir()) / "lectora_uploads"

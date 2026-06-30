@@ -14,14 +14,19 @@ from lectora_backend.core.course_storage import (
 )
 from lectora_backend.core.job_registry import cancel_jobs_for_storage_delete
 
-logger = logging.getLogger(__name__)
+try:
+    from lectora_backend.core.pipeline_paths import (
+        PIPELINE_COURSES_DIR as _PIPELINE_COURSES_DIR,
+        PIPELINE_SHARED_STATE_DIR as _LEGACY_SHARED_STATE_DIR,
+    )
+except ModuleNotFoundError:
+    # Backward-compatible fallback for environments that don't yet include
+    # the central pipeline_paths module.
+    _BACKEND_ROOT = Path(__file__).resolve().parents[1]
+    _PIPELINE_COURSES_DIR = _BACKEND_ROOT / "pipeline" / "courses"
+    _LEGACY_SHARED_STATE_DIR = _BACKEND_ROOT / "pipeline" / "shared_state"
 
-_PIPELINE_COURSES_DIR = (
-    Path(__file__).resolve().parents[1] / "pipeline" / "courses"
-)
-_LEGACY_SHARED_STATE_DIR = (
-    Path(__file__).resolve().parents[1] / "pipeline" / "shared_state"
-)
+logger = logging.getLogger(__name__)
 _UPLOAD_ROOT = Path(__import__("tempfile").gettempdir()) / "lectora_uploads"
 
 

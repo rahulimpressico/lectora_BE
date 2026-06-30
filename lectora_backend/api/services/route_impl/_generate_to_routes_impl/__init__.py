@@ -57,6 +57,7 @@ _ensure_route("/generate-to/jobs/{job_id}/cancel", cancel_generate_to_job, "POST
 _ensure_route("/load-to", load_to_from_path, "GET")
 _ensure_route("/save-to", save_to, "POST")
 _ensure_route("/generate-learning-objectives", generate_learning_objectives, "POST")
+_ensure_route("/suggest-required-topics", suggest_required_topics, "POST")
 _ensure_route("/suggest-outline-structure", suggest_outline_structure, "POST")
 _ensure_route("/suggest-course-type", suggest_course_type, "POST")
 _ensure_route("/generate-to/jobs/{job_id}", get_generate_to_job, "GET")

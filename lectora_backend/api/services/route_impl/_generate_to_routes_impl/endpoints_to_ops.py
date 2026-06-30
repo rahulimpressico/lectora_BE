@@ -89,8 +89,10 @@ that follow best-practice instructional design.
 ═══════════════════════════════════════════════════════════
 LEARNING OBJECTIVE RULES (CRITICAL)
 ═══════════════════════════════════════════════════════════
-CONSTRAINT 1 — Count: write exactly 4–6 objectives. Never fewer, never more.
+CONSTRAINT 1 — Count: write 4–6 objectives by default.
   More than 6 dilutes focus; fewer than 4 fails to cover the course scope.
+  EXCEPTION: if the user provides regeneration guidance requesting more or fewer
+  objectives, honour that request even if it falls outside the 4–6 default range.
 
 CONSTRAINT 2 — Bloom's verb required.
   Every objective MUST begin with a measurable action verb from Bloom's Taxonomy:
@@ -135,7 +137,7 @@ VALIDATION STEP — required before finalising each objective:
   1. Does it start with a Bloom's Taxonomy verb?
   2. Does it describe what the learner will DO, not what the course covers?
   3. Are all acronyms spelled out on first use?
-  4. Is the total count between 4 and 6?
+  4. Is the total count between 4 and 6 (or within the range the user requested)?
   If ANY answer is "No" — rewrite the objective.
 
 Return a JSON object with this exact structure:
@@ -161,6 +163,26 @@ Return a JSON object with this exact structure:
         input_parts.append(f"Certification/compliance focus: {body.certification_focus}")
     if body.additional_instructions:
         input_parts.append(f"Additional instructions: {body.additional_instructions}")
+    if body.current_objectives:
+        co_lines = [
+            "\nCURRENT OBJECTIVES (the list the user sees right now — modify these "
+            "according to the regeneration guidance below; do not start from scratch):",
+        ]
+        for i, obj in enumerate(body.current_objectives, 1):
+            co_lines.append(f"  {i}. {obj}")
+        input_parts.append("\n".join(co_lines))
+    if body.regeneration_prompt and body.regeneration_prompt.strip():
+        regen = body.regeneration_prompt.strip()
+        current_count = len(body.current_objectives)
+        count_hint = (
+            f" (the user currently has {current_count} objectives; "
+            f"adjust the total accordingly)"
+            if current_count
+            else ""
+        )
+        input_parts.append(
+            f"REGENERATION GUIDANCE — highest priority{count_hint}: {regen}"
+        )
 
     if body.required_topics:
         rt_lo_lines = [
@@ -231,6 +253,93 @@ Return a JSON object with this exact structure:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate objectives: {exc}",
         ) from exc
+
+async def suggest_required_topics(
+    body: SuggestRequiredTopicsRequest,
+) -> SuggestRequiredTopicsResponse:
+    """Analyse course metadata and return 8–15 required topics the course must cover.
+
+    Called automatically when the user lands on the Required Topics step with an
+    empty topic list, and also when the user clicks 'Regenerate Suggestions'.
+    """
+    from lectora_backend.pipeline.shared_llm_config.llm import LLMConfig, chat as llm_chat
+    from lectora_backend.pipeline.shared_llm_config.model_registry import get_deployment
+
+    config = LLMConfig(
+        deployment=get_deployment("A0_TO"),
+        max_tokens=1024,
+        response_format={"type": "json_object"},
+    )
+
+    system_prompt = """\
+You are an expert instructional designer specialising in corporate, regulatory, \
+and compliance training courses. Analyse the provided course metadata and return \
+the specific topics that the course MUST cover in order to meet its objectives and \
+regulatory requirements.
+
+TOPIC RULES:
+- Return 8–15 topics. Fewer than 8 is too sparse; more than 15 dilutes focus.
+- Each topic must be concrete and specific (e.g. "COBRA qualifying events and \
+election deadlines", not just "COBRA").
+- Topics should reflect regulatory mandates, must-know concepts, and compliance \
+areas a learner will be tested on in certification exams.
+- Keep each topic concise: 5–15 words.
+- Do NOT repeat topics or group unrelated concepts under one item.
+
+Return a JSON object with this exact structure:
+{"required_topics": ["Topic 1", "Topic 2", ...]}\
+"""
+
+    input_parts: list[str] = []
+    if body.course_title:
+        input_parts.append(f"Course title: {body.course_title}")
+    if body.course_description:
+        input_parts.append(f"Description: {body.course_description}")
+    if body.course_type:
+        input_parts.append(f"Course type: {body.course_type}")
+    if body.course_duration:
+        input_parts.append(f"Duration: {body.course_duration}")
+    if body.target_audience:
+        input_parts.append(f"Target audience: {body.target_audience}")
+    if body.skill_level:
+        input_parts.append(f"Skill level: {body.skill_level}")
+    if body.learner_outcomes:
+        input_parts.append(f"Desired learner outcomes: {body.learner_outcomes}")
+
+    user_msg = (
+        "\n".join(input_parts)
+        or "Suggest required topics for a standard regulatory training course."
+    )
+    _set_preview_trace_context(
+        route_name="suggest-required-topics",
+        course_title=body.course_title,
+    )
+
+    try:
+        def _call_llm() -> str:
+            return llm_chat(system_prompt, user_msg, config, "SUGGEST_TOPICS")
+
+        raw = await asyncio.to_thread(_call_llm)
+        data = json.loads(raw)
+        topics: list[str] = data.get("required_topics") or []
+        if not isinstance(topics, list):
+            topics = []
+        topics = [str(t).strip() for t in topics if t]
+        logger.info("[suggest-required-topics] Generated %d topics", len(topics))
+        return SuggestRequiredTopicsResponse(required_topics=topics)
+    except json.JSONDecodeError as exc:
+        logger.warning("[suggest-required-topics] JSON parse error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="LLM returned malformed JSON. Please try again.",
+        ) from exc
+    except Exception as exc:
+        logger.exception("[suggest-required-topics] LLM call failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to suggest required topics: {exc}",
+        ) from exc
+
 
 async def suggest_outline_structure(
     body: SuggestOutlineStructureRequest,

@@ -360,12 +360,47 @@ class GenerateLearningObjectivesRequest(BaseModel):
             "Used to guide LO generation toward these required areas."
         ),
     )
+    regeneration_prompt: str = Field(
+        default="",
+        alias="regenerationPrompt",
+        description=(
+            "Optional user instruction to guide LO regeneration "
+            "(e.g., 'make it more advanced')."
+        ),
+    )
+    current_objectives: list[str] = Field(
+        default_factory=list,
+        alias="currentObjectives",
+        description=(
+            "The existing learning objectives shown to the user before regeneration. "
+            "When provided alongside regeneration_prompt, the LLM modifies these "
+            "rather than generating from scratch."
+        ),
+    )
     model_config = {"populate_by_name": True}
 
 
 class GenerateLearningObjectivesResponse(BaseModel):
     """Response from POST /documents/generate-learning-objectives."""
     learning_objectives: list[str] = Field(alias="learningObjectives")
+    model_config = {"populate_by_name": True}
+
+
+class SuggestRequiredTopicsRequest(BaseModel):
+    """Body for POST /documents/suggest-required-topics."""
+    course_title: str = Field(default="", alias="courseTitle")
+    course_description: str = Field(default="", alias="courseDescription")
+    course_type: str = Field(default="", alias="courseType")
+    course_duration: str = Field(default="", alias="courseDuration")
+    target_audience: str = Field(default="", alias="targetAudience")
+    skill_level: str = Field(default="", alias="skillLevel")
+    learner_outcomes: str = Field(default="", alias="learnerOutcomes")
+    model_config = {"populate_by_name": True}
+
+
+class SuggestRequiredTopicsResponse(BaseModel):
+    """Response from POST /documents/suggest-required-topics."""
+    required_topics: list[str] = Field(alias="requiredTopics")
     model_config = {"populate_by_name": True}
 
 

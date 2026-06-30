@@ -20,14 +20,18 @@ from pydantic import BaseModel, Field, model_validator
 
 from lectora_backend.core.artifact_paths import local_artifact_path_candidates
 from lectora_backend.core.blob_paths import UPLOADED_DOCUMENTS_PREFIX
+from lectora_backend.core.pipeline_paths import (
+    PIPELINE_COURSES_DIR,
+    PIPELINE_SHARED_STATE_DIR,
+)
 from lectora_backend.core.storage_cleanup import strip_upload_blob_roots as _strip_upload_blob_roots
 from lectora_backend.repositories.blob_repository import BlobRepository
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_LOCAL_COURSES_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "courses"
-_LOCAL_LEGACY_DIR = Path(__file__).resolve().parents[2] / "pipeline" / "shared_state"
+_LOCAL_COURSES_DIR = PIPELINE_COURSES_DIR
+_LOCAL_LEGACY_DIR = PIPELINE_SHARED_STATE_DIR
 _LOCAL_DIR = _LOCAL_COURSES_DIR
 _LOCAL_COURSES_DIR.mkdir(parents=True, exist_ok=True)
 _UPLOAD_ROOT = Path(tempfile.gettempdir()) / "lectora_uploads"

@@ -62,11 +62,60 @@ from lectora_backend.pipeline.agent.a2_content_generator.step_04_render_docx.uti
 from lectora_backend.pipeline.agent.kc_planner.main import run as kc_planner_run
 from lectora_backend.pipeline.agent.s2_validator.main import S2Validator
 from lectora_backend.pipeline.agent.section_mapper.main import run as section_mapper_run
-from lectora_backend.pipeline.shared_utils.validation_helpers import (
-    format_s2_feedback,
-    llm_outline_from_to_data,
-    s2_blocks,
-)
+try:
+    from lectora_backend.pipeline.shared_utils.validation_helpers import (
+        format_s2_feedback,
+        llm_outline_from_to_data,
+        s2_blocks,
+    )
+except ModuleNotFoundError:
+    # Fallback for container images built before validation_helpers.py was added.
+    from collections import defaultdict
+
+    def s2_blocks(status: Any) -> bool:  # type: ignore[misc]  # noqa: F841
+        _BLOCKING = {"blocked", "blocker"}
+        v = status.value if hasattr(status, "value") else str(status)
+        return v in _BLOCKING
+
+    def format_s2_feedback(report: Any) -> str:  # type: ignore[misc]  # noqa: F841
+        def _get(obj: Any, attr: str, default: str = "") -> Any:
+            return obj.get(attr, default) if isinstance(obj, dict) else getattr(obj, attr, default)
+        buckets: dict[str, list[str]] = defaultdict(list)
+        for issue in _get(report, "issues", []) or []:
+            field = _get(issue, "field", "?")
+            message = _get(issue, "message", str(issue))
+            rule_source = _get(issue, "rule_source", "?")
+            severity = _get(issue, "severity", "warning")
+            buckets[severity].append(f"  - [{field}] {message} (rule: {rule_source})")
+        lines: list[str] = []
+        for label, key in [("Blockers (must fix):", "blocker"), ("Critical issues:", "critical"), ("Warnings:", "warning")]:
+            if buckets[key]:
+                lines.append(label)
+                lines.extend(buckets[key])
+        return "\n".join(lines)
+
+    def llm_outline_from_to_data(to_data: dict[str, Any]) -> dict[str, Any]:  # type: ignore[misc]  # noqa: F841
+        sections = []
+        for s in to_data.get("sections") or []:
+            raw_subtopics = s.get("subtopics") or []
+            sections.append({
+                "title": s.get("title") or "",
+                "word_count": s.get("word_count"),
+                "minutes": s.get("duration_minutes"),
+                "credit_hours": s.get("credit_hours"),
+                "content": s.get("content_summary") or "",
+                "interactive_elements": s.get("interactive_elements") or [],
+                "subtopics": [{"title": t} if isinstance(t, str) else t for t in raw_subtopics],
+            })
+        return {
+            "course_title": to_data.get("course_name") or to_data.get("course_title") or "",
+            "description": to_data.get("description") or "",
+            "learning_objectives": to_data.get("learning_objectives") or [],
+            "totals": {"word_count": to_data.get("total_word_count"), "minutes": to_data.get("total_minutes"), "credit_hours": to_data.get("total_credit_hours")},
+            "sections": sections,
+            "_user_edited": True,
+            "_reused_from_preview": True,
+        }
 logger = logging.getLogger(__name__)
 router = APIRouter()
 _SSE_POLL_INTERVAL = 1.0  # seconds between SSE frames

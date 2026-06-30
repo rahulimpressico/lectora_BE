@@ -20,17 +20,10 @@ from pydantic import BaseModel, Field, model_validator
 
 from lectora_backend.core.artifact_paths import local_artifact_path_candidates
 from lectora_backend.core.blob_paths import UPLOADED_DOCUMENTS_PREFIX
-try:
-    from lectora_backend.core.pipeline_paths import (
-        PIPELINE_COURSES_DIR,
-        PIPELINE_SHARED_STATE_DIR,
-    )
-except ModuleNotFoundError:
-    # Backward-compatible fallback for environments that don't yet include
-    # the central pipeline_paths module.
-    _BACKEND_ROOT = Path(__file__).resolve().parents[2]
-    PIPELINE_COURSES_DIR = _BACKEND_ROOT / "pipeline" / "courses"
-    PIPELINE_SHARED_STATE_DIR = _BACKEND_ROOT / "pipeline" / "shared_state"
+from lectora_backend.core.pipeline_paths import (
+    PIPELINE_COURSES_DIR,
+    PIPELINE_SHARED_STATE_DIR,
+)
 from lectora_backend.core.storage_cleanup import strip_upload_blob_roots as _strip_upload_blob_roots
 from lectora_backend.repositories.blob_repository import BlobRepository
 

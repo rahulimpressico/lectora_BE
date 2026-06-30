@@ -91,12 +91,7 @@ from lectora_backend.api.services.to_response_builder import (
     safe_int as _safe_int,
     unwrap_llm_outline as _unwrap_llm_outline,
 )
-try:
-    from lectora_backend.core.pipeline_paths import PIPELINE_SHARED_STATE_DIR
-except ModuleNotFoundError:
-    # Backward-compatible fallback for environments that don't yet include
-    # the central pipeline_paths module.
-    PIPELINE_SHARED_STATE_DIR = Path(__file__).resolve().parents[4] / "pipeline" / "shared_state"
+from lectora_backend.core.pipeline_paths import PIPELINE_SHARED_STATE_DIR
 from lectora_backend.pipeline.shared_utils.validation_helpers import s1_blocks
 logger = logging.getLogger(__name__)
 router = APIRouter()

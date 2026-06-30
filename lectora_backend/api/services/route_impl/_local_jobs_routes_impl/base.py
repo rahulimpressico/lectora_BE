@@ -31,13 +31,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-
-try:
-    from lectora_backend.core.pipeline_paths import PIPELINE_SHARED_STATE_DIR as _PIPELINE_COURSES_DIR
-except ModuleNotFoundError:
-    # Backward-compatible fallback for environments that don't yet include
-    # the central pipeline_paths module.
-    _PIPELINE_COURSES_DIR = Path(__file__).resolve().parents[4] / "pipeline" / "shared_state"
+from lectora_backend.core.pipeline_paths import PIPELINE_SHARED_STATE_DIR as _PIPELINE_COURSES_DIR
 
 _PIPELINE_COURSES_DIR.mkdir(parents=True, exist_ok=True)
 from lectora_backend.api.local_course_job_store import (

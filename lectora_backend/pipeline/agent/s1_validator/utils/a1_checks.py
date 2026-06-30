@@ -1,10 +1,6 @@
-"""Compatibility facade for legacy checks imports."""
+"""Compatibility wrapper for legacy a1_checks imports."""
 
-from lectora_backend.pipeline.agent.s1_validator.utils.checks_domain import (
-    check_a0_classification,
-    check_a0_images,
-    check_a0_metadata,
-    check_a0_timed_outline_required,
+from .checks_domain.a1 import (
     check_a1_assessment_rules,
     check_a1_credit_hours,
     check_a1_credit_hours_against_rule_pack,
@@ -13,15 +9,9 @@ from lectora_backend.pipeline.agent.s1_validator.utils.checks_domain import (
     check_a1_lo_coverage,
     check_a1_sections,
     check_a1_word_counts,
-    check_rule_pack_sanity,
 )
 
 __all__ = [
-    "check_rule_pack_sanity",
-    "check_a0_metadata",
-    "check_a0_classification",
-    "check_a0_timed_outline_required",
-    "check_a0_images",
     "check_a1_sections",
     "check_a1_word_counts",
     "check_a1_kc_count",

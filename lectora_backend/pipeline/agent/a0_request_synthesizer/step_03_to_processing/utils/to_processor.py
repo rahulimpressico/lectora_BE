@@ -30,9 +30,19 @@ from ..constants.prompts import (
 logger = logging.getLogger(__name__)
 
 # Max words of indexed_content sent to the LLM for TO generation.
-# At ~1.3 tokens/word, 100k words ≈ 130k tokens — leaves 70k tokens headroom for
-# system prompt, user headers, and the model's own response within a 200k context.
-_MAX_TO_INDEXED_WORDS = 100_000
+# Kept adaptive so very large source docs retain more context while still staying
+# under practical context limits.
+_MIN_TO_INDEXED_WORDS = 120_000
+_MAX_TO_INDEXED_WORDS = 150_000
+
+
+def _resolve_to_word_budget(calculated_word_count: int | None) -> int:
+    """Return adaptive indexed-content word budget for FORMAT B prompts."""
+    if calculated_word_count is None:
+        return _MIN_TO_INDEXED_WORDS
+    # Keep roughly ~8x of target output words as source context, within bounded limits.
+    proposed = int(calculated_word_count * 8)
+    return max(_MIN_TO_INDEXED_WORDS, min(_MAX_TO_INDEXED_WORDS, proposed))
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +99,7 @@ def _build_to_user_message(
     audience: str | None = None,
     validation_hints: str | None = None,
     all_doc_titles: list[str] | None = None,
+    indexed_word_budget: int = _MIN_TO_INDEXED_WORDS,
 ) -> str:
     """Build the user message for GENERATE_TO_PROMPT.
 
@@ -157,13 +168,13 @@ def _build_to_user_message(
 
         if indexed_content:
             content_words = indexed_content.split()
-            if len(content_words) > _MAX_TO_INDEXED_WORDS:
-                truncated = " ".join(content_words[:_MAX_TO_INDEXED_WORDS])
+            if len(content_words) > indexed_word_budget:
+                truncated = " ".join(content_words[:indexed_word_budget])
                 logger.warning(
                     "[TO CONTENT TRUNCATION] indexed_content truncated from %d → %d words "
                     "to stay within context limit.",
                     len(content_words),
-                    _MAX_TO_INDEXED_WORDS,
+                    indexed_word_budget,
                 )
                 indexed_content = truncated + "\n\n[CONTENT TRUNCATED — remaining paragraphs omitted to fit context window]"
             parts.append(
@@ -273,6 +284,7 @@ def generate_to_with_llm(
         prompt_source += " + custom hints"
     # ── Pre-build diagnostics ────────────────────────────────────────────────
     raw_indexed_words = len(indexed_content.split()) if indexed_content else 0
+    indexed_word_budget = _resolve_to_word_budget(calculated_word_count)
     toc_content_words = sum(
         len((s.get("indexed_content") or "").split()) for s in (toc_section_contents or [])
     )
@@ -290,12 +302,13 @@ def generate_to_with_llm(
     logger.info("[TO-LLM]  Heading entries    : %d", len(heading_tree or []))
     logger.info("[TO-LLM]  TOC sections       : %d  (%d words in section bodies)", len(toc_section_contents or []), toc_content_words)
     logger.info("[TO-LLM]  indexed_content    : %d words (before truncation)", raw_indexed_words)
-    if raw_indexed_words > _MAX_TO_INDEXED_WORDS:
+    logger.info("[TO-LLM]  indexed budget     : %d words", indexed_word_budget)
+    if raw_indexed_words > indexed_word_budget:
         logger.warning(
             "[TO-LLM]  ⚠ indexed_content will be TRUNCATED: %d → %d words (~%d%% kept)",
             raw_indexed_words,
-            _MAX_TO_INDEXED_WORDS,
-            int(100 * _MAX_TO_INDEXED_WORDS / raw_indexed_words),
+            indexed_word_budget,
+            int(100 * indexed_word_budget / raw_indexed_words),
         )
     logger.info(
         "[TO-LLM] ─────────────────────────────────────────────────────────────"
@@ -314,6 +327,7 @@ def generate_to_with_llm(
         audience=audience,
         validation_hints=validation_hints,
         all_doc_titles=all_doc_titles,
+        indexed_word_budget=indexed_word_budget,
     )
 
     user_msg_words = len(user_msg.split())

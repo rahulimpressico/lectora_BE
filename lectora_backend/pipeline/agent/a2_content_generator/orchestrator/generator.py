@@ -332,21 +332,23 @@ class A2ContentGenerator:
         # Build source material guidance from per-file specs if present
         raw_specs: list[dict] = shared_state.get("source_file_specs") or []
         if raw_specs:
-            importance_order = {"high": 0, "medium": 1, "low": 2}
-            sorted_specs = sorted(raw_specs, key=lambda s: importance_order.get(s.get("importance", "medium"), 1))
+            # Sources with an extraction focus are listed first.
+            sorted_specs = sorted(
+                raw_specs,
+                key=lambda s: (0 if (s.get("extract_hint") or "").strip() else 1),
+            )
             guidance_lines = ["## Source Material Guidance"]
             guidance_lines.append(
                 "The following source files were provided by the course author. "
-                "Respect their importance levels and extraction focus when drawing on source material:"
+                "Respect what they asked to get from each source when drawing on source material:"
             )
             for spec in sorted_specs:
                 name = spec.get("blob_path", "").split("/")[-1]
-                imp = (spec.get("importance") or "medium").upper()
                 hint = (spec.get("extract_hint") or "").strip()
-                line = f"- {name} [{imp} importance]"
                 if hint:
-                    line += f": {hint}"
-                guidance_lines.append(line)
+                    guidance_lines.append(f"- {name}: What to get from this source — {hint}")
+                else:
+                    guidance_lines.append(f"- {name}")
             source_guidance = "\n".join(guidance_lines)
             special_instructions = (
                 f"{source_guidance}\n\n{special_instructions}"
